@@ -1,0 +1,29 @@
+# ── Build artifacts ──────────────────────────────────────────────
+build/
+build_asan/
+build*/
+*.o
+*.obj
+
+# ── Packaged snap + snapcraft local lifecycle dirs ───────────────
+*.snap
+parts/
+stage/
+prime/
+.snapcraft/
+
+# ── Runtime data (written next to the binary during dev) ─────────
+scores.json
+settings.json
+
+# ── Project memory — NOT for publication ─────────────────────────
+CLAUDE.md
+.claude/
+
+# ── OS / editor cruft ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/

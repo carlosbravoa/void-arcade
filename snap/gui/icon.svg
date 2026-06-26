@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#0a1a0a"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </radialGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="256" height="256" rx="24" fill="url(#bg)"/>
+
+  <!-- CRT screen bezel -->
+  <rect x="28" y="28" width="200" height="200" rx="16" fill="#111" stroke="#1a3a1a" stroke-width="3"/>
+  <!-- Screen glow -->
+  <rect x="36" y="36" width="184" height="184" rx="12" fill="#030d03" stroke="#2a6a2a" stroke-width="1.5"/>
+
+  <!-- Screen content - scanline overlay -->
+  <rect x="36" y="36" width="184" height="4"  fill="#0a1a0a" opacity="0.6"/>
+  <rect x="36" y="44" width="184" height="4"  fill="#0a1a0a" opacity="0.6"/>
+  <rect x="36" y="52" width="184" height="4"  fill="#0a1a0a" opacity="0.6"/>
+
+  <!-- Invader sprite (top-centre) -->
+  <g fill="#64ffaa" filter="url(#glow)" transform="translate(88, 52)">
+    <rect x="12" y="0"  width="8" height="8"/>
+    <rect x="60" y="0"  width="8" height="8"/>
+    <rect x="4"  y="8"  width="8" height="8"/>
+    <rect x="12" y="8"  width="8" height="8"/>
+    <rect x="28" y="8"  width="24" height="8"/>
+    <rect x="60" y="8"  width="8" height="8"/>
+    <rect x="68" y="8"  width="8" height="8"/>
+    <rect x="0"  y="16" width="80" height="8"/>
+    <rect x="4"  y="24" width="8" height="8"/>
+    <rect x="24" y="24" width="12" height="8"/>
+    <rect x="44" y="24" width="12" height="8"/>
+    <rect x="68" y="24" width="8" height="8"/>
+    <rect x="8"  y="32" width="8" height="8"/>
+    <rect x="64" y="32" width="8" height="8"/>
+  </g>
+
+  <!-- Boss Galaga (middle-left) -->
+  <g fill="#ffc828" filter="url(#glow)" transform="translate(48, 120) scale(0.85)">
+    <rect x="16" y="0"  width="8" height="8"/>
+    <rect x="24" y="0"  width="8" height="8"/>
+    <rect x="32" y="0"  width="8" height="8"/>
+    <rect x="8"  y="8"  width="40" height="8"/>
+    <rect x="0"  y="16" width="56" height="8"/>
+    <rect x="0"  y="24" width="8" height="8"/>
+    <rect x="16" y="24" width="24" height="8"/>
+    <rect x="48" y="24" width="8" height="8"/>
+    <rect x="0"  y="32" width="8" height="8"/>
+    <rect x="8"  y="32" width="8" height="8"/>
+    <rect x="40" y="32" width="8" height="8"/>
+    <rect x="48" y="32" width="8" height="8"/>
+  </g>
+
+  <!-- Arkanoid ball (middle-right) -->
+  <circle cx="176" cy="144" r="10" fill="#ffffb4" filter="url(#glow)"/>
+  <circle cx="173" cy="141" r="3"  fill="white" opacity="0.8"/>
+
+  <!-- Bricks row -->
+  <g filter="url(#glow)">
+    <rect x="44"  y="176" width="28" height="12" rx="2" fill="#ff5050"/>
+    <rect x="76"  y="176" width="28" height="12" rx="2" fill="#ffa028"/>
+    <rect x="108" y="176" width="28" height="12" rx="2" fill="#ffdc28"/>
+    <rect x="140" y="176" width="28" height="12" rx="2" fill="#50dc50"/>
+    <rect x="172" y="176" width="28" height="12" rx="2" fill="#50b4ff"/>
+  </g>
+
+  <!-- Player ship -->
+  <g fill="#50c8ff" filter="url(#glow)" transform="translate(112, 200)">
+    <rect x="14" y="0"  width="4" height="4"/>
+    <rect x="10" y="4"  width="12" height="4"/>
+    <rect x="4"  y="8"  width="24" height="4"/>
+    <rect x="0"  y="12" width="32" height="4"/>
+  </g>
+
+  <!-- Corner phosphor dots -->
+  <circle cx="44"  cy="44"  r="2" fill="#1a4a1a" opacity="0.7"/>
+  <circle cx="212" cy="44"  r="2" fill="#1a4a1a" opacity="0.7"/>
+  <circle cx="44"  cy="212" r="2" fill="#1a4a1a" opacity="0.7"/>
+  <circle cx="212" cy="212" r="2" fill="#1a4a1a" opacity="0.7"/>
+</svg>

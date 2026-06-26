@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=The Void Arcade
+GenericName=Arcade Game Bundle
+Comment=Seven retro CRT arcade games — Invaders, Squadrons, Raid, Breaker, Drift, Gunner, Storm
+Exec=void-arcade
+Icon=${SNAP}/meta/gui/icon.svg
+Type=Application
+Categories=Game;ArcadeGame;
+Keywords=arcade;retro;void;crt;pixel;shooter;
+StartupNotify=true
+Terminal=false

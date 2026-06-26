@@ -1,0 +1,73 @@
+name: void-arcade
+title: The Void Arcade
+base: core24
+version: '2.0.0'
+summary: The Void Arcade — seven retro CRT arcade games in one cabinet
+description: |
+  The Void Arcade is a bundle of seven original retro arcade games sharing one
+  authentic CRT/phosphor post-processing pipeline and procedurally-synthesised
+  sound (no audio files — every sound is generated at runtime):
+
+    * Void Invaders   — descend-and-defend, armoured fleets, giant boss
+    * Void Squadrons  — diving formations, tractor beams, dual-fighter rescue
+    * Void Raid       — fly the asteroid rift, manage fuel, branching routes
+    * Void Breaker    — brick-breaker with power-ups and cross-game boss cameos
+    * Void Drift      — vector asteroids with inertial drift and a void saucer
+    * Void Gunner     — first-person rail shooter with a radar and laser energy
+    * Void Storm      — R-Type-style side-scroller with a chargeable beam
+
+  Native C++/SDL2/OpenGL with a hand-written CRT shader, gamepad support, an
+  in-game Options screen (tune glow / afterglow / scanlines / volume), and a
+  self-playing attract demo.
+
+  Controls:
+    Arrows / A,D    Move / Aim / Select
+    SPACE           Fire / Launch / Confirm
+    P  Pause    M  Mute    O  Options    F11  Fullscreen
+    ESC             Back to launcher
+
+license: GPL-3.0-or-later
+contact: cbravoa@gmail.com
+source-code: https://github.com/carlosbravoa/void-arcade
+website: https://github.com/carlosbravoa/void-arcade
+issues: https://github.com/carlosbravoa/void-arcade/issues
+
+grade: stable
+confinement: strict
+
+platforms:
+  amd64:
+
+apps:
+  void-arcade:
+    command: usr/bin/void_arcade
+    extensions: [gnome]          # desktop + Mesa/OpenGL + theming integration
+    plugs:
+      - opengl
+      - audio-playback
+      - joystick                 # gamepad (SDL_GameController); connect manually
+      - x11
+      - wayland
+      - desktop
+      - desktop-legacy
+    environment:
+      # The binary writes scores.json / settings.json next to itself by default,
+      # which is read-only in a snap — redirect them to a writable per-user dir.
+      RETRO_ARCADE_DATA: $SNAP_USER_COMMON
+
+parts:
+  void-arcade:
+    plugin: cmake
+    source: .
+    source-type: local
+    cmake-parameters:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_PREFIX=/usr     # install() puts binary+assets in usr/bin
+    build-packages:
+      - libsdl2-dev
+      - libsdl2-mixer-dev
+      - libgl-dev
+      - pkg-config
+    stage-packages:
+      - libsdl2-2.0-0
+      - libsdl2-mixer-2.0-0
