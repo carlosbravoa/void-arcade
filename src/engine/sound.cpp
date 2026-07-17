@@ -513,15 +513,30 @@ Mix_Chunk* make_lock_on() {
     return to_chunk(concat({a, gap, b}), 0.4f);
 }
 Mix_Chunk* make_energy_refill() {
-    float notes[] = {392, 523, 659, 784, 1046};
-    Wave out;
-    for (float f : notes) {
-        Wave s = adsr(square(f, 0.07f, 0.45f), 0.003f, 0.015f, 0.8f, 0.03f, 0.07f);
-        Wave shimmer = sine(f * 2, 0.07f);
-        for (size_t i = 0; i < s.size(); ++i) s[i] = std::clamp(s[i] * 0.8f + shimmer[i] * 0.2f, -1.0f, 1.0f);
-        out.insert(out.end(), s.begin(), s.end());
+    // "Recharging" swell: a rising pitch with an accelerating shimmer/whir that
+    // grows from quiet to full as the tank fills — like a capacitor charging up —
+    // capped by a soft "topped-off" ping. (Was five discrete ascending beeps.)
+    float dur = 0.5f;
+    int n = nsamp(dur);
+    Wave w(n);
+    for (int i = 0; i < n; ++i) {
+        float t = float(i) / n;            // 0..1 fill progress
+        float ph = float(i) * dur / n;     // seconds
+        float f = 160.0f + 620.0f * t;     // pitch climbs as it charges
+        float trem = 0.6f + 0.4f * std::sin(TAU * (8.0f + 26.0f * t) * ph);  // whir speeds up
+        float body = (std::sin(TAU * f * ph) * 0.55f +
+                      sgn(std::sin(TAU * f * 0.5f * ph)) * 0.20f +
+                      std::sin(TAU * f * 2.0f * ph) * 0.15f) * trem;
+        w[i] = body * (t * t);             // amplitude swells as the reserve fills
     }
-    return to_chunk(out, 0.6f);
+    // soft "topped-off" ping at the tail
+    Wave ping = adsr(sine(1046, 0.10f), 0.002f, 0.02f, 0.6f, 0.05f, 0.10f);
+    for (size_t i = 0; i < ping.size() && i < w.size(); ++i) {
+        size_t idx = w.size() - ping.size() + i;
+        w[idx] = std::clamp(w[idx] + ping[i] * 0.5f, -1.0f, 1.0f);
+    }
+    edge_fade(w, 0.01f);
+    return to_chunk(w, 0.55f);
 }
 Mix_Chunk* make_beam_fire() {
     // bright convergent laser: high square zap with a quick down-sweep + sparkle.
@@ -547,22 +562,28 @@ Mix_Chunk* make_charge_loop() {
     edge_fade(w, 0.01f);
     return to_chunk(w, 0.32f);
 }
-Mix_Chunk* make_charged_blast() {
-    // the payoff: a screaming down-sweep + a fat boom + a sub thump.
-    Wave sw = sweep(1500, 90, 0.45f, "sawtooth");
-    sw = adsr(sw, 0.002f, 0.05f, 0.7f, 0.25f, 0.45f);
-    Wave boom = noise(0.5f), boom2 = roll(boom, 7);
+// The payoff: a screaming down-sweep + a fat boom + a sub thump. Scales with the
+// charge level `c` (0..1): a small charge is a quick zap, a full charge a roar —
+// deeper down-sweep, fatter boom and more sub the longer it was held.
+Mix_Chunk* make_charged_blast(float c) {
+    float dur = 0.26f + 0.26f * c;          // longer tail when fuller
+    float hi  = 1100.0f + 500.0f * c;       // brighter start
+    float lo  = 220.0f - 130.0f * c;        // deeper end
+    Wave sw = sweep(hi, lo, dur * 0.9f, "sawtooth");
+    sw = adsr(sw, 0.002f, 0.05f, 0.7f, 0.25f, dur * 0.9f);
+    Wave boom = noise(dur), boom2 = roll(boom, 7);
     Wave b(boom.size());
     for (size_t i = 0; i < boom.size(); ++i) b[i] = (boom[i] + boom2[i]) * 0.5f;
-    b = adsr(b, 0.0f, 0.04f, 0.5f, 0.4f, 0.5f);
-    Wave sub = sweep(120, 45, 0.5f, "sine");
-    sub = adsr(sub, 0.001f, 0.08f, 0.6f, 0.3f, 0.5f);
-    int total = int(SR * 0.52f);
+    b = adsr(b, 0.0f, 0.04f, 0.5f, 0.4f, dur);
+    Wave sub = sweep(120, 45, dur, "sine");
+    sub = adsr(sub, 0.001f, 0.08f, 0.6f, 0.3f, dur);
+    int total = int(SR * (dur + 0.02f));
     Wave out(total, 0.0f);
+    float boomamt = 0.35f + 0.45f * c, subamt = 0.35f + 0.55f * c;
     for (int i = 0; i < total; ++i) {
-        float v = (i < (int)sw.size() ? sw[i] * 0.6f : 0.0f) +
-                  (i < (int)b.size()  ? b[i]  * 0.7f : 0.0f) +
-                  (i < (int)sub.size()? sub[i]* 0.75f : 0.0f);
+        float v = (i < (int)sw.size()  ? sw[i] * 0.6f    : 0.0f) +
+                  (i < (int)b.size()   ? b[i]  * boomamt : 0.0f) +
+                  (i < (int)sub.size() ? sub[i] * subamt : 0.0f);
         out[i] = std::clamp(v, -1.0f, 1.0f);
     }
     return to_chunk(out, 0.97f);
@@ -619,7 +640,9 @@ bool SoundManager::init() {
     refill_      = make_energy_refill();
     beam_        = make_beam_fire();
     charge_loop_ = make_charge_loop();
-    charged_     = make_charged_blast();
+    charged_[0]  = make_charged_blast(0.30f);   // small charge
+    charged_[1]  = make_charged_blast(0.65f);   // mid charge
+    charged_[2]  = make_charged_blast(1.0f);    // full charge
     Mix_Volume(-1, master_vol_);
     ready_ = true;
     std::printf("[SFX] Procedural sound engine ready.\n");
@@ -683,7 +706,10 @@ void SoundManager::warp()           { play(warp_); }
 void SoundManager::lock_on()        { play(lock_); }
 void SoundManager::energy_refill()  { play(refill_); }
 void SoundManager::beam_fire()      { play(beam_); }
-void SoundManager::charged_blast()  { play(charged_); }
+void SoundManager::charged_blast(float charge) {
+    int tier = charge >= 0.80f ? 2 : charge >= 0.50f ? 1 : 0;
+    play(charged_[tier]);
+}
 
 void SoundManager::start_charge() {
     if (!ready_ || muted_ || !charge_loop_) return;

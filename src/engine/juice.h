@@ -24,7 +24,10 @@ struct Juice {
     bool  shock_req = false;
     float shock_cx = 0.5f, shock_cy = 0.5f;
 
-    void shake(float m)   { shake_mag = std::max(shake_mag, m); }
+    // Capped so a burst of events (e.g. a charged beam shredding a crowd, each
+    // kill re-requesting shake every frame) can never pin the screen at a huge
+    // offset — that read as judder/"lag", not impact.
+    void shake(float m)   { shake_mag = std::min(20.0f, std::max(shake_mag, m)); }
     void hitstop(float s) { hitstop_t = std::max(hitstop_t, s); }
     void rumble(float low, float high, int ms) {
         rumble_low = std::max(rumble_low, low);

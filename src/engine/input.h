@@ -9,7 +9,7 @@
 #include <vector>
 
 // Virtual held controls fed from the active gamepad (stick + d-pad + shoulders).
-enum PadBtn { PadLeft, PadRight, PadUp, PadDown, PadFire, PadThrUp, PadThrDown, PadCount };
+enum PadBtn { PadLeft, PadRight, PadUp, PadDown, PadFire, PadThrUp, PadThrDown, PadBtnB, PadCount };
 
 struct Input {
     const Uint8* state = nullptr;        // SDL_GetKeyboardState, by scancode

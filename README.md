@@ -61,6 +61,27 @@ void-arcade
 
 Saves live in `~/snap/void-arcade/common/`. See `snap/SNAP_BUILD.md` for details.
 
+### Gamepad on the snap
+
+A strict snap can't reach `/dev/input/js*` until the **`joystick`** interface is
+connected, and snapd does **not** auto-connect it. So after install (or after
+plugging in a pad), run once:
+
+```sh
+sudo snap connect void-arcade:joystick
+```
+
+It persists across reboots and game launches. Check with
+`snap connections void-arcade` — the `joystick` row should show a slot, not `-`.
+If a controller is plugged in but the interface isn't connected, the launcher
+detects it (the node is *present but access-denied*, vs. simply absent when
+nothing's plugged in) and shows a hint with the exact command; relaunch after
+connecting. Keyboard play needs none of this.
+
+> Auto-connecting `joystick` on install requires a store-granted snap
+> declaration (request it on the Snapcraft forum for the published snap); until
+> then the manual `snap connect` above is the expected one-time step.
+
 ## Controls
 
 | Action | Key |

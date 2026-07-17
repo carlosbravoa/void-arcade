@@ -105,7 +105,10 @@ void main() {
     color *= mix(0.96, 1.0, grid_x);
 
     vec2 vig_uv = curved_uv * (1.0 - curved_uv.yx);
-    float vignette = pow(vig_uv.x * vig_uv.y * 18.0, 0.35);
+    float vignette = pow(vig_uv.x * vig_uv.y * 24.0, 0.30);
+    // Lift the darkest corners off the floor so screen-edge content (menu text,
+    // HUD bars) stays readable — the vignette still shades, just never crushes.
+    vignette = mix(0.66, 1.0, clamp(vignette, 0.0, 1.0));
     color *= vignette;
 
     color *= vec3(0.96, 1.02, 0.92);

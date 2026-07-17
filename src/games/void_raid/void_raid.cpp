@@ -16,6 +16,7 @@
 #include "engine/initials.h"
 #include "engine/boss_art.h"
 #include "engine/combo.h"
+#include "engine/enemy_art.h"
 #include "engine/input.h"
 #include "engine/juice.h"
 #include "engine/particles.h"
@@ -45,6 +46,7 @@ const Color C_SCOUT(255, 100, 40);
 const Color C_FLANKER(200, 80, 255);
 const Color C_CRUISER(255, 200, 40);
 const Color C_TURRET(80, 255, 120);
+const Color C_DIVER(255, 70, 110);   // homing kamikaze (ported from Void Storm)
 
 // Zone thresholds (score)
 const int ZONE_SCORES[5] = {0, 3000, 7000, 13000, 22000};
@@ -215,7 +217,7 @@ struct EnemyShot {
 };
 
 // ── Power-ups ────────────────────────────────────────────────────────────────
-enum class PU { Rapid, Spread, Pierce, Shield, Fuel, Life, Nuke, Mystery };
+enum class PU { Rapid, Spread, Pierce, Shield, Fuel, Life, Nuke, Tank, Mystery };
 struct PUInfo { const char* label; Color color; };
 PUInfo pu_info(PU k) {
     switch (k) {
@@ -226,6 +228,7 @@ PUInfo pu_info(PU k) {
         case PU::Fuel:   return {"F", CORE_COLOR};
         case PU::Life:   return {"+1", WHITE};
         case PU::Nuke:   return {"N", RED};
+        case PU::Tank:   return {"E+", CYAN};
         default:         return {"?", WHITE};
     }
 }
@@ -676,6 +679,57 @@ struct Terrain {
     }
 };
 
+// ── Enemy sprite art (pixel-art ships, ported in spirit from Void Storm) ───────
+// Void Raid descends, so every craft faces DOWN (nose at the bottom). '@' cells
+// are the hot cockpit/core highlight; '#' the body colour; '.' transparent.
+const SL RAID_SCOUT_F0 = {
+    "...###...", "..#@@@#..", ".##@@@##.", "#########",
+    "#########", ".#######.", "..#####..", "...###...", "....#....",
+};
+const SL RAID_SCOUT_F1 = {
+    ".#.#.#.#.", "..#@@@#..", ".##@@@##.", "#########",
+    "#########", ".#######.", "..#####..", "...###...", "....#....",
+};
+// Flanker — a purple manta sweeper with broad flapping wings.
+const SL RAID_FLANKER_F0 = {
+    "###.......###", ".###.....###.", "..####.####..", "...#######...",
+    "...#@@@@@#...", "....#####....", ".....###.....", "......#......",
+};
+const SL RAID_FLANKER_F1 = {
+    ".###.....###.", "..###...###..", "...#######...", "...#######...",
+    "...#@@@@@#...", "....#####....", ".....###.....", "......#......",
+};
+// Cruiser — a bulky gold gunship with twin cannon pods.
+const SL RAID_CRUISER_F0 = {
+    "###.........###", "###############", "##@@@#####@@@##", "###############",
+    ".#############.", ".#############.", "..###########..", "...#########...",
+    "....#######....",
+};
+const SL RAID_CRUISER_F1 = {
+    "###.........###", "###############", "##@@@#####@@@##", "###############",
+    ".#############.", ".#############.", "..###########..", "...#########...",
+    ".....#####.....",
+};
+// Diver — a hot-red dart/raptor: rear fins, a glowing core, a sharp nose.
+const SL RAID_DIVER_F0 = {
+    "#.......#", "##.....##", ".#######.", ".#######.", ".#@@@@@#.",
+    "..#####..", "...###...", "...###...", "....#....",
+};
+const SL RAID_DIVER_F1 = {
+    ".#.....#.", "##.....##", ".#######.", ".#######.", ".#@@@@@#.",
+    "..#####..", "...###...", "...###...", "....#....",
+};
+// Turret — an armoured gun-pod dome; the swivelling barrel is drawn in code.
+const SL RAID_TURRET_BASE = {
+    "..######..", ".########.", "##@@@@@@##", "##@@@@@@##", "##########", "##########",
+};
+const EnemyArt& raid_scout_art()   { static EnemyArt a = make_enemy_art(RAID_SCOUT_F0, RAID_SCOUT_F1, C_SCOUT, 2); return a; }
+const EnemyArt& raid_flanker_art() { static EnemyArt a = make_enemy_art(RAID_FLANKER_F0, RAID_FLANKER_F1, C_FLANKER, 2); return a; }
+const EnemyArt& raid_cruiser_art() { static EnemyArt a = make_enemy_art(RAID_CRUISER_F0, RAID_CRUISER_F1, C_CRUISER, 3, 7); return a; }
+const EnemyArt& raid_cruiser_armored_art() { static EnemyArt a = make_enemy_art(RAID_CRUISER_F0, RAID_CRUISER_F1, STEEL, 3, 7); return a; }
+const EnemyArt& raid_diver_art()   { static EnemyArt a = make_enemy_art(RAID_DIVER_F0, RAID_DIVER_F1, C_DIVER, 2, 7, 0.9f); return a; }
+const EnemyArt& raid_turret_art()  { static EnemyArt a = make_enemy_art(RAID_TURRET_BASE, RAID_TURRET_BASE, C_TURRET, 3); return a; }
+
 // ── Enemies ───────────────────────────────────────────────────────────────────
 struct Enemy {
     float x, y;
@@ -703,6 +757,8 @@ struct Enemy {
     // Turret hook: override returns the station this turret sits on.
     virtual int station_id() const { return -1; }  // turret's platform, by stable id
     virtual bool is_heavy() const { return max_hp > 2; }
+    // Kamikaze hook: ramming enemies damage the player on body contact.
+    virtual bool rams() const { return false; }
 };
 
 struct Player;  // fwd
@@ -711,10 +767,12 @@ struct Scout : Enemy {
     static constexpr int W = 22, H = 18;
     static constexpr float SPEED = 160.0f;
     float t_ = 0, fire_cd;
+    float bx_ = 0, amp_ = 0, freq_ = 0;   // sine weave so it isn't a straight-liner
     Scout(float px, float py) {
         x = px; y = py; hp = 1; max_hp = 1; pts = 100;
         color = C_SCOUT;
         fire_cd = rnd_uniform(0.5f, 2.0f);
+        bx_ = px; amp_ = rnd_uniform(18.0f, 40.0f); freq_ = rnd_uniform(1.8f, 3.0f);
     }
     Rect rect() const override { return {int(x), int(y), W, H}; }
     std::pair<int, int> center() const override {
@@ -723,15 +781,8 @@ struct Scout : Enemy {
     void update(float dt, float scroll_speed, Player& player,
                 std::vector<EnemyShot>& shots) override;
     void draw(Surface& s) const override {
-        Rect r = rect();
-        Color col = hit_flash > 0 ? lerp_color(color, WHITE, 0.6f) : color;
-        glow_rect(s, r, col, 4, 55);
         auto [cx, cy] = center();
-        std::vector<std::pair<int, int>> pts_{
-            {cx, r.y}, {r.x + r.w, cy}, {cx, r.y + r.h}, {r.x, cy}};
-        draw::polygon(s, col, pts_);
-        draw::polygon(s, WHITE, pts_, 1);
-        glow_circle(s, col, cx, r.y + r.h, 4, 60);
+        blit_enemy(s, raid_scout_art(), int(t_ * 16) & 1, cx, cy, hit_flash);
     }
 };
 
@@ -753,19 +804,9 @@ struct Flanker : Enemy {
     void update(float dt, float scroll_speed, Player& player,
                 std::vector<EnemyShot>& shots) override;
     void draw(Surface& s) const override {
-        Rect r = rect();
         auto [cx, cy] = center();
-        Color col = hit_flash > 0 ? lerp_color(color, WHITE, 0.6f) : color;
-        glow_rect(s, r, col, 4, 55);
-        std::vector<std::pair<int, int>> pts_;
-        if (direction == 1)
-            pts_ = {{r.x, r.y}, {r.x + r.w, cy}, {r.x, r.y + r.h}, {r.x + 8, cy}};
-        else
-            pts_ = {{r.x + r.w, r.y}, {r.x, cy}, {r.x + r.w, r.y + r.h},
-                    {r.x + r.w - 8, cy}};
-        draw::polygon(s, col, pts_);
-        draw::polygon(s, WHITE, pts_, 1);
-        glow_circle(s, col, cx, cy, 4, 60);
+        int frame = std::sin(t_ * 9) > 0 ? 0 : 1;   // wing flap
+        blit_enemy(s, raid_flanker_art(), frame, cx, cy, hit_flash);
     }
 };
 
@@ -787,19 +828,11 @@ struct Cruiser : Enemy {
     void draw(Surface& s) const override {
         Rect r = rect();
         auto [cx, cy] = center();
-        float hp_frac = hp / float(max_hp);
-        Color base = armored ? STEEL : color;
-        Color col(int(base.r * hp_frac + 80 * (1 - hp_frac)),
-                  int(base.g * hp_frac + 80 * (1 - hp_frac)),
-                  int(base.b * hp_frac + 80 * (1 - hp_frac)));
-        if (hit_flash > 0) col = lerp_color(col, WHITE, 0.6f);
-        glow_rect(s, r, col, 6, 65);
-        draw::rect(s, col, r, 0, 5);
-        draw::rect(s, WHITE, r, 1, 5);
-        int pips = std::min(hp, 6);
+        blit_enemy(s, armored ? raid_cruiser_armored_art() : raid_cruiser_art(),
+                   int(t_ * 8) & 1, cx, cy, hit_flash);
+        int pips = std::min(hp, 6);   // damage pips along the hull
         for (int i = 0; i < pips; ++i)
-            draw::circle(s, WHITE, r.x + 8 + i * 8, cy, 3);
-        glow_circle(s, col, cx, r.y + r.h, 6, 60);
+            draw::circle(s, WHITE, r.x + 10 + i * 8, cy, 2);
     }
 };
 
@@ -825,15 +858,47 @@ struct Turret : Enemy {
                 std::vector<EnemyShot>& shots) override;
     void draw(Surface& s) const override {
         int cx = int(x), cy = int(y);
-        Color col = hit_flash > 0 ? lerp_color(color, WHITE, 0.6f) : color;
-        glow_circle(s, col, cx, cy, R, 55);
-        draw::circle(s, col, cx, cy, R);
-        draw::circle(s, WHITE, cx, cy, R, 1);
-        int bx = cx + int(std::cos(angle) * (R + 6));
-        int by = cy + int(std::sin(angle) * (R + 6));
-        draw::line(s, WHITE, cx, cy, bx, by, 3);
+        // swivelling barrel (tracks the player), drawn under the dome
+        int bx = cx + int(std::cos(angle) * (R + 8));
+        int by = cy + int(std::sin(angle) * (R + 8));
+        draw::line(s, STEEL, cx, cy, bx, by, 4);
+        glow_circle(s, RED, bx, by, 3, 70);   // hot muzzle
+        draw::circle(s, Color(255, 200, 120), bx, by, 2);
+        // armoured gun-pod dome (sprite)
+        blit_enemy(s, raid_turret_art(), 0, cx, cy, hit_flash);
         for (int i = 0; i < hp; ++i)
-            draw::circle(s, Color(255, 255, 0), cx - (hp - 1) * 3 + i * 6, cy - R - 5, 2);
+            draw::circle(s, Color(255, 255, 0), cx - (hp - 1) * 3 + i * 6, cy - R - 6, 2);
+    }
+};
+
+// Diver — a homing kamikaze (ported from Void Storm). Drifts in, then LOCKS a
+// commit trajectory straight at where the player is and dives. No shots; the
+// threat is the dive itself, and it CAN be dodged once committed (it won't
+// re-aim), which rewards a sidestep. A telegraphed lock makes it readable.
+struct Diver : Enemy {
+    static constexpr int W = 20, H = 20;
+    float t_ = 0, vx = 0, vy = 0, lock_telegraph_ = 0;
+    bool locked = false;
+    Diver(float px, float py) {
+        x = px; y = py; hp = 2; max_hp = 2; pts = 250;
+        color = C_DIVER;
+    }
+    Rect rect() const override { return {int(x), int(y), W, H}; }
+    std::pair<int, int> center() const override {
+        return {int(x + W / 2.0f), int(y + H / 2.0f)};
+    }
+    bool rams() const override { return true; }
+    void update(float dt, float scroll_speed, Player& player,
+                std::vector<EnemyShot>& shots) override;
+    void draw(Surface& s) const override {
+        Rect r = rect();
+        auto [cx, cy] = center();
+        // Reuse the white-flash overlay to flare it the instant before it commits,
+        // so the dive stays telegraphed.
+        float flash = std::max(hit_flash, lock_telegraph_ > 0 ? 0.8f : 0.0f);
+        blit_enemy(s, raid_diver_art(), int(t_ * 20) & 1, cx, cy, flash);
+        float p = 0.5f + 0.5f * std::sin(t_ * 20);  // hot eye glow on the nose
+        glow_circle(s, Color(255, 120, 120), cx, r.y + r.h, int(2 + 2 * p), 80);
     }
 };
 
@@ -870,6 +935,7 @@ struct Player {
     bool alive = true;
     float invincible = 0, fire_cd = 0;
     float energy = 1.0f;
+    float energy_max_ = 1.0f;   // ENERGY TANK power-ups grow the reserve (and the bar)
     float energy_drain = 0.065f;
     int w = PLAYER_W, h = PLAYER_H;
     float exhaust_t = 0;
@@ -979,10 +1045,12 @@ struct Player {
         for (int i = 1; i <= w_spread_; ++i) { add(-90.0f * i); add(90.0f * i); }
         return 1 + 2 * w_spread_;
     }
-    void refuel(float amount = 0.40f) { energy = std::min(1.0f, energy + amount); }
+    void refuel(float amount = 0.40f) { energy = std::min(energy_max_, energy + amount); }
+    // 0..1 fraction of the (possibly enlarged) reserve — use this for warnings/tints.
+    float energy_ratio() const { return energy_max_ > 0 ? energy / energy_max_ : 0.0f; }
     bool safe() const { return invincible > 0 || shield_ > 0; }
     bool take_hit() {
-        energy -= 0.35f;
+        energy -= 0.35f * energy_max_;  // a hit costs ~35% of the bar, whatever its size
         invincible = 1.2f;
         if (energy <= 0) { energy = 0.0f; return true; }
         return false;
@@ -992,7 +1060,7 @@ struct Player {
         x = float(nx); y = float(ny);
         alive = true;
         invincible = 2.5f;
-        energy = std::max(energy, 0.35f);
+        energy = std::max(energy, 0.35f * energy_max_);
         fire_cd = 0.0f;
     }
     void draw(Surface& surface, ParticleSystem& particles) const {
@@ -1029,6 +1097,7 @@ void Scout::update(float dt, float scroll_speed, Player& player,
     tick_flash(dt);
     t_ += dt;
     y += (SPEED + scroll_speed * 0.5f) * dt;
+    x = bx_ + std::sin(t_ * freq_) * amp_;   // gentle weave
     fire_cd -= dt;
     if (fire_cd <= 0 && player.alive) {
         fire_cd = rnd_uniform(1.5f, 3.5f);
@@ -1084,6 +1153,30 @@ void Turret::update(float dt, float scroll_speed, Player& player,
     if (fire_cd <= 0 && player.alive) {
         fire_cd = rnd_uniform(1.5f, 3.0f);
         shots.emplace_back(x, y, angle);
+    }
+}
+
+void Diver::update(float dt, float scroll_speed, Player& player,
+                   std::vector<EnemyShot>& /*shots*/) {
+    tick_flash(dt);
+    t_ += dt;
+    if (lock_telegraph_ > 0) lock_telegraph_ -= dt;
+    if (!locked) {
+        // ease in with the scroll until it has a clean line on the player below it
+        y += (95.0f + scroll_speed * 0.5f) * dt;
+        auto [cx, cy] = center();
+        auto [px, py] = player.center();
+        if (player.alive && cy > 36 && py > cy + 8) {
+            locked = true;
+            lock_telegraph_ = 0.18f;
+            float a = std::atan2(float(py - cy), float(px - cx));
+            float spd = 240.0f + scroll_speed * 0.4f;
+            vx = std::cos(a) * spd;
+            vy = std::sin(a) * spd;
+        }
+    } else {
+        x += vx * dt;
+        y += vy * dt;
     }
 }
 
@@ -1167,11 +1260,16 @@ struct Boss {
     Rect rect() const { return {int(x), int(y), w, h}; }
     float hp_ratio() const { return std::max(0.0f, float(hp) / max_hp); }
 
-    // The glowing core weak-point: centred low on the body, only meaningful when
-    // weak_open_ (it pulses open on a cycle in phase 2+). Bonus damage if hit.
+    // Only the later bosses (RIFT WARDEN, VOID TITAN — idx 2,3 of each loop) use
+    // a weak-point. The first bosses (BLOATWARD, THE GULPER) take damage anywhere
+    // on the body, with no target at all.
+    bool uses_core() const { return (tier - 1) % 4 >= 2; }
+
+    // The glowing core weak-point: a SMALL spot deep inside the body (centred),
+    // pulses open/closed for rhythm. Full damage when open; the body only chips.
     Rect weak_rect() const {
-        int ww = std::max(20, w / 5), wh = std::max(20, h / 5);
-        return {int(x + w / 2 - ww / 2), int(y + h * 0.58f - wh / 2), ww, wh};
+        int ww = std::max(16, w / 8), wh = std::max(16, h / 8);
+        return {int(x + w / 2 - ww / 2), int(y + h * 0.50f - wh / 2), ww, wh};
     }
     bool weak_vulnerable() const { return weak_open_ && damageable(); }
 
@@ -1194,7 +1292,13 @@ struct Boss {
 
     void take_damage(int dmg, ParticleSystem& parts, bool weak = false) {
         if (!damageable()) return;
-        if (weak) dmg *= 3;                 // CORE shot: triple damage bonus
+        if (uses_core()) {
+            // Later bosses are armoured: the CORE is the real damage path, body
+            // hits only chip (forgiving, not a wall). Early bosses fall through
+            // and take full damage anywhere.
+            if (weak) dmg *= 2;                  // core pop: satisfying
+            else dmg = std::max(1, dmg / 4);     // body: chip damage only
+        }
         hp -= dmg; hit_flash = 0.14f;
         if (hp <= 0) { dying = true; die_t = 0; hp = 0; want_squeeze = 0; return; }
         // The unexpected: a one-time fake-out death gag around a quarter health.
@@ -1385,9 +1489,10 @@ struct Boss {
         float aggr = (tier <= 1) ? 0.85f : 0.55f;  // first boss stays calm even low
         float iv = atk_iv * (phase == 3 ? aggr : phase == 2 ? 0.85f : 1.0f);
 
-        // weak-point CORE: pulses open on a cycle from phase 2 on (bonus-damage
-        // window). Telegraphed by the glow in draw().
-        weak_open_ = (phase >= 2) && (std::sin(weak_t * 2.0f) > 0.2f);
+        // weak-point CORE (later bosses only): pulses open/closed for rhythm.
+        // Available from the start so the fight isn't a slog — open a good share
+        // of the time. Telegraphed by the glow in draw().
+        weak_open_ = uses_core() && (std::sin(weak_t * 2.0f) > -0.2f);
 
         // sway across the rift (chase attack overrides x itself)
         if (cur_attack != 10) {
@@ -1433,8 +1538,14 @@ struct Boss {
         int bx = int(x + (w - bw) / 2), by = int(y + (h - bh) / 2 + std::sin(bob * 2) * 4);
         if (bw < 4 || bh < 4) return;
         Color body = hit_flash > 0 ? lerp_color(color, WHITE, 0.6f) : color;
-        // soft outer glow
-        draw::rect(s, Color(body.r, body.g, body.b, 70), {bx - 6, by - 6, bw + 12, bh + 12}, 0, cell + 4);
+        // soft outer glow (flood-fill halo, not a hard blocky rect)
+        // soft outer glow — cheap layered translucent rounded rects (glow_rect
+        // allocated a surface per layer each frame, which lagged big-boss fights).
+        for (int gi = 4; gi >= 1; --gi) {
+            int pad = gi * 3;
+            draw::rect(s, Color(body.r, body.g, body.b, 22),
+                       {bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad}, 0, cell + pad);
+        }
         // a GIANT INVADER body (shared pixel-alien art)
         draw_boss_alien(s, face, int(bob * 3) % 2, bx, by, bw, bh, body);
         if (invuln_ > 0) {  // spawn-shield shimmer: can't be hurt yet
@@ -1471,22 +1582,18 @@ struct Boss {
             draw_eye(s, eyr, eyy, er, pcx, pcy);
         }
 
-        // ── weak-point CORE: a pulsing target low on the body (phase 2+) ──
-        if (phase >= 2 && sc > 0.5f) {
+        // ── weak-point CORE (later bosses only): a small glowing spot deep in
+        // the body. No crosshair/target — just a soft glow that flares bright gold
+        // when open (full damage) and dims red when closed (body only chips). ──
+        if (uses_core() && sc > 0.5f) {
             Rect wr = weak_rect();
-            int wcx = wr.x + wr.w / 2, wcy = wr.y + wr.h / 2, wrad = wr.w / 2;
+            int wcx = wr.x + wr.w / 2, wcy = wr.y + wr.h / 2, wrad = std::max(5, wr.w / 2);
             bool open = weak_open_;
-            Color core = open ? Color(255, 240, 80) : Color(120, 60, 60);
+            Color core = open ? Color(255, 240, 80) : Color(150, 70, 70);
             float pulse = 0.6f + 0.4f * std::sin(weak_t * (open ? 9.0f : 3.0f));
-            if (open) glow_circle(s, core, wcx, wcy, wrad + 4, 110);
-            draw::circle(s, BLACK, wcx, wcy, wrad + 3);
+            glow_circle(s, core, wcx, wcy, wrad + (open ? 6 : 2), open ? 140 : 60);
             draw::circle(s, Color(core.r, int(core.g * pulse), int(core.b * pulse)), wcx, wcy, wrad);
             draw::circle(s, WHITE, wcx, wcy, std::max(2, wrad / 2));
-            if (open) {  // crosshair so "shoot HERE" reads at a glance
-                draw::circle(s, Color(255, 240, 80, 160), wcx, wcy, wrad + 6, 2);
-                draw::line(s, WHITE, wcx - wrad - 6, wcy, wcx - wrad, wcy, 2);
-                draw::line(s, WHITE, wcx + wrad, wcy, wcx + wrad + 6, wcy, 2);
-            }
         }
 
         // mouth changes with health / face (drawn above the core)
@@ -1532,12 +1639,12 @@ struct SpawnTable {
 };
 const SpawnTable SPAWN_TABLES[5] = {
     {2.2f, 4.0f, {{"scout", 10}}, 5.0f, 8.0f},
-    {1.8f, 3.2f, {{"scout", 8}, {"flanker", 4}}, 5.5f, 9.0f},
-    {1.4f, 2.8f, {{"scout", 6}, {"flanker", 5}, {"turret", 3}}, 6.0f, 10.0f},
+    {1.8f, 3.2f, {{"scout", 8}, {"flanker", 4}, {"diver", 2}}, 5.5f, 9.0f},
+    {1.4f, 2.8f, {{"scout", 6}, {"flanker", 5}, {"turret", 3}, {"diver", 3}}, 6.0f, 10.0f},
     {1.2f, 2.4f,
-     {{"scout", 5}, {"flanker", 5}, {"turret", 4}, {"cruiser", 2}}, 6.5f, 11.0f},
+     {{"scout", 5}, {"flanker", 5}, {"turret", 4}, {"cruiser", 2}, {"diver", 4}}, 6.5f, 11.0f},
     {0.9f, 1.8f,
-     {{"scout", 4}, {"flanker", 5}, {"turret", 4}, {"cruiser", 3}}, 7.0f, 12.0f},
+     {{"scout", 4}, {"flanker", 5}, {"turret", 4}, {"cruiser", 3}, {"diver", 5}}, 7.0f, 12.0f},
 };
 
 std::string weighted_choice(const std::vector<SpawnKind>& kinds) {
@@ -1597,13 +1704,24 @@ struct Spawner {
                 int rw = terrain.right_wall_w(80);
                 int rift_x = lw;
                 int rift_w = W - lw - rw;
-                // During a fork, confine grunts to the RIGHT (gauntlet) channel so
-                // the LEFT route truly reads as the calm, low-reward option.
+                // During a fork: the RIGHT (gauntlet) channel gets most grunts and
+                // the full mix (the score route), while the LEFT (fuel route) gets
+                // only a light sprinkle of easy scouts — present, but fewer and
+                // gentler, so the safe lane isn't barren but stays the calm option.
                 int dx = 0, dw = 0;
-                bool fork_right = terrain.forking() && terrain.divider_at(80.0f, dx, dw);
-                if (fork_right) {
-                    rift_x = dx + dw;
-                    rift_w = (W - rw) - rift_x;
+                bool forking = terrain.forking() && terrain.divider_at(80.0f, dx, dw);
+                bool fork_right = forking;  // flanker edge math: gauntlet is on the right
+                if (forking) {
+                    bool spawn_left = rnd01() < 0.30f;
+                    if (spawn_left) {
+                        kind = "scout";          // safe lane: easy descenders only
+                        rift_x = lw;
+                        rift_w = dx - rift_x;
+                        fork_right = false;
+                    } else {
+                        rift_x = dx + dw;
+                        rift_w = (W - rw) - rift_x;
+                    }
                 }
 
                 if (rift_w >= 60) {
@@ -1629,6 +1747,9 @@ struct Spawner {
                     } else if (kind == "cruiser") {
                         auto e = std::make_unique<Cruiser>(spawn_x - 23, spawn_y);
                         made = e.get(); enemies.push_back(std::move(e));
+                    } else if (kind == "diver") {
+                        auto e = std::make_unique<Diver>(spawn_x - 10, spawn_y);
+                        made = e.get(); enemies.push_back(std::move(e));
                     }
                     // "turret" -> from pending station placements only
                     if (made && armored && kind != "turret") {
@@ -1653,8 +1774,9 @@ struct Spawner {
         }
 
         // Cores keep flowing even mid-boss (energy management stays central).
-        // During a fork the RIGHT (gauntlet) channel is where the cores live, and
-        // a touch more often — the gauntlet's reward is fuel as well as score.
+        // During a fork the LEFT (safe) channel is the FUEL route: cores cluster
+        // there, a touch more often — so the calm lane's reward is energy, while
+        // the gauntlet's reward is score. That makes the choice a real trade-off.
         core_cd -= dt;
         if (core_cd <= 0) {
             const int CORE_R = 12;
@@ -1662,11 +1784,11 @@ struct Spawner {
             int dx = 0, dw = 0;
             if (terrain.forking() && terrain.divider_at(80.0f, dx, dw)) {
                 core_cd = rnd_uniform(table.core_lo * 0.7f, table.core_hi * 0.7f);
-                int rw = terrain.right_wall_w(80);
-                int rch_x = dx + dw + margin;
-                int rch_w = (W - rw) - rch_x - margin;
-                if (rch_w > CORE_R * 2) {
-                    int cx = rch_x + rnd_int(0, std::max(1, rch_w - 1));
+                int lw = terrain.left_wall_w(80);
+                int lch_x = lw + margin;
+                int lch_w = dx - lch_x - margin;
+                if (lch_w > CORE_R * 2) {
+                    int cx = lch_x + rnd_int(0, std::max(1, lch_w - 1));
                     cores.emplace_back(float(cx), -20.0f);
                 }
             } else {
@@ -1830,7 +1952,11 @@ private:
         }
         tele(J().add("ev", "zone_start").add("zone", zone_).add("t", (double)game_t_)
                 .add("load", loadout()).add("lives", lives_));
-        if (std::getenv("VOID_BOSS")) { state_ = St::Play; ready_t_ = 0; start_boss(); }  // debug: verify boss
+        if (const char* bv = std::getenv("VOID_BOSS")) {  // debug: verify boss (VOID_BOSS=N -> tier N)
+            int t = atoi(bv);
+            if (t > 1) boss_tier_ = t - 1;
+            state_ = St::Play; ready_t_ = 0; start_boss();
+        }
         if (std::getenv("VOID_FORK")) {  // debug: force a fork right away
             zone_ = 1; state_ = St::Play; ready_t_ = 0; terrain_->fork_cd = 2;
         }
@@ -1848,7 +1974,9 @@ private:
     }
     void restore_checkpoint() {
         player_->respawn(ctx_.W / 2 - 11, ctx_.H - 160);
-        player_->energy = std::max(0.3f, checkpoint_energy_);
+        // Respawn with a FULL tank — energy is too scarce to drop back into a
+        // later zone half-empty (the checkpoint energy felt punishing).
+        player_->energy = player_->energy_max_;
         enemies_.clear();
         enemy_shots_.clear();
         player_shots_.clear();
@@ -1883,10 +2011,11 @@ private:
     void spawn_powerup(float x, float y) {
         int r = rnd_int(0, 99);
         PU k;
-        if (r < 26) k = PU::Rapid; else if (r < 48) k = PU::Spread;
-        else if (r < 62) k = PU::Pierce; else if (r < 74) k = PU::Shield;
-        else if (r < 86) k = PU::Fuel; else if (r < 93) k = PU::Nuke;
-        else if (r < 97) k = PU::Life; else k = PU::Mystery;
+        if (r < 24) k = PU::Rapid; else if (r < 44) k = PU::Spread;
+        else if (r < 57) k = PU::Pierce; else if (r < 68) k = PU::Shield;
+        else if (r < 79) k = PU::Fuel; else if (r < 86) k = PU::Nuke;
+        else if (r < 90) k = PU::Life; else if (r < 96) k = PU::Tank;
+        else k = PU::Mystery;
         powerups_.push_back({x, y, 0, k});
     }
     void maybe_drop(float x, float y, float base) {
@@ -1912,6 +2041,9 @@ private:
             case PU::Fuel:   player_->refuel(0.55f); msg = "FUEL CELL!"; break;
             case PU::Life:   lives_++; msg = "EXTRA LIFE!"; break;
             case PU::Nuke:   nukes_++; msg = "NUKE ACQUIRED!"; break;
+            case PU::Tank:   player_->energy_max_ = std::min(2.5f, player_->energy_max_ + 0.5f);
+                             player_->energy = player_->energy_max_;  // top off into the bigger tank
+                             msg = "ENERGY TANK!"; break;
             default: break;
         }
         add_flash(msg, player_->x + player_->w / 2, player_->y - 30, YELLOW, 1.2f);
@@ -2122,7 +2254,7 @@ void VoidRaidGame::update_play(float dt, const Input& in) {
         player_->bot = true;
         player_->bdx = tx > pcx + 6 ? 1.f : tx < pcx - 6 ? -1.f : 0.f;
         player_->bdy = ty > pcy + 6 ? 1.f : ty < pcy - 6 ? -1.f : 0.f;
-        if (player_->energy < 0.3f)
+        if (player_->energy_ratio() < 0.3f)
             scroll_speed_ = std::max(SCROLL_MIN, scroll_speed_ - SCROLL_ACCEL * dt);
         int n = player_->shoot(player_shots_);
         if (n > 0) { zone_shots_ += n; if (ctx_.sfx) ctx_.sfx->shoot(); }
@@ -2238,8 +2370,8 @@ void VoidRaidGame::update_play(float dt, const Input& in) {
     }
 
     // Low energy warning — faster beeps as energy drops
-    if (player_->energy < 0.25f) {
-        float beep_interval = 0.15f + (player_->energy / 0.25f) * 0.25f;
+    if (player_->energy_ratio() < 0.25f) {
+        float beep_interval = 0.15f + (player_->energy_ratio() / 0.25f) * 0.25f;
         low_energy_beep_ -= dt;
         if (low_energy_beep_ <= 0) {
             low_energy_beep_ = beep_interval;
@@ -2261,6 +2393,23 @@ void VoidRaidGame::update_play(float dt, const Input& in) {
                    [&](const std::unique_ptr<Enemy>& e) {
                        return !(e->alive && e->y < ctx_.H + 60);
                    }), enemies_.end());
+
+    // Kamikaze ramming: Divers damage the player on body contact (then die).
+    if (player_->alive && !player_->safe()) {
+        Rect pr = player_->rect();
+        for (auto& e : enemies_) {
+            if (!e->alive || !e->rams() || !overlap(pr, e->rect())) continue;
+            e->alive = false;
+            auto [cx, cy] = player_->center();
+            particles_.explode_invader(cx, cy, e->color, 16);
+            bool destroyed = player_->take_hit();
+            if (destroyed) { player_die(); return; }
+            add_flash("RAMMED!", cx, cy - 20, C_DIVER, 0.7f);
+            if (ctx_.sfx) ctx_.sfx->brick_hit();
+            if (ctx_.fx) { ctx_.fx->shake(7); ctx_.fx->rumble(0.5f, 0.6f, 160); }
+            break;
+        }
+    }
 
     // Boss
     if (boss_) {
@@ -2340,7 +2489,7 @@ void VoidRaidGame::update_fork(float dt) {
     // Telegraph a moment before the split materialises.
     if (t.fork_pending_hint) {
         add_flash("RIFT FORK AHEAD", ctx_.W / 2.0f, ctx_.H * 0.34f, CYAN, 1.6f, true);
-        add_flash("<< SAFE        RISKY >>", ctx_.W / 2.0f, ctx_.H * 0.40f,
+        add_flash("<< FUEL        SCORE >>", ctx_.W / 2.0f, ctx_.H * 0.40f,
                   YELLOW, 1.6f, true);
         if (ctx_.sfx) ctx_.sfx->low_energy_pip();
     }
@@ -2391,7 +2540,7 @@ void VoidRaidGame::update_fork(float dt) {
                 tele(J().add("ev", "fork_right").add("zone", zone_).add("t", (double)game_t_)
                         .add("bonus", bonus).add("rt", (double)right_time_));
             } else {
-                add_flash("SAFE ROUTE", ctx_.W / 2.0f, ctx_.H * 0.42f, GREEN, 1.4f);
+                add_flash("FUEL ROUTE", ctx_.W / 2.0f, ctx_.H * 0.42f, GREEN, 1.4f);
                 tele(J().add("ev", "fork_left").add("zone", zone_).add("t", (double)game_t_));
             }
         }
@@ -2664,11 +2813,14 @@ void VoidRaidGame::draw_hud(Surface& s) {
         draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
     }
 
-    // Energy bar (bottom)
-    int bar_w = 220, bar_h = 14;
+    // Energy bar (bottom). The bar GROWS with the tank's capacity (ENERGY TANK
+    // power-ups) — base width per unit of reserve — so a bigger reserve reads as
+    // a literally wider bar. Colour/fill use the 0..1 ratio.
+    int base_w = 220, bar_h = 14;
+    int bar_w = int(base_w * player_->energy_max_);
     int bar_x = ctx_.W / 2 - bar_w / 2;
     int bar_y = ctx_.H - 30;
-    float e = player_->energy;
+    float e = player_->energy_ratio();
 
     draw::rect(s, Color(20, 30, 40), {bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2},
                0, 4);
@@ -2683,6 +2835,10 @@ void VoidRaidGame::draw_hud(Surface& s) {
         gs.fill(Color(col.r, col.g, col.b, 50));
         s.blit(gs, bar_x, bar_y);
     }
+    // unit-segment dividers so an enlarged tank reads as discrete capacity tiers
+    for (int u = 1; u < int(player_->energy_max_ + 0.001f); ++u)
+        draw::line(s, Color(10, 20, 30, 180), bar_x + base_w * u, bar_y,
+                   bar_x + base_w * u, bar_y + bar_h, 1);
     draw::rect(s, Color(60, 80, 100), {bar_x, bar_y, bar_w, bar_h}, 1, 3);
 
     // Label

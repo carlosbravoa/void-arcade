@@ -1160,6 +1160,7 @@ private:
     int w_rapid_ = 0, w_spread_ = 0, w_side_ = 0, w_pierce_ = 0, nukes_ = 0;
     int kills_since_drop_ = 0;
     float shield_ = 0, nuke_flash_ = 0;
+    float pierce_t_ = 0;   // PIERCE is now a timed buff (was a permanent stacking level)
     // Rescue reward: a brief twin-shot spread so capture-then-rescue pays off.
     float twin_boost_ = 0;
 
@@ -1286,7 +1287,7 @@ private:
             case PU::Rapid:  w_rapid_ = std::min(3, w_rapid_ + 1); msg = "RAPID FIRE!"; break;
             case PU::Spread: w_spread_ = std::min(2, w_spread_ + 1); msg = "SPREAD SHOT!"; break;
             case PU::Side:   w_side_ = std::min(2, w_side_ + 1); msg = "WING CANNONS!"; break;
-            case PU::Pierce: w_pierce_ = std::min(2, w_pierce_ + 1); msg = "PIERCING ROUNDS!"; break;
+            case PU::Pierce: pierce_t_ = std::min(12.0f, pierce_t_ + 8.0f); msg = "PIERCING ROUNDS!"; break;
             case PU::Shield: shield_ = 7.0f; msg = "SHIELD UP!"; break;
             case PU::Life:   player_->lives++; msg = "EXTRA LIFE!"; break;
             case PU::Nuke:   nukes_++; msg = "NUKE ACQUIRED!"; break;
@@ -1366,7 +1367,7 @@ void GalagaGame::fire() {
     int dmg = 1 + weapon_tier() / 4;
     auto add = [&](float x, float vx) {
         Bullet b; b.x = x; b.y = py; b.vx = vx; b.vy = -520;
-        b.color = col; b.pierce = w_pierce_; b.damage = dmg;
+        b.color = col; b.pierce = pierce_t_ > 0 ? 2 : 0; b.damage = dmg;
         b.w = 3 + std::min(3, weapon_tier() / 2);
         p_bullets_.push_back(b);
     };
@@ -1591,7 +1592,7 @@ void GalagaGame::hit_player() {
     particles_.explode_player(cx, cy);
     // Death costs you your arsenal — start the weapon climb over (nukes survive).
     bool had_weapons = w_rapid_ || w_spread_ || w_side_ || w_pierce_;
-    w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0;
+    w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0; pierce_t_ = 0;
     shield_ = 0;
     twin_boost_ = 0;
     if (had_weapons) add_flash("WEAPONS LOST!", cx, cy - 44, RED, 1.8f, true);
@@ -1609,6 +1610,7 @@ void GalagaGame::update_entering(float dt, const Input& in) {
     bool want_nuke = false;
     handle_keys(dt, in, want_nuke);
     if (shield_ > 0) shield_ -= dt;
+    if (pierce_t_ > 0) pierce_t_ -= dt;
     if (twin_boost_ > 0) twin_boost_ -= dt;
     formation_->update(dt, ctx_.H, ctx_.W);
     if (ctx_.sfx && formation_->anim_ticked) ctx_.sfx->march_tick();
@@ -1627,6 +1629,7 @@ void GalagaGame::update_play(float dt, const Input& in) {
     handle_keys(dt, in, want_nuke);
     if (want_nuke) detonate_nuke();
     if (shield_ > 0) shield_ -= dt;
+    if (pierce_t_ > 0) pierce_t_ -= dt;
     if (twin_boost_ > 0) twin_boost_ -= dt;
 
     if (!player_->alive) { return; }
@@ -1674,6 +1677,21 @@ void GalagaGame::update_play(float dt, const Input& in) {
         overlap(player_->rect(), boss_->rect())) {
         hit_player();
         return;
+    }
+    // A DIVING enemy that flies INTO you crashes your fighter (it used to pass
+    // through harmlessly). Only enemies out of formation, and never through the
+    // spawn-shield / power shield.
+    if (formation_ && player_->alive && !player_->captured &&
+        player_->invincible <= 0 && shield_ <= 0) {
+        for (auto& e : formation_->enemies) {
+            if (!e.alive || e.state == "formation" || e.state == "entering") continue;
+            if (!overlap(player_->rect(), e.rect())) continue;
+            e.alive = false;
+            auto [cx, cy] = e.center();
+            particles_.explode_invader(cx, cy, e.color(), 18);
+            hit_player();
+            return;
+        }
     }
     update_powerups(dt);
 
@@ -1753,7 +1771,7 @@ void GalagaGame::update_captured(float dt) {
         player_->captured = false;
         player_->kill();
         // capture costs the arsenal too (mirror death reset)
-        w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0;
+        w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0; pierce_t_ = 0;
         shield_ = 0;
         if (player_->lives > 0) {
             player_->respawn(ctx_.W / 2 - 14);
@@ -1990,6 +2008,8 @@ void GalagaGame::draw_hud(Surface& s) {
         draw_text_right(s, *ctx_.fonts.small, "TWIN " + std::to_string(int(twin_boost_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 62, ORANGE);
     if (shield_ > 0)
         draw_text_right(s, *ctx_.fonts.small, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 26, Color(80, 220, 255));
+    if (pierce_t_ > 0)
+        draw_text_right(s, *ctx_.fonts.small, "PIERCE " + std::to_string(int(pierce_t_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 10, Color(200, 100, 255));
     else
         draw_text_right(s, *ctx_.fonts.small, "P PAUSE", ctx_.W - 12, ctx_.H - 26, Color(25, 50, 70));
 }

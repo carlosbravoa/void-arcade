@@ -147,17 +147,21 @@ struct Bullet {
     Color color;
     bool alive = true;
     bool enemy = false;
+    int power = 1;          // 1 = normal; 2..4 = charged shot (bigger + more damage)
     void update(float dt, int sw, int sh) {
         x = wrapf(x + vx * dt, (float)sw);
         y = wrapf(y + vy * dt, (float)sh);
         life -= dt;
         if (life <= 0) alive = false;
     }
-    Rect rect() const { return {int(x) - 3, int(y) - 3, 6, 6}; }
+    int rad() const { return power > 1 ? 3 + power : 2; }   // charged bullets are fatter
+    Rect rect() const { int r = rad() + 1; return {int(x) - r, int(y) - r, r * 2, r * 2}; }
     void draw(Surface& s) const {
         if (!alive) return;
-        draw::circle(s, Color(color.r, color.g, color.b, 80), int(x), int(y), 5);
-        draw::circle(s, color, int(x), int(y), 2);
+        int r = rad();
+        draw::circle(s, Color(color.r, color.g, color.b, 80), int(x), int(y), r + 3);
+        draw::circle(s, color, int(x), int(y), r);
+        if (power > 1) draw::circle(s, WHITE, int(x), int(y), std::max(1, r / 2));  // hot core
     }
 };
 
@@ -287,6 +291,8 @@ struct Saucer {
     bool small = false;  // small saucer aims; big one sprays
     float radius = 18;
     int wave = 1;
+    int hp = 5, max_hp = 5;   // survives several shots (5 on wave 1, +1 per wave)
+    float hit_flash = 0;
 
     Saucer(int wv) : wave(wv) { spawn_cd = rnd_uniform(10, 18); }
     Rect rect() const { return {int(x) - int(radius), int(y) - int(radius),
@@ -302,6 +308,7 @@ struct Saucer {
                 dir = rnd01() < 0.5f ? 1 : -1;
                 small = wave >= 3 && rnd01() < std::min(0.55f, 0.2f + wave * 0.04f);
                 radius = small ? 13 : 20;
+                max_hp = hp = 4 + wave;   // 5 on wave 1, one more each wave
                 x = dir == 1 ? -radius : sw + radius;
                 y = rnd_uniform(60, sh - 120);
                 vx = dir * (small ? 130.0f : 95.0f);
@@ -312,6 +319,7 @@ struct Saucer {
             return false;
         }
         anim_t += dt;
+        if (hit_flash > 0) hit_flash -= dt * 5;
         x += vx * dt;
         y += vy * dt;
         // occasional vertical jink to feel alive
@@ -344,6 +352,17 @@ struct Saucer {
         // soft halo behind the hull, then the hull itself.
         s.blit(*sp.glow, ox - sp.glow_r, oy - sp.glow_r);
         s.blit(*sp.hull, ox, oy);
+
+        // white impact flash when shot (it's armoured — takes several hits).
+        if (hit_flash > 0.05f)
+            draw::circle(s, Color(255, 255, 255, int(150 * std::min(1.0f, hit_flash))),
+                         cx, cy, int(radius));
+        // armour bar so you can read the multi-hit progress.
+        if (hp < max_hp) {
+            int bw = std::max(24, int(radius * 2)), bx = cx - bw / 2, by = oy - 7;
+            draw::rect(s, Color(30, 30, 40), {bx, by, bw, 3});
+            draw::rect(s, Color(120, 255, 160), {bx, by, int(bw * float(hp) / max_hp), 3});
+        }
 
         // dome porthole: a glowing eye on the dome that subtly pulses.
         Color dome_col = small ? CYAN : Color(150, 230, 255);
@@ -569,7 +588,8 @@ public:
     void draw(Surface& s) override;
     void on_exit() override {
         submit_scores();
-        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->stop_ambient(); }
+        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->stop_ambient(); ctx_.sfx->stop_charge(); }
+        charge_snd_ = false;
     }
 
 private:
@@ -600,6 +620,10 @@ private:
     int w_spread_ = 0, w_rapid_ = 0;
     float shield_ = 0;
     float hyper_cd_ = 0;
+    // charge-shot state (hold fire to build a 2x–4x shot; rising hum like Storm)
+    float fire_hold_t_ = 0, charge_ = 0;
+    bool charging_ = false, charge_snd_ = false;
+    static constexpr float CHARGE_DELAY = 0.15f;   // hold this long before charging starts
 
     bool bot_ = false;
     float game_t_ = 0;
@@ -672,24 +696,32 @@ private:
         }
     }
 
-    void fire() {
+    void fire(int power = 1, float charge = 0.0f) {
         if (!ship_->alive || ship_->fire_cd > 0) return;
         if ((int)bullets_.size() >= MAX_BULLETS + w_spread_ * 2) return;
         ship_->fire_cd = std::max(0.12f, 0.30f - w_rapid_ * 0.05f);
+        bool charged = power > 1;
         auto h = ship_->hull();
         float tx = (float)h[0].first, ty = (float)h[0].second;
-        Color col = GOLD;
+        Color col = charged ? Color(120, 225, 255) : GOLD;   // charged = hot cyan
+        float spd = charged ? 720.0f : 620.0f;
         auto add = [&](float off) {
             Bullet b;
             b.x = tx; b.y = ty;
-            b.vx = std::cos(ship_->ang + off) * 620 + ship_->vx;
-            b.vy = std::sin(ship_->ang + off) * 620 + ship_->vy;
-            b.life = 0.85f; b.color = col;
+            b.vx = std::cos(ship_->ang + off) * spd + ship_->vx;
+            b.vy = std::sin(ship_->ang + off) * spd + ship_->vy;
+            b.life = charged ? 1.0f : 0.85f; b.color = col; b.power = power;
             bullets_.push_back(b);
         };
         add(0);
-        for (int i = 1; i <= w_spread_; ++i) { add(i * 0.16f); add(-i * 0.16f); }
-        if (ctx_.sfx) { ctx_.sfx->pan_next(tx / float(ctx_.W)); ctx_.sfx->shoot(); }
+        // a charged shot is a single fat lance; normal shots still spread
+        if (!charged) for (int i = 1; i <= w_spread_; ++i) { add(i * 0.16f); add(-i * 0.16f); }
+        if (ctx_.sfx) {
+            ctx_.sfx->pan_next(tx / float(ctx_.W));
+            if (charged) ctx_.sfx->charged_blast(0.3f + 0.7f * charge);
+            else ctx_.sfx->shoot();
+        }
+        if (charged && ctx_.fx) ctx_.fx->shake(2 + int(3 * charge));
     }
 
     void hyperspace() {
@@ -697,20 +729,24 @@ private:
         hyper_cd_ = 1.2f;
         auto [cx, cy] = std::pair<int, int>{int(ship_->x), int(ship_->y)};
         particles_.ufo_explode((float)cx, (float)cy, 14);
-        ship_->x = rnd_uniform(60, ctx_.W - 60);
-        ship_->y = rnd_uniform(60, ctx_.H - 60);
-        ship_->vx = ship_->vy = 0;
-        particles_.ufo_explode(ship_->x, ship_->y, 14);
-        if (ctx_.sfx) { ctx_.sfx->pan_next(ship_->x / float(ctx_.W)); ctx_.sfx->warp(); }
-        if (ctx_.fx) ctx_.fx->shake(5);
-        // small panic risk: ~12% chance you rematerialise inside a rock (classic)
-        if (rnd01() < 0.12f) {
+        // Rematerialise somewhere CLEAR — re-roll a few times to avoid landing in a
+        // rock. (No more classic self-destruct: hyperspace must never auto-kill you.)
+        for (int tries = 0; tries < 10; ++tries) {
+            ship_->x = rnd_uniform(60, ctx_.W - 60);
+            ship_->y = rnd_uniform(60, ctx_.H - 60);
+            bool clear = true;
             for (auto& r : rocks_) {
                 float d = std::hypot(wrap_delta(ship_->x, r.x, (float)ctx_.W),
                                      wrap_delta(ship_->y, r.y, (float)ctx_.H));
-                if (d < r.radius + ship_->radius) { kill_ship("BAD JUMP!"); break; }
+                if (d < r.radius + ship_->radius + 24) { clear = false; break; }
             }
+            if (clear) break;
         }
+        ship_->vx = ship_->vy = 0;
+        ship_->invincible = std::max(ship_->invincible, 0.6f);   // brief grace on arrival
+        particles_.ufo_explode(ship_->x, ship_->y, 14);
+        if (ctx_.sfx) { ctx_.sfx->pan_next(ship_->x / float(ctx_.W)); ctx_.sfx->warp(); }
+        if (ctx_.fx) ctx_.fx->shake(5);
     }
 
     // Takes the rock BY VALUE, and defers child rocks into rock_spawn_ instead of
@@ -784,7 +820,7 @@ void VoidDriftGame::update(float dt, const Input& in) {
     for (auto k : in.pressed)
         if (k == SDLK_p && state_ == St::Play) {
             pause_.toggle();
-            if (ctx_.sfx && pause_.active()) ctx_.sfx->stop_ufo();
+            if (ctx_.sfx && pause_.active()) { ctx_.sfx->stop_ufo(); ctx_.sfx->stop_charge(); charge_snd_ = false; }
         }
     if (pause_.active()) {
         if (pause_.update(in) == PauseResult::QuitToMenu) quit_to_menu = true;
@@ -854,7 +890,8 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
         bot_decide(turn, thrust, want_fire, want_hyper);
     } else {
         turn = (in.down(SDLK_RIGHT) || in.down(SDLK_d)) - (in.down(SDLK_LEFT) || in.down(SDLK_a));
-        thrust = in.down(SDLK_UP) || in.down(SDLK_w);
+        // thrust: UP/W, or the gamepad B button (A shoots, so accel sits on B — Xbox layout)
+        thrust = in.down(SDLK_UP) || in.down(SDLK_w) || in.pad[PadBtnB];
         want_fire = in.down(SDLK_SPACE);
         for (auto k : in.pressed) if (k == SDLK_DOWN || k == SDLK_s) want_hyper = true;
     }
@@ -863,9 +900,33 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
     if (shield_ > 0) shield_ -= dt;
     if (want_hyper) hyperspace();
     ship_->update(dt, turn, thrust, ctx_.W, ctx_.H);
-    if (thrust && ctx_.sfx && rnd01() < 0.15f) {}  // (thrust is silent; flame is the feedback)
-    if (!ship_->alive) return;
-    if (want_fire) fire();
+    if (!ship_->alive) {
+        if (charge_snd_ && ctx_.sfx) { ctx_.sfx->stop_charge(); }
+        charge_snd_ = charging_ = false; fire_hold_t_ = charge_ = 0;
+        return;
+    }
+
+    // ── firing: bot taps; human taps for normal shots but HOLDING charges a
+    //    2x–4x shot (same rising hum + timing as Void Storm's charge beam). ──
+    if (bot_) {
+        if (want_fire) fire();
+    } else if (want_fire) {
+        fire_hold_t_ += dt;
+        if (fire_hold_t_ >= CHARGE_DELAY) {
+            charging_ = true;
+            charge_ = std::min(1.0f, charge_ + dt * 0.9f);   // matches Storm's charge rate
+            if (!charge_snd_ && ctx_.sfx) { ctx_.sfx->start_charge(); charge_snd_ = true; }
+        }
+    } else {
+        if (charging_) {
+            int power = 2 + int(2.0f * charge_ + 0.5f);   // 2..4 by charge
+            fire(std::min(4, power), charge_);
+        } else if (fire_hold_t_ > 0) {
+            fire();                                        // quick tap -> normal shot
+        }
+        fire_hold_t_ = 0; charge_ = 0; charging_ = false;
+        if (charge_snd_ && ctx_.sfx) { ctx_.sfx->stop_charge(); charge_snd_ = false; }
+    }
 
     for (auto& b : bullets_) {
         b.update(dt, ctx_.W, ctx_.H);
@@ -934,20 +995,32 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
         if (!b.alive) continue;
         if (saucer_->active && overlap(b.rect(), saucer_->rect())) {
             b.alive = false;
-            int pts = saucer_->points() * (ctx_.combo ? ctx_.combo->hit() : 1);
-            score_ += pts;
             auto [sx, sy] = std::pair<int, int>{int(saucer_->x), int(saucer_->y)};
-            particles_.ufo_explode((float)sx, (float)sy);
-            add_flash("+" + std::to_string(pts) + "!", (float)sx, sy - 20, PURPLE);
-            maybe_drop((float)sx, (float)sy, 0.6f);
-            saucer_->reset_idle();
-            if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->boss_explosion(); }
-            if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->hitstop(0.04f); }
+            saucer_->hp -= b.power;
+            saucer_->hit_flash = 1.0f;
+            if (saucer_->hp > 0) {
+                // non-fatal: a metallic clang, a shower of sparks, and it gets shoved
+                // back a little (in the bullet's travel direction) until it dies.
+                particles_.explode_invader(sx, sy, Color(200, 210, 235), 5);
+                saucer_->x += (b.vx >= 0 ? 1.0f : -1.0f) * (10.0f + 2.0f * b.power);
+                saucer_->y += (b.vy >= 0 ? 1.0f : -1.0f) * 5.0f;
+                if (ctx_.sfx) { ctx_.sfx->pan_next(sx / float(ctx_.W)); ctx_.sfx->shield_hit(); }
+                if (ctx_.fx) ctx_.fx->shake(2);
+            } else {
+                int pts = saucer_->points() * (ctx_.combo ? ctx_.combo->hit() : 1);
+                score_ += pts;
+                particles_.ufo_explode((float)sx, (float)sy);
+                add_flash("+" + std::to_string(pts) + "!", (float)sx, sy - 20, PURPLE);
+                maybe_drop((float)sx, (float)sy, 0.6f);
+                saucer_->reset_idle();
+                if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->boss_explosion(); }
+                if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->hitstop(0.04f); }
+            }
             continue;
         }
         if (boss_ && boss_->damageable() && overlap(b.rect(), boss_->rect())) {
             b.alive = false;
-            boss_->take_damage(1);
+            boss_->take_damage(b.power);
             score_ += 5;
             particles_.explode_invader(b.x, b.y, boss_->color, 6);
             if (ctx_.sfx) ctx_.sfx->invader_hit();

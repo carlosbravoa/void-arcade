@@ -33,6 +33,7 @@
 
 #include "engine/boss_art.h"
 #include "engine/combo.h"
+#include "engine/enemy_art.h"
 #include "engine/initials.h"
 #include "engine/input.h"
 #include "engine/juice.h"
@@ -76,7 +77,12 @@ constexpr int BOSS_EVERY = 5;          // a boss every 5th stage
 // World scroll (right -> left). Climbs with stage; player has no throttle here.
 constexpr float SCROLL_BASE = 130.0f;
 
-using SL = std::vector<std::string>;
+// Deep-stage enemy aggression: <1.0 shortens enemy fire cooldowns (so they fire
+// more often). Set per stage in advance_stage(); keeps firing escalating past the
+// 5 base spawn tables.
+float g_aggro = 1.0f;
+
+// SL, EnemyArt, make_enemy_art and blit_enemy now come from engine/enemy_art.h.
 
 Color darker(Color c, float f) { return Color(int(c.r * f), int(c.g * f), int(c.b * f)); }
 
@@ -315,42 +321,6 @@ const SL TURRET_BASE = {
     "##########",
 };
 
-// Sprite cache: build the two frames (each as a glowing surface) once per type.
-struct EnemyArt {
-    std::shared_ptr<Surface> frame[2];
-    std::shared_ptr<Surface> flash[2];   // white silhouette for hit-flash
-    int cw = 0, ch = 0;   // unscaled cell dims (for centring)
-    int scale = 0;
-};
-// '@' cells render as a hot near-white cockpit/highlight; '#' as the body color.
-Surface build_enemy_frame(const SL& grid, Color body, int scale) {
-    Surface s = make_sprite_surface(grid, body, scale);
-    // overlay '@' highlight cells (cockpit / core glow)
-    Color hi(std::min(255, body.r + 110), std::min(255, body.g + 110),
-             std::min(255, body.b + 110));
-    for (int r = 0; r < (int)grid.size(); ++r)
-        for (int c = 0; c < (int)grid[r].size(); ++c)
-            if (grid[r][c] == '@')
-                draw::rect(s, hi, {c * scale, r * scale, scale, scale});
-    return s;
-}
-EnemyArt make_enemy_art(const SL& f0, const SL& f1, Color body, int scale,
-                        int glow_r = 6, float glow_i = 0.8f) {
-    EnemyArt a;
-    a.scale = scale;
-    a.cw = (int)f0[0].size();
-    a.ch = (int)f0.size();
-    Surface s0 = build_enemy_frame(f0, body, scale);
-    Surface s1 = build_enemy_frame(f1, body, scale);
-    a.frame[0] = glow_surface(s0, body, glow_r, glow_i);
-    a.frame[1] = glow_surface(s1, body, glow_r, glow_i);
-    // White silhouettes (same body shape) for the hit-flash flicker.
-    Surface w0 = make_sprite_surface(f0, WHITE, scale);
-    Surface w1 = make_sprite_surface(f1, WHITE, scale);
-    a.flash[0] = glow_surface(w0, WHITE, glow_r, glow_i);
-    a.flash[1] = glow_surface(w1, WHITE, glow_r, glow_i);
-    return a;
-}
 // Lazily-built, function-local caches (one set, shared by all instances).
 const EnemyArt& darter_art() {
     static EnemyArt a = make_enemy_art(DARTER_F0, DARTER_F1, C_DARTER, 2);
@@ -371,23 +341,6 @@ const EnemyArt& carrier_art() {
 const EnemyArt& turret_art() {
     static EnemyArt a = make_enemy_art(TURRET_BASE, TURRET_BASE, C_TURRET, 3);
     return a;
-}
-
-// Blit a cached enemy frame centred on (cx,cy), tinting white on hit-flash. The
-// glow surface already carries a halo, so this is a single blit.
-void blit_enemy(Surface& s, const EnemyArt& art, int frame, int cx, int cy,
-                float hit_flash) {
-    const Surface& g = *art.frame[frame & 1];
-    int gx = cx - g.width() / 2, gy = cy - g.height() / 2;
-    s.blit(g, gx, gy);
-    if (hit_flash > 0) {
-        // overlay the matching white silhouette at the flash's alpha — a clean,
-        // shape-correct impact flicker that costs no per-frame allocation.
-        Surface& f = *art.flash[frame & 1];
-        f.set_alpha(int(170 * std::min(1.0f, hit_flash)));
-        s.blit(f, gx, gy);
-        f.set_alpha(-1);
-    }
 }
 
 // ── Shots ─────────────────────────────────────────────────────────────────────
@@ -797,19 +750,24 @@ struct Player {
     int release_beam(std::vector<PlayerShot>& out) {
         float c = charge_;
         charge_ = 0; charging_ = false;
-        if (c < 0.25f) return tap_fire(out);   // not enough charge -> normal shot
+        if (c < 0.12f) return tap_fire(out);   // not enough charge -> normal shot
         bool full = c >= 1.0f;                 // only a max charge clears enemy fire
         auto [gx, gy] = nose();
-        int beam_h = int(10 + 28 * c);
-        int dmg = int(3 + 9 * c);
-        PlayerShot s{float(gx), float(gy), 1100.0f, 60, beam_h};
-        s.beam = true; s.full = full; s.color = BEAM_COLOR; s.damage = dmg; s.pierce = 999;
+        // Everything scales with how long it was held, so a slight charge is a
+        // small/short/dim lance and a near-full charge is a fat/long/white-hot one.
+        int beam_h = int(6 + 48 * c);          // thickness  (~12 slight … 54 full)
+        int beam_w = int(34 + 86 * c);         // length     (~44 slight … 120 full)
+        int dmg = int(2 + 14 * c);             // power
+        Color bc = lerp_color(BEAM_COLOR, WHITE, 0.45f * c);  // hotter when fuller
+        PlayerShot s{float(gx), float(gy), 1100.0f, beam_w, beam_h};
+        s.beam = true; s.full = full; s.color = bc; s.damage = dmg; s.pierce = 999;
         out.push_back(s);
         for (auto& o : options_) {
             // Option pods fire at ~1/3 the main beam's power, so stacking pods on
             // a charged beam stays strong but not abusive.
-            PlayerShot os{o.x + w, o.y + h / 2.0f, 1100.0f, 40, std::max(7, beam_h - 8)};
-            os.beam = true; os.full = full; os.color = BEAM_COLOR; os.damage = std::max(1, dmg / 3);
+            PlayerShot os{o.x + w, o.y + h / 2.0f, 1100.0f, std::max(30, beam_w - 24),
+                          std::max(7, beam_h - 8)};
+            os.beam = true; os.full = full; os.color = bc; os.damage = std::max(1, dmg / 3);
             os.pierce = 999; out.push_back(os);
         }
         fire_cd = 0.18f;
@@ -876,6 +834,7 @@ struct Enemy {
     int pts = 0;
     float hit_flash = 0;
     bool carrier = false;       // drops a guaranteed power-up
+    bool hardened = false;      // deep-stage armour: extra HP + a steel ring
     virtual ~Enemy() = default;
     virtual Rect rect() const = 0;
     virtual std::pair<int, int> center() const = 0;
@@ -1036,7 +995,7 @@ void Darter::update(float dt, float scroll_speed, Player& player,
     x -= (SPEED + scroll_speed * 0.4f) * dt;
     fire_cd -= dt;
     if (fire_cd <= 0 && player.alive && x > 60) {
-        fire_cd = rnd_uniform(1.4f, 3.0f);
+        fire_cd = rnd_uniform(1.4f, 3.0f) * g_aggro;
         auto [cx, cy] = center();
         shots.emplace_back(float(cx - 8), float(cy), PI, 230.0f);
     }
@@ -1048,7 +1007,7 @@ void Weaver::update(float dt, float scroll_speed, Player& player,
     y = base_y + std::sin(t_ * 3.0f) * amp;
     fire_cd -= dt;
     if (fire_cd <= 0 && player.alive && x > 60) {
-        fire_cd = rnd_uniform(1.0f, 2.4f);
+        fire_cd = rnd_uniform(1.0f, 2.4f) * g_aggro;
         auto [cx, cy] = center();
         auto [px, py] = player.center();
         float a = std::atan2(float(py - cy), float(px - cx));
@@ -1077,7 +1036,7 @@ void Carrier::update(float dt, float scroll_speed, Player& player,
     y += std::sin(t_ * 1.4f) * 16 * dt;
     fire_cd -= dt;
     if (fire_cd <= 0 && player.alive && x > 80) {
-        fire_cd = rnd_uniform(1.6f, 3.0f);
+        fire_cd = rnd_uniform(1.6f, 3.0f) * g_aggro;
         auto [cx, cy] = center();
         for (float a : {PI - 0.28f, PI, PI + 0.28f})
             shots.emplace_back(float(cx - 8), float(cy), a, 210.0f);
@@ -1096,7 +1055,7 @@ void Turret::update(float dt, float scroll_speed, Player& player,
     }
     fire_cd -= dt;
     if (fire_cd <= 0 && player.alive && x > 40) {
-        fire_cd = rnd_uniform(1.4f, 2.8f);
+        fire_cd = rnd_uniform(1.4f, 2.8f) * g_aggro;
         shots.emplace_back(x, y, angle, 240.0f);
     }
 }
@@ -1302,15 +1261,20 @@ struct Boss {
     }
 
     void draw_eye(Surface& s, int ex, int ey, int er, float pcx, float pcy) const {
-        draw::circle(s, WHITE, ex, ey, er);
+        // Blocky pixel eye — square sclera + square pupil, snapped to a chunky
+        // grid so it matches the rest of the blocky boss art (no smooth circle).
+        int cell = std::max(2, er / 2);
+        auto snap = [cell](int v) { return (v / cell) * cell; };
+        draw::rect(s, WHITE, {snap(ex - er), snap(ey - er), er * 2, er * 2});
         float dx = pcx - ex, dy = pcy - ey, d = std::max(1.0f, std::hypot(dx, dy));
         int off = er / 2;
         int px = ex + int(dx / d * off), py = ey + int(dy / d * off);
         if (hit_flash > 0.06f) {
-            draw::line(s, BLACK, ex - er / 2, ey - er / 2, ex + er / 2, ey + er / 2, 3);
-            draw::line(s, BLACK, ex - er / 2, ey + er / 2, ex + er / 2, ey - er / 2, 3);
+            draw::line(s, BLACK, ex - er, ey - er, ex + er, ey + er, 4);
+            draw::line(s, BLACK, ex - er, ey + er, ex + er, ey - er, 4);
         } else {
-            draw::circle(s, BLACK, px, py, std::max(2, er / 2));
+            int pr = std::max(2, er / 2);
+            draw::rect(s, BLACK, {snap(px - pr), snap(py - pr), pr * 2, pr * 2});
         }
     }
 
@@ -1321,7 +1285,14 @@ struct Boss {
         int bx = int(x + (w - bw) / 2 + std::sin(bob * 2) * 3), by = int(y + (h - bh) / 2);
         if (bw < 4 || bh < 4) return;
         Color body = hit_flash > 0 ? lerp_color(color, WHITE, 0.6f) : color;
-        draw::rect(s, Color(body.r, body.g, body.b, 70), {bx - 6, by - 6, bw + 12, bh + 12}, 0, cell + 4);
+        // soft outer glow — a few translucent rounded rects drawn straight onto s.
+        // (glow_rect() allocated `radius` full-size surfaces PER FRAME, which made
+        // big-boss fights lag badly at high stages.)
+        for (int gi = 4; gi >= 1; --gi) {
+            int pad = gi * 3;
+            draw::rect(s, Color(body.r, body.g, body.b, 22),
+                       {bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad}, 0, cell + pad);
+        }
         draw_boss_alien(s, face, int(bob * 3) % 2, bx, by, bw, bh, body);
         if (invuln_ > 0) {
             float p = 0.5f + 0.5f * std::sin(bob * 18);
@@ -1438,6 +1409,8 @@ private:
     int kills_since_drop_ = 0, kills_this_stage_ = 0, kills_needed_ = 18;
 
     bool bot_ = false; bool fire_held_ = false;
+    float fire_hold_t_ = 0;          // how long fire has been held (charge-delay gate)
+    static constexpr float CHARGE_DELAY = 0.15f;  // hold this long before charging starts
     float game_t_ = 0;
     bool charge_loop_on_ = false;   // is the looping charge hum currently playing?
     float chirp_cd_ = 0;            // throttle for enemy spawn vocalisations
@@ -1490,6 +1463,7 @@ private:
             if (t >= 2) player_->options_.push_back(OptionPod(player_->x, player_->y));
         }
         if (const char* e = std::getenv("VOID_STAGE")) stage_ = std::max(1, atoi(e));
+        g_aggro = std::max(0.5f, 1.0f - (stage_ - 1) * 0.04f);
         if (std::getenv("VOID_BOSS")) { stage_ = BOSS_EVERY; state_ = St::Play; intro_t_ = 0; start_boss(); }
         tele(J().add("ev", "stage_start").add("stage", stage_).add("load", loadout()).add("lives", lives_));
     }
@@ -1519,12 +1493,12 @@ private:
         int r = rnd_int(0, 99);
         if (carrier_drop) {
             if (r < 38) k = PU::Option; else if (r < 64) k = PU::Spread;
-            else if (r < 82) k = PU::Shield; else if (r < 92) k = PU::Speed;
+            else if (r < 82) k = PU::Shield; else if (r < 94) k = PU::Speed;  // slightly fewer extra lives
             else k = PU::Life;
         } else {
             if (r < 30) k = PU::Spread; else if (r < 52) k = PU::Speed;
-            else if (r < 72) k = PU::Shield; else if (r < 88) k = PU::Option;
-            else if (r < 94) k = PU::Life; else k = PU::Mystery;
+            else if (r < 72) k = PU::Shield; else if (r < 90) k = PU::Option;
+            else if (r < 93) k = PU::Life; else k = PU::Mystery;   // Life 6% -> 3%
         }
         powerups_.push_back({x, y, 0, k});
     }
@@ -1601,6 +1575,7 @@ private:
         kills_this_stage_ = 0;
         kills_needed_ = 16 + stage_ * 2;
         scroll_speed_ = SCROLL_BASE + std::min(120.0f, stage_ * 8.0f);
+        g_aggro = std::max(0.5f, 1.0f - (stage_ - 1) * 0.04f);  // enemies fire faster deeper in
         add_flash("STAGE " + std::to_string(stage_) + "  " +
                   STAGE_NAMES[std::min(stage_ - 1, 4) % 5], ctx_.W / 2.0f, ctx_.H / 2.0f, GOLD, 2.2f, true);
         if (ctx_.fx) ctx_.fx->palette_hue = 0.16f * std::sin(stage_ * 0.7f);
@@ -1728,6 +1703,7 @@ void VoidStormGame::bot_decide(const Input& in) {
     int ahead = 0;
     for (auto& e : enemies_) if (e->alive && e->center().first > pcx) ahead++;
     bool want_charge = (boss_ && boss_->active()) || ahead >= 3;
+    if (std::getenv("VOID_CHARGE")) want_charge = true;  // debug: force charging to verify the beam
     if (want_charge && p.charge_ < 1.0f) { p.charging_ = true; p.bcharge = true; p.bfire = false; }
     else { p.bcharge = false; p.bfire = true; }
 }
@@ -1753,24 +1729,41 @@ void VoidStormGame::spawn_enemies(float dt) {
     if (chirp_cd_ > 0) chirp_cd_ -= dt;
     int zi = std::min(stage_ - 1, 4);
     const SpawnTable& table = SPAWN_TABLES[zi];
+    // Deep-stage escalation (the 5 base tables cap at stage 5, so without this it
+    // plateaus): spawns speed up, a growing share of enemies are HARDENED (extra
+    // HP + steel ring), and surprise BURSTS file in as a tight squadron.
+    float rate = std::max(0.45f, 1.0f - (stage_ - 1) * 0.045f);   // shorter gaps deeper
+    float armor_p = std::clamp((stage_ - 3) * 0.07f, 0.0f, 0.55f);
+    int armor_bonus = 1 + stage_ / 6;
     enemy_cd_ -= dt;
     if (enemy_cd_ <= 0) {
-        enemy_cd_ = rnd_uniform(table.lo, table.hi);
-        std::string kind = weighted_choice(table.enemies);
+        enemy_cd_ = rnd_uniform(table.lo, table.hi) * rate;
+        // surprise burst: a cluster instead of a single, more likely deeper in.
+        int burst = (stage_ >= 4 && rnd01() < std::min(0.30f, 0.045f * stage_))
+                        ? rnd_int(2, 4) : 1;
         int y_top, y_bot;
         terrain_->corridor_at(ctx_.W - 10.0f, y_top, y_bot);
         if (y_bot - y_top < 60) { y_top = 120; y_bot = ctx_.H - 120; }
-        float sy = rnd_uniform(float(y_top), float(y_bot));
-        float sx = ctx_.W + 30;
-        if (kind == "darter") enemies_.push_back(std::make_unique<Darter>(sx, sy));
-        else if (kind == "weaver") enemies_.push_back(std::make_unique<Weaver>(sx, sy));
-        else if (kind == "diver") enemies_.push_back(std::make_unique<Diver>(sx, sy));
-        else if (kind == "carrier") enemies_.push_back(std::make_unique<Carrier>(sx, sy));
+        for (int b = 0; b < burst; ++b) {
+            std::string kind = weighted_choice(table.enemies);
+            float sy = rnd_uniform(float(y_top), float(y_bot));
+            float sx = ctx_.W + 30 + b * 36;   // stagger so the squadron files in
+            Enemy* made = nullptr;
+            if (kind == "darter") { auto e = std::make_unique<Darter>(sx, sy); made = e.get(); enemies_.push_back(std::move(e)); }
+            else if (kind == "weaver") { auto e = std::make_unique<Weaver>(sx, sy); made = e.get(); enemies_.push_back(std::move(e)); }
+            else if (kind == "diver") { auto e = std::make_unique<Diver>(sx, sy); made = e.get(); enemies_.push_back(std::move(e)); }
+            else if (kind == "carrier") { auto e = std::make_unique<Carrier>(sx, sy); made = e.get(); enemies_.push_back(std::move(e)); }
+            // Harden a growing fraction (not carriers — already tanky).
+            if (made && kind != "carrier" && rnd01() < armor_p) {
+                made->hp += armor_bonus; made->max_hp += armor_bonus;
+                made->hardened = true; made->pts = int(made->pts * 1.5f);
+            }
+        }
         // spawn vocalisation — panned hard right (they enter from the right),
         // throttled so a busy stage doesn't turn into a chorus.
         if (chirp_cd_ <= 0 && ctx_.sfx) {
             chirp_cd_ = rnd_uniform(1.1f, 2.2f);
-            ctx_.sfx->pan_next(std::clamp(sx / float(ctx_.W), 0.0f, 1.0f));
+            ctx_.sfx->pan_next(1.0f);
             ctx_.sfx->alien_chirp(rnd_int(0, 2));
         }
     }
@@ -1801,11 +1794,21 @@ void VoidStormGame::update_play(float dt, const Input& in) {
         my = (in.down(SDLK_DOWN) || in.down(SDLK_s)) - (in.down(SDLK_UP) || in.down(SDLK_w));
         bool space = in.down(SDLK_SPACE) || in.down(SDLK_LCTRL);
         if (space) {
-            player_->charging_ = true;
+            // A slight HOLD delay before charging kicks in: a quick tap fires a
+            // normal shot (and no charge hum); only a deliberate hold spins up the
+            // beam. Once charging starts the charge floor is the minimum beam.
+            fire_hold_t_ += dt;
+            if (!player_->charging_ && fire_hold_t_ >= CHARGE_DELAY) {
+                player_->charging_ = true;
+                player_->charge_ = std::max(player_->charge_, 0.12f);
+            }
             fire_down = false;
-        } else if (fire_held_) {
-            // just released
-            if (player_->charging_) { beam_release = true; player_->charging_ = false; }
+        } else {
+            if (fire_held_) {  // just released this frame
+                if (player_->charging_) { beam_release = true; player_->charging_ = false; }
+                else fire_down = true;  // tapped below the charge delay -> normal shot
+            }
+            fire_hold_t_ = 0;
         }
         fire_held_ = space;
     }
@@ -1815,8 +1818,13 @@ void VoidStormGame::update_play(float dt, const Input& in) {
     if (player_->charging_) {
         player_->charge_ = std::min(1.0f, player_->charge_ + dt * 0.9f);
         if (ctx_.fx) ctx_.fx->rumble_charge(player_->charge_);
-        // bot releases beam when fully charged
-        if (bot_ && player_->charge_ >= 1.0f) { beam_release = true; player_->charging_ = false; }
+        // bot releases beam when fully charged (VOID_CHARGE=0..1 caps it, for
+        // verifying/tuning the progressive beam at a fixed charge level).
+        static const float bot_cap = [] {
+            const char* e = std::getenv("VOID_CHARGE");
+            return e ? std::clamp(float(atof(e)), 0.12f, 1.0f) : 1.0f;
+        }();
+        if (bot_ && player_->charge_ >= bot_cap) { beam_release = true; player_->charging_ = false; }
     }
 
     player_->update(dt, ctx_.W, ctx_.H);
@@ -1836,10 +1844,10 @@ void VoidStormGame::update_play(float dt, const Input& in) {
             auto [nx, ny] = player_->nose();
             (void)ny;
             ctx_.sfx->pan_next(nx / float(ctx_.W));
-            if (charge_at_release >= 0.25f) ctx_.sfx->charged_blast();  // the payoff
+            if (charge_at_release >= 0.12f) ctx_.sfx->charged_blast(charge_at_release);  // scales with charge
             else ctx_.sfx->shoot();
         }
-        if (ctx_.fx) ctx_.fx->shake(charge_at_release >= 0.25f ? 8 : 4);
+        if (ctx_.fx) ctx_.fx->shake(charge_at_release >= 0.12f ? int(3 + 7 * charge_at_release) : 4);
     } else if (fire_down && !player_->charging_) {
         int n = player_->tap_fire(player_shots_);
         if (n > 0 && ctx_.sfx) ctx_.sfx->shoot();
@@ -1958,7 +1966,9 @@ void VoidStormGame::check_player_shots() {
                         ctx_.sfx->invader_hit();
                     }
                 }
-                if (ctx_.fx) ctx_.fx->shake(s.beam ? 9 : e->is_heavy() ? 6 : 2);
+                // Beams pierce whole columns, re-requesting shake every frame, so
+                // keep the per-kill beam shake small — the release already shook.
+                if (ctx_.fx) ctx_.fx->shake(s.beam ? 3 : e->is_heavy() ? 6 : 2);
                 if (e->carrier) spawn_powerup(float(cx), float(cy), true);
                 else roll_drop(float(cx), float(cy), e->is_heavy());
             } else {
@@ -2040,7 +2050,14 @@ void VoidStormGame::draw(Surface& s) {
     if (parallax_) parallax_->draw(s);
     particles_.draw(s);
     terrain_->draw(s);
-    for (auto& e : enemies_) e->draw(s);
+    for (auto& e : enemies_) {
+        e->draw(s);
+        if (e->hardened) {  // steel armour ring so the tougher ones read at a glance
+            Rect r = e->rect();
+            float p = 0.6f + 0.4f * std::sin(game_t_ * 6);
+            draw::rect(s, Color(210, 222, 240, int(190 * p)), {r.x - 3, r.y - 3, r.w + 6, r.h + 6}, 2, 6);
+        }
+    }
     if (boss_) {
         auto [pcx, pcy] = player_->center();
         boss_->draw(s, float(pcx), float(pcy));

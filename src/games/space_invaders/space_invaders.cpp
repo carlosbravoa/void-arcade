@@ -865,6 +865,7 @@ private:
     int w_rapid_ = 0, w_spread_ = 0, w_side_ = 0, w_pierce_ = 0, nukes_ = 0;
     int kills_since_drop_ = 0;
     float shield_ = 0, nuke_flash_ = 0;
+    float pierce_t_ = 0;   // PIERCE is now a timed buff (was a permanent stacking level)
 
     // bot + telemetry
     bool bot_ = false;
@@ -972,7 +973,7 @@ private:
         int dmg = 1 + weapon_tier() / 4;
         auto add = [&](float x, float vx) {
             Bullet b; b.x = x; b.y = py; b.vx = vx; b.up = true;
-            b.color = col; b.speed = 560; b.pierce = w_pierce_; b.damage = dmg;
+            b.color = col; b.speed = 560; b.pierce = pierce_t_ > 0 ? 2 : 0; b.damage = dmg;
             b.w = 3 + std::min(3, weapon_tier() / 2);
             p_bullets_.push_back(b);
         };
@@ -1013,7 +1014,7 @@ private:
             case PU::Rapid:  w_rapid_ = std::min(3, w_rapid_ + 1); msg = "RAPID FIRE!"; break;
             case PU::Spread: w_spread_ = std::min(2, w_spread_ + 1); msg = "SPREAD SHOT!"; break;
             case PU::Side:   w_side_ = std::min(2, w_side_ + 1); msg = "WING CANNONS!"; break;
-            case PU::Pierce: w_pierce_ = std::min(2, w_pierce_ + 1); msg = "PIERCING ROUNDS!"; break;
+            case PU::Pierce: pierce_t_ = std::min(12.0f, pierce_t_ + 8.0f); msg = "PIERCING ROUNDS!"; break;
             case PU::Shield: shield_ = 7.0f; msg = "SHIELD UP!"; break;
             case PU::Life:   player_->lives++; msg = "EXTRA LIFE!"; break;
             case PU::Rebuild:
@@ -1150,7 +1151,7 @@ void SpaceInvadersGame::hit_player() {
     particles_.explode_player(cx, cy);
     // Death costs you your arsenal — start the weapon climb over (nukes survive).
     bool had_weapons = w_rapid_ || w_spread_ || w_side_ || w_pierce_;
-    w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0;
+    w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0; pierce_t_ = 0;
     shield_ = 0;
     if (had_weapons) add_flash("WEAPONS LOST!", cx, cy - 44, RED, 1.8f, true);
     player_->kill(); state_ = St::Dead; dead_t_ = 2.2f;
@@ -1175,6 +1176,7 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
     if (want_nuke) detonate_nuke();
 
     if (shield_ > 0) shield_ -= dt;
+    if (pierce_t_ > 0) pierce_t_ -= dt;
     player_->update(dt, move_dir, ctx_.W);
     if (!player_->alive) { if (player_->respawn_t <= 0) player_->respawn(ctx_.W / 2 - 15); return; }
     if (want_fire) fire();
@@ -1535,6 +1537,8 @@ void SpaceInvadersGame::draw_hud(Surface& s) {
         draw_text_right(s, *ctx_.fonts.small, "☢ NUKE x" + std::to_string(nukes_) + "  [↑/B]", ctx_.W - 12, ctx_.H - 44, RED);
     if (shield_ > 0)
         draw_text_right(s, *ctx_.fonts.small, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 28, Color(80, 220, 255));
+    if (pierce_t_ > 0)
+        draw_text_right(s, *ctx_.fonts.small, "PIERCE " + std::to_string(int(pierce_t_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 12, Color(200, 100, 255));
     else
         draw_text_right(s, *ctx_.fonts.small, "P PAUSE", ctx_.W - 12, ctx_.H - 28, Color(30, 60, 30));
 }

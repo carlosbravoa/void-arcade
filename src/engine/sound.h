@@ -53,7 +53,7 @@ public:
     // charge beam (void_storm): a looping rising hum while held, a payoff on release
     void start_charge();
     void stop_charge();
-    void charged_blast();       // the spectacular charged-shot release
+    void charged_blast(float charge = 1.0f);  // charged-shot release; scales with charge 0..1
 
     // ── ambient bed (per-game looping drone) ──
     void start_ambient(int variant);   // 0 deep-space, 1 rift, 2 calm
@@ -122,5 +122,5 @@ private:
     Mix_Chunk* refill_ = nullptr;
     Mix_Chunk* beam_ = nullptr;
     Mix_Chunk* charge_loop_ = nullptr;
-    Mix_Chunk* charged_ = nullptr;
+    Mix_Chunk* charged_[3] = {};   // charged-blast tiers: small / mid / full
 };

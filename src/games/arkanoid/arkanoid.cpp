@@ -47,6 +47,25 @@ Color brick_color(int hp) {
     }
 }
 
+// One-shot (1-HP) bricks would otherwise all be red — a wall of them reads as
+// monotone. Give them vibrant variety (banded by row, classic arcade look)
+// WITHOUT changing durability: these are still 1-HP. Column nudges the band so
+// even single-row strips aren't uniform.
+Color one_shot_brick_color(int col, int row) {
+    static const Color pal[] = {
+        Color(255, 80, 80),    // red
+        Color(255, 150, 40),   // orange
+        Color(255, 220, 40),   // yellow
+        Color(90, 230, 90),    // green
+        Color(80, 200, 255),   // cyan
+        Color(120, 130, 255),  // indigo
+        Color(210, 90, 255),   // magenta
+    };
+    int n = (int)(sizeof(pal) / sizeof(pal[0]));
+    int idx = ((row + col / 4) % n + n) % n;
+    return pal[idx];
+}
+
 // ── powerup colours / labels (entities.py) ────────────────────────────────────
 Color powerup_color(const std::string& k) {
     if (k == "expand") return Color(80, 255, 80);
@@ -275,7 +294,9 @@ struct Brick {
     }
     Rect rect() const { return {x, y, W, H}; }
     bool indestructible() const { return hp == 9; }
-    Color color() const { return brick_color(hp); }
+    // Genuine 1-shot bricks (max_hp==1) get a vibrant per-position colour;
+    // multi-hit bricks keep the hp→colour mapping that telegraphs durability.
+    Color color() const { return max_hp == 1 ? one_shot_brick_color(col, row) : brick_color(hp); }
     bool hit() {
         if (indestructible()) return false;
         hp -= 1;
@@ -363,13 +384,19 @@ struct Paddle {
     Color color = Color(80, 200, 255);
     bool laser_on = false, catch_on = false;
     float laser_cd = 0;
-    // ── SMASH ability: hold to charge a meter, release to launch a nearby ball ──
-    static constexpr float SMASH_FULL = 1.0f;     // seconds to a full charge
-    static constexpr float SMASH_CD = 1.6f;       // cooldown after firing
-    float smash_charge = 0;    // 0..SMASH_FULL while charging
+    // ── SMASH ability: HOLD smash to charge a meter (it drains when released), so
+    // you pre-charge and TIME it to peak as the ball arrives; a charged PADDLE HIT
+    // launches THAT ball as a fast piercing smash. (No remote mid-air launches.) ──
+    static constexpr float SMASH_FULL = 1.0f;     // full meter
+    static constexpr float SMASH_RATE = 1.1f;     // charge/sec while held (~0.9s to full)
+    static constexpr float SMASH_DRAIN = 1.6f;    // charge/sec lost when not held
+    static constexpr float SMASH_MIN  = 0.5f;     // meter needed to trigger a smash
+    static constexpr float SMASH_CD = 0.5f;       // brief re-arm after a smash
+    float smash_charge = 0;    // 0..SMASH_FULL, fills while held
     float smash_cd = 0;        // cooldown timer
     bool charging = false;
-    float smash_glow = 0;      // brief flash on release (for draw)
+    bool armed = false;        // smash button currently held
+    float smash_glow = 0;      // brief flash on smash (for draw)
     Paddle(int sw, int sh)
         : screen_w(sw), screen_h(sh), w(PADDLE_W_NORMAL), h(PADDLE_H),
           x(float(sw / 2 - PADDLE_W_NORMAL / 2)), y(float(sh - PADDLE_Y_OFF)) {}
@@ -1018,6 +1045,7 @@ private:
     int score_, lives_, level_idx_;
     St state_;
     float dead_t_ = 0, win_t_ = 0;
+    float ready_t_ = 0;   // brief "get ready" grace so a carried-over press doesn't auto-launch
 
     std::unique_ptr<Paddle> paddle_;
     std::vector<Ball> balls_;
@@ -1034,6 +1062,12 @@ private:
     std::vector<BossShot> boss_shots_;
     std::vector<BossBullet> boss_bullets_;
     bool boss_level_ = false, boss_revealed_ = false;
+    // ── stage events: a random modifier flavours most non-boss levels so each
+    // stage brings a surprise instead of "just another wall of bricks". ──
+    enum class Ev { GoldRush, LaserStorm, Multiball, Frenzy, Slowmo, COUNT };
+    Ev event_ = Ev::COUNT;    // COUNT = "no event this level"
+    int ev_score_mult_ = 1;
+    float ev_speed_mult_ = 1.0f;   // Frenzy/Slowmo ball-speed modifier for the level
     float base_speed_ = Ball::BASE_SPEED;  // climbs each endless loop
     float game_t_ = 0, level_t0_ = 0;      // accumulating game clock
     int lvl_bricks_ = 0, lvl_balls_lost_ = 0, lvl_powerups_ = 0;  // per-level counters
@@ -1087,6 +1121,9 @@ private:
         state_ = St::Ready;
         dead_t_ = 0;
         win_t_ = 0;
+        ready_t_ = 0.9f;   // hold the ball on the paddle a beat (ignores the carried-over
+                           // launcher-select press) and play a "get ready" tune
+        if (ctx_.sfx) ctx_.sfx->spawn_chime();
         pw_timers_.clear();
 
         if (boss_level_) {
@@ -1100,8 +1137,20 @@ private:
         }
         attach_ball();
 
-        // Cross-game cameo: an invader sometimes crashes a normal level.
-        if (!boss_level_ && (std::getenv("VOID_FORCE_CAMEO") || (n >= 3 && rnd01() < 0.22f))) {
+        // Stage EVENT: most non-boss levels roll a fun modifier so each stage is a
+        // surprise, not just another wall. Announced with a big banner.
+        event_ = Ev::COUNT; ev_score_mult_ = 1; ev_speed_mult_ = 1.0f;
+        if (const char* e = std::getenv("VOID_EVENT")) {   // debug: force a stage event
+            event_ = Ev(std::clamp(atoi(e), 0, int(Ev::COUNT) - 1));
+            apply_event();
+        } else if (!boss_level_ && n >= 2 && rnd01() < 0.55f) {
+            event_ = Ev(rnd_int(0, int(Ev::COUNT) - 1));
+            apply_event();
+        }
+
+        // Cross-game cameo: an invader sometimes crashes a normal level. Made more
+        // frequent + earlier so the surprises land often.
+        if (!boss_level_ && (std::getenv("VOID_FORCE_CAMEO") || (n >= 2 && rnd01() < 0.30f))) {
             cameo_ = std::make_unique<CameoInvader>(ctx_.W, n);
             add_flash("⚠  INVADER INCURSION  ⚠", ctx_.W / 2, ctx_.H / 2 - 30, RED, 2.0f);
             if (ctx_.sfx) ctx_.sfx->life_lost();
@@ -1118,6 +1167,26 @@ private:
                 .add("boss", boss_level_ ? 1 : 0).add("t", (double)game_t_)
                 .add("lives", lives_).add("base_speed", (double)base_speed_));
     }
+
+    // Apply the rolled stage event: reuse the existing power-up machinery where we
+    // can. Effects last the level and reset on the next load_level (fresh paddle +
+    // balls), so no timers to babysit.
+    void apply_event() {
+        std::string name; Color col(255, 210, 60);
+        switch (event_) {
+            case Ev::GoldRush:   ev_score_mult_ = 2; name = "GOLD RUSH   x2 SCORE"; col = Color(255, 210, 60); break;
+            case Ev::LaserStorm: paddle_->laser_on = true; name = "LASER STORM"; col = Color(255, 120, 120); break;
+            case Ev::Multiball:  attach_ball(); attach_ball(); name = "MULTIBALL MADNESS"; col = Color(90, 220, 255); break;
+            case Ev::Frenzy:     ev_speed_mult_ = 1.35f; name = "FRENZY"; col = Color(255, 150, 40); break;
+            case Ev::Slowmo:     ev_speed_mult_ = 0.70f; name = "SLOW MOTION"; col = Color(120, 200, 255); break;
+            default: return;
+        }
+        for (auto& b : balls_) b.speed_mult = ev_speed_mult_;
+        add_flash(name, ctx_.W / 2, ctx_.H / 2 - 60, col, 2.4f);
+        if (ctx_.sfx) ctx_.sfx->powerup_collect();
+        tele(J().add("ev", "stage_event").add("level", level_num()).add("event", name));
+    }
+
     // A handful of indestructible-ish bricks so the boss arena isn't empty.
     void build_boss_decor() {
         int total_w = BRICK_COLS * (BRICK_W + BRICK_GAP) - BRICK_GAP;
@@ -1235,6 +1304,7 @@ private:
         b.attached = true;
         b.attach_offset = paddle_->w / 2.0f;
         b.base_speed = base_speed_;
+        b.speed_mult = ev_speed_mult_;   // Frenzy/Slowmo events flavour the pace
         balls_.push_back(b);
     }
     int destructible_count() const {
@@ -1290,7 +1360,7 @@ private:
     float paddle_dir(const Input& in);
     bool bot_ = false;
     void reflect_ball_off_brick(Ball& ball, Rect br);
-    void do_smash(float charge);
+    void smash_ball(Ball& b, float charge);
     void collect_powerup(const PowerUp& pw);
     void deactivate_powerup(const std::string& k);
     void deactivate_all_powerups();
@@ -1387,6 +1457,7 @@ float ArkanoidGame::paddle_dir(const Input& in) {
 }
 
 void ArkanoidGame::update_ready(float dt, const Input& in) {
+    if (ready_t_ > 0) ready_t_ -= dt;   // "get ready" grace before the ball can launch
     paddle_->update(dt, paddle_dir(in));
     for (auto& b : balls_) {
         if (b.attached) {
@@ -1397,7 +1468,7 @@ void ArkanoidGame::update_ready(float dt, const Input& in) {
     bool launch = bot_;
     for (auto k : in.pressed)
         if (k == SDLK_SPACE || k == SDLK_UP || k == SDLK_w) launch = true;
-    if (launch) { for (auto& b : balls_) b.release(); state_ = St::Play; }
+    if (launch && ready_t_ <= 0) { for (auto& b : balls_) b.release(); state_ = St::Play; }
 }
 
 void ArkanoidGame::update_play(float dt, const Input& in) {
@@ -1419,21 +1490,19 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
             for (auto& b : balls_) if (b.attached) b.release();
     }
 
-    // ── SMASH ability: hold LSHIFT to charge, release to launch a nearby ball ──
-    // (bot never charges; it just plays normally.)
+    // ── SMASH: HOLD the button (keyboard SHIFT or a gamepad shoulder) to charge the
+    // meter; it drains when released, so you time the pre-charge to peak as the ball
+    // reaches the paddle. The charged paddle hit fires the smash (see paddle
+    // collision). (Bot never charges.)
+    paddle_->armed = !bot_ && (in.down(SDLK_LSHIFT) || in.down(SDLK_RSHIFT) ||
+                               in.pad[PadThrUp] || in.pad[PadThrDown]);
     if (!bot_) {
-        bool held = in.down(SDLK_LSHIFT) || in.down(SDLK_RSHIFT);
-        if (held && paddle_->smash_ready()) {
-            if (!paddle_->charging) paddle_->charging = true;
+        if (paddle_->armed)
             paddle_->smash_charge = std::min(Paddle::SMASH_FULL,
-                                             paddle_->smash_charge + dt);
-        } else if (paddle_->charging) {
-            // released (or cooldown hit): fire if we built any meaningful charge
-            float cr = paddle_->charge_ratio();
-            paddle_->charging = false;
-            paddle_->smash_charge = 0;
-            if (cr >= 0.35f) do_smash(cr);
-        }
+                                             paddle_->smash_charge + dt * Paddle::SMASH_RATE);
+        else
+            paddle_->smash_charge = std::max(0.0f,
+                                             paddle_->smash_charge - dt * Paddle::SMASH_DRAIN);
     }
 
     // ── moving bricks drift + bounce ──
@@ -1578,9 +1647,16 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
                 ball.attached = true;
                 ball.attach_offset = ball.x - paddle_->x;
             } else {
-                ball.bounce_paddle(*paddle_);
-                particles_.paddle_hit(int(ball.x), int(paddle_->y));
-                if (ctx_.sfx) ctx_.sfx->ball_paddle();
+                ball.bounce_paddle(*paddle_);   // sets the outgoing angle from hit position
+                // a pre-charged paddle hit becomes a smash (strength = how charged)
+                if (paddle_->smash_cd <= 0 && paddle_->smash_charge >= Paddle::SMASH_MIN) {
+                    smash_ball(ball, paddle_->charge_ratio());
+                    paddle_->smash_charge = 0;
+                    paddle_->smash_cd = Paddle::SMASH_CD;
+                } else {
+                    particles_.paddle_hit(int(ball.x), int(paddle_->y));
+                    if (ctx_.sfx) ctx_.sfx->ball_paddle();
+                }
             }
         }
 
@@ -1604,12 +1680,13 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
                 particles_.explode_brick(cx, cy, brick_color(1));
                 lvl_bricks_++;
                 int jm = juggle_mult();
-                int pts = brick.max_hp * 10 * (ctx_.combo ? ctx_.combo->hit() : 1) * jm;
+                int pts = brick.max_hp * 10 * (ctx_.combo ? ctx_.combo->hit() : 1) * jm * ev_score_mult_;
                 score_ += pts;
                 high_score_ = std::max(high_score_, score_);
                 add_flash("+" + std::to_string(pts), cx, cy, YELLOW);
                 if (ctx_.sfx) ctx_.sfx->brick_break();
-                if (!brick.indestructible() && rnd01() < POWERUP_CHANCE) {
+                float puc = event_ == Ev::GoldRush ? 0.36f : POWERUP_CHANCE;  // GOLD RUSH showers power-ups
+                if (!brick.indestructible() && rnd01() < puc) {
                     std::string kind = weighted_powerup();
                     powerups_.emplace_back(float(cx), float(cy), kind);
                 }
@@ -1834,44 +1911,21 @@ void ArkanoidGame::reflect_ball_off_brick(Ball& ball, Rect br) {
     ball.y = std::max(float(ball.r), std::min(float(ctx_.H - ball.r), ball.y));
 }
 
-// SMASH: launch a ball near/on the paddle straight up at high speed with a brief
-// pierce (fire) so it rips up through a column. Picks an attached/caught ball
-// first, else the ball closest to the paddle and above it. Starts the cooldown.
-void ArkanoidGame::do_smash(float charge) {
-    paddle_->smash_cd = Paddle::SMASH_CD;
+// SMASH: turn the ball that just bounced off the paddle into a fast piercing
+// smash. It keeps the bounce ANGLE (so you aim with paddle position) but ramps the
+// speed toward MAX and gives it a brief fire/pierce to rip up through a column.
+void ArkanoidGame::smash_ball(Ball& b, float charge) {
     paddle_->smash_glow = 1.0f;
+    float spd = Ball::BASE_SPEED + (Ball::MAX_SPEED - Ball::BASE_SPEED) * (0.6f + 0.4f * charge);
+    float ang = std::atan2(b.vy, b.vx);             // keep the just-computed bounce direction
+    b.vx = std::cos(ang) * spd;
+    b.vy = std::sin(ang) * spd;
+    b.speed_mult = std::max(b.speed_mult, 1.0f);
+    b.fire = true;                                  // brief pierce
+    set_pw_timer("fire", std::max(0.6f + charge * 1.2f, pw_timer("fire") ? *pw_timer("fire") : 0.0f));
 
-    // choose target: prefer an attached (caught) ball, else nearest above paddle.
-    Ball* target = nullptr;
-    float best = 1e18f;
-    float pcx = paddle_->center_x(), py = paddle_->y;
-    for (auto& b : balls_) {
-        if (!(b.alive || b.attached)) continue;
-        if (b.attached) { target = &b; break; }
-        if (b.y > py + 4) continue;                 // only balls above the paddle
-        float d = std::fabs(b.x - pcx) + std::fabs(b.y - py) * 0.4f;
-        if (d < best) { best = d; target = &b; }
-    }
-    if (!target) {  // nothing to launch — still telegraph the whiff softly
-        if (ctx_.sfx) ctx_.sfx->ball_wall();
-        return;
-    }
-
-    // launch it (mostly) straight up; charge biases toward MAX_SPEED. A small
-    // sideways nudge follows the paddle's current offset so it isn't dead-vertical.
-    target->attached = false;
-    float spd = Ball::BASE_SPEED + (Ball::MAX_SPEED - Ball::BASE_SPEED) * (0.55f + 0.45f * charge);
-    float rel = (target->x - pcx) / std::max(1.0f, paddle_->w / 2.0f);
-    rel = std::max(-0.4f, std::min(0.4f, rel));
-    float angle = -PI / 2 + rel * (PI * 0.18f);
-    target->vx = std::cos(angle) * spd;
-    target->vy = std::sin(angle) * spd;
-    target->speed_mult = std::max(target->speed_mult, 1.0f);
-    target->fire = true;                            // brief pierce up the column
-    set_pw_timer("fire", std::max(charge * 1.4f, pw_timer("fire") ? *pw_timer("fire") : 0.0f));
-
-    particles_.paddle_hit(int(target->x), int(paddle_->y));
-    add_flash("SMASH!", int(target->x), int(paddle_->y) - 18, Color(255, 150, 40), 0.8f);
+    particles_.paddle_hit(int(b.x), int(paddle_->y));
+    add_flash("SMASH!", int(b.x), int(paddle_->y) - 18, Color(255, 150, 40), 0.8f);
     if (ctx_.sfx) { ctx_.sfx->ball_paddle(); ctx_.sfx->laser_shoot(); }
     if (ctx_.fx) { ctx_.fx->shake(7 + int(6 * charge)); ctx_.fx->hitstop(0.03f); ctx_.fx->rumble(0.5f, 0.6f, 200); }
 }
@@ -2025,6 +2079,14 @@ void ArkanoidGame::draw_hud(Surface& s) {
     draw_text(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
     draw_text_centered(s, *ctx_.fonts.med, "HI  " + zpad(high_score_, 6), ctx_.W / 2, 8, YELLOW);
     draw_text_right(s, *ctx_.fonts.med, "LV  " + std::to_string(level_idx_ + 1), ctx_.W - 16, 8, CYAN);
+    // active stage event reminder
+    if (event_ != Ev::COUNT && state_ == St::Play) {
+        const char* en = event_ == Ev::GoldRush ? "GOLD RUSH"
+                       : event_ == Ev::LaserStorm ? "LASER STORM"
+                       : event_ == Ev::Multiball ? "MULTIBALL"
+                       : event_ == Ev::Frenzy ? "FRENZY" : "SLOW-MO";
+        draw_text_right(s, *ctx_.fonts.small, en, ctx_.W - 16, 34, Color(255, 200, 90));
+    }
     draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 26, Color(40, 60, 80));
     for (int i = 0; i < lives_; ++i)
         draw::circle(s, CYAN, 82 + i * 18, ctx_.H - 16, 6);
@@ -2052,20 +2114,20 @@ void ArkanoidGame::draw_hud(Surface& s) {
                            "JUGGLE x" + std::to_string(jm), ctx_.W / 2, ctx_.H - 56, jc);
     }
 
-    // ── SMASH ability meter (only relevant when playing manually) ──
+    // ── SMASH meter: fills as the ball bounces off the paddle. Past the threshold
+    //    tick, HOLD smash (SHIFT / a shoulder) and the next paddle hit smashes. ──
     if (state_ == St::Play && !bot_) {
         int bw = 90, bx = ctx_.W - bw - 12, by = ctx_.H - 44;
-        bool ready = paddle_->smash_ready();
-        float fill = paddle_->charging ? paddle_->charge_ratio()
-                   : ready ? 1.0f : 1.0f - std::max(0.0f, paddle_->smash_cd / Paddle::SMASH_CD);
-        Color fc = !ready ? Color(90, 90, 110)
-                 : paddle_->charging ? (paddle_->charge_ratio() >= 1.0f
-                                        ? Color(255, 90, 40) : Color(255, 220, 80))
-                                     : Color(255, 150, 40);
-        draw_text_right(s, *ctx_.fonts.small, "SMASH", bx + bw, by - 14,
-                        ready ? Color(255, 150, 40) : Color(70, 70, 90));
+        float fill = paddle_->smash_charge / Paddle::SMASH_FULL;
+        bool canSmash = paddle_->smash_charge >= Paddle::SMASH_MIN && paddle_->smash_cd <= 0;
+        Color fc = canSmash ? (paddle_->armed ? Color(255, 90, 40) : Color(255, 180, 60))
+                            : Color(255, 220, 80);
+        draw_text_right(s, *ctx_.fonts.small, (paddle_->armed && canSmash) ? "SMASH!" : "SMASH",
+                        bx + bw, by - 14, canSmash ? Color(255, 150, 40) : Color(70, 70, 90));
         draw::rect(s, Color(30, 30, 40), {bx, by, bw, 6});
-        draw::rect(s, fc, {bx, by, int(bw * fill), 6});
+        draw::rect(s, fc, {bx, by, int(bw * std::min(1.0f, fill)), 6});
+        int tx = bx + int(bw * (Paddle::SMASH_MIN / Paddle::SMASH_FULL));  // trigger threshold
+        draw::line(s, Color(200, 200, 220, 160), tx, by - 2, tx, by + 8, 1);
     }
 
     // boss HP bar

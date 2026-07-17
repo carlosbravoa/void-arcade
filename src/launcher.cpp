@@ -348,9 +348,14 @@ void Launcher::draw(Surface& s) {
     draw_title(s);
     draw_cards(s);
     draw_text_centered(s, *ctx_.fonts.small, "◀  A/D or ARROW KEYS  ▶  |  ESC to quit",
-                       ctx_.W / 2, ctx_.H - 38, Color(30, 65, 30));
+                       ctx_.W / 2, ctx_.H - 38, Color(95, 170, 95));
     draw_text_centered(s, *ctx_.fonts.small, "O  OPTIONS   |   F11  FULLSCREEN", ctx_.W / 2,
-                       ctx_.H - 20, Color(22, 48, 22));
+                       ctx_.H - 20, Color(80, 150, 80));
+    // Gamepad is plugged in but the snap's joystick interface isn't connected.
+    if (ctx_.pad_blocked)
+        draw_text_centered(s, *ctx_.fonts.small,
+                           "CONTROLLER BLOCKED  -  RUN:  snap connect void-arcade:joystick",
+                           ctx_.W / 2, ctx_.H - 58, Color(190, 130, 30));
     for (int y = 0; y < ctx_.H; y += 4) draw::rect(s, Color(0, 0, 0, 12), {0, y, ctx_.W, 2});
 }
 
@@ -379,8 +384,8 @@ void Launcher::draw_attract(Surface& s) {
 
     int y = 230, cx = ctx_.W / 2;
     if (board.empty()) {
-        draw_text_centered(s, *ctx_.fonts.med, "NO SCORES YET", cx, 330, Color(60, 120, 60));
-        draw_text_centered(s, *ctx_.fonts.small, "BE THE FIRST", cx, 366, Color(40, 90, 40));
+        draw_text_centered(s, *ctx_.fonts.med, "NO SCORES YET", cx, 330, Color(100, 180, 100));
+        draw_text_centered(s, *ctx_.fonts.small, "BE THE FIRST", cx, 366, Color(85, 155, 85));
     } else {
         for (size_t i = 0; i < board.size(); ++i) {
             Color rc = i == 0 ? YELLOW : (i < 3 ? Color(200, 240, 200) : Color(90, 150, 90));
@@ -393,8 +398,8 @@ void Launcher::draw_attract(Surface& s) {
     }
 
     if (int(t_ * 2) % 2 == 0)
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS ANY KEY", cx, ctx_.H - 56, Color(70, 140, 70));
-    draw_text_centered(s, *ctx_.fonts.small, "INSERT COIN  //  THE VOID ARCADE", cx, ctx_.H - 32, Color(40, 80, 40));
+        draw_text_centered(s, *ctx_.fonts.small, "PRESS ANY KEY", cx, ctx_.H - 56, Color(120, 210, 120));
+    draw_text_centered(s, *ctx_.fonts.small, "INSERT COIN  //  THE VOID ARCADE", cx, ctx_.H - 32, Color(90, 160, 90));
     for (int yy = 0; yy < ctx_.H; yy += 4) draw::rect(s, Color(0, 0, 0, 12), {0, yy, ctx_.W, 2});
 }
 
@@ -416,7 +421,7 @@ void Launcher::draw_title(Surface& s) {
         s.blit(*chars[i], x, int(28 + bob));
         x += chars[i]->width();
     }
-    draw_text_centered(s, *ctx_.fonts.small, "SELECT YOUR GAME", ctx_.W / 2, 80, Color(50, 110, 50));
+    draw_text_centered(s, *ctx_.fonts.small, "SELECT YOUR GAME", ctx_.W / 2, 80, Color(95, 185, 95));
 }
 
 void Launcher::draw_cards(Surface& s) {

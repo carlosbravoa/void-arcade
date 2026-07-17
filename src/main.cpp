@@ -7,8 +7,13 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
+
+#include <cerrno>   // errno — distinguish "blocked" from "absent" joystick nodes
+#include <fcntl.h>  // open()
+#include <unistd.h> // close()
 
 #include "engine/crt_renderer.h"
 #include "engine/font.h"
@@ -39,6 +44,30 @@ constexpr int kW = 900;
 constexpr int kH = 720;
 const char* kTitle = "THE  VOID  ARCADE  //  CRT  EDITION";
 
+// Is a controller physically present but unreachable because we're a strictly
+// confined snap whose `joystick` interface isn't connected?
+//
+// Inside the snap, /dev/input/js* is mediated by AppArmor + the device cgroup.
+// When the interface is NOT connected, opening the node is *denied*
+// (EACCES/EPERM) — the device exists, we're just blocked. When no controller is
+// plugged in at all, the node is simply *absent* (ENOENT). That errno
+// difference lets us tell "go connect the interface" apart from "nothing's
+// plugged in", so we only nag when it's actually fixable. Only meaningful inside
+// a snap ($SNAP set); open() never blocks, so this can't hang.
+bool snap_pad_blocked() {
+    if (!std::getenv("SNAP")) return false;
+    bool blocked = false;
+    for (int i = 0; i < 4; ++i) {
+        char path[32];
+        std::snprintf(path, sizeof path, "/dev/input/js%d", i);
+        int fd = ::open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) ::close(fd);                                 // readable: fine
+        else if (errno == EACCES || errno == EPERM) blocked = true;  // present but blocked
+        // ENOENT (and anything else) → treat as "not blocked".
+    }
+    return blocked;
+}
+
 // Map a gamepad button to the keycode the games already understand.
 SDL_Keycode map_pad_button(Uint8 b) {
     switch (b) {
@@ -47,6 +76,7 @@ SDL_Keycode map_pad_button(Uint8 b) {
         // B/Back intentionally unmapped: B sits right next to A (fire), so it kept
         // closing the game by accident. Quitting is keyboard-only now (ESC); on a
         // pad, use Start to pause and choose "quit to menu" from there.
+        case SDL_CONTROLLER_BUTTON_Y:          return SDLK_b;   // NUKE (the 'B' bomb key)
         case SDL_CONTROLLER_BUTTON_START:      return SDLK_p;
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  return SDLK_LEFT;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return SDLK_RIGHT;
@@ -124,6 +154,10 @@ int main(int, char**) {
     for (int i = 0; i < SDL_NumJoysticks(); ++i)
         if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); break; }
     if (pad) std::printf("[pad] %s connected\n", SDL_GameControllerName(pad));
+    gctx.pad_blocked = !pad && snap_pad_blocked();
+    if (gctx.pad_blocked)
+        std::printf("[pad] controller present but blocked — run: "
+                    "snap connect void-arcade:joystick\n");
 
     auto launcher = std::make_unique<Launcher>(gctx);
     std::unique_ptr<Scene> game;
@@ -267,6 +301,7 @@ int main(int, char**) {
                 SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > DZ;
             input.pad[PadThrUp]   = h(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
             input.pad[PadThrDown] = h(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+            input.pad[PadBtnB]    = h(SDL_CONTROLLER_BUTTON_B);  // held B (e.g. Void Drift thrust)
         }
 
         // Advance any active characterful rumble pattern, then consume. The

@@ -19,6 +19,8 @@ settings.json
 # ── Project memory — NOT for publication ─────────────────────────
 CLAUDE.md
 .claude/
+PORTING_GUIDE.md
+IDEAS.md
 
 # ── OS / editor cruft ────────────────────────────────────────────
 .DS_Store
