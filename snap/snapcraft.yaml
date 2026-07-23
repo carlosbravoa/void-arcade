@@ -26,8 +26,13 @@ description: |
     P  Pause    M  Mute    O  Options    F11  Fullscreen
     ESC             Back to launcher
 
+  Gamepad: keyboard works out of the box. For controller support, connect the
+  joystick interface once after installing:
+
+    sudo snap connect void-arcade:joystick
+
 license: GPL-3.0-or-later
-contact: cbravoa@gmail.com
+contact: https://github.com/carlosbravoa/void-arcade/issues
 source-code: https://github.com/carlosbravoa/void-arcade
 website: https://github.com/carlosbravoa/void-arcade
 issues: https://github.com/carlosbravoa/void-arcade/issues

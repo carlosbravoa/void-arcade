@@ -5,8 +5,8 @@ desktop-game snap named `void-arcade`.
 
 ## Layout this snap produces
 
-- `$SNAP/bin/void_arcade`      — the game binary (command)
-- `$SNAP/bin/assets/`          — shaders + font (found via `SDL_GetBasePath()`)
+- `$SNAP/usr/bin/void_arcade`  — the game binary (command)
+- `$SNAP/usr/bin/assets/`      — shaders + font (found via `SDL_GetBasePath()`)
 - `$SNAP_USER_COMMON/`         — writable `scores.json` / `settings.json`
                                  (via `RETRO_ARCADE_DATA`, set in the app env)
 
