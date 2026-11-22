@@ -29,5 +29,7 @@ private:
     int  cursor_ = 0;
     int  rank_ = 0, score_ = 0;
     float t_ = 0.0f;
+    bool  pad_ = false;
+    unsigned last_ticks_ = 0;
     std::string title_;
 };

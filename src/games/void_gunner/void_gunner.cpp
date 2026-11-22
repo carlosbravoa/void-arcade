@@ -29,12 +29,15 @@
 #include "engine/surface.h"
 #include "engine/telemetry.h"
 #include "engine/text.h"
+#include "engine/ui.h"
 
 namespace {
 const Color BLACK(0, 0, 0), WHITE(255, 255, 255);
 const Color CYAN(90, 220, 255), RED(255, 70, 70), YELLOW(255, 220, 40);
 const Color GREEN(90, 255, 120), ORANGE(255, 150, 50), PURPLE(190, 110, 255);
-const Color GOLD(255, 200, 70), DIM(60, 80, 110);
+const Color GOLD(255, 200, 70);
+// Energy canister: pale mint, deliberately unlike any enemy (the armoured beetle is gold).
+const Color CAN(175, 255, 215), CAN_GLOW(90, 255, 160);
 constexpr float PI = 3.14159265358979323846f;
 
 // ── Projection constants (tuned for 900x720) ────────────────────────────────
@@ -284,6 +287,7 @@ struct Star {
     void seed() { recycle(); z = rnd_uniform(0.05f, 1.0f); }
 };
 
+
 // ── Enemy ────────────────────────────────────────────────────────────────────
 enum class EType { Charger, Weaver, Shooter, Tank };
 
@@ -323,6 +327,10 @@ struct Enemy {
     bool peeled = false;
     float form_a = 0, form_e = 0;   // squadron formation slot (target a/e)
     float orbit_r = 0, orbit_w = 0, orbit_ph = 0, orbit_cy = 0;  // orbit arc params
+    // Ramming run: the offset currently pulling it off its pattern and onto your
+    // view axis (applied on top of the pattern position, removed before the next
+    // pattern step so the scripted paths stay untouched).
+    float ram_da = 0, ram_de = 0;
 
     Color color() const {
         switch (type) {
@@ -344,7 +352,12 @@ struct Enemy {
     }
 };
 
-// ── Energy tank (gold; shoot to refill) ─────────────────────────────────────
+// On-screen edge length (px) of an enemy / canister at depth z. Shared by the
+// renderer, the laser hit test and the lock indicator so they always agree.
+inline int enemy_px(float z) { return std::min(300, std::max(6, int(BASE / std::max(z, 0.07f)))); }
+inline int tank_px(float z)  { return std::min(200, std::max(10, int(BASE / std::max(z, 0.07f)))); }
+
+// ── Energy tank (mint canister; shoot to refill) ────────────────────────────
 struct Tank {
     float a, e, z, vz, phase;
     bool alive = true;
@@ -364,30 +377,46 @@ struct Missile {
 };
 
 // ── Enemy shot: STARTS at the firer's direction (sa,se) and travels toward the
-// aim direction (ta,te = your view at fire time) as z->0, growing as it nears.
-// So it visibly leaves the enemy and arrives at where you were looking — pan away
-// to dodge. (Previously it was drawn straight at the aim point = "from the centre".)
+// aim direction (ta,te = your view at fire time) as z closes, growing as it
+// nears. It visibly leaves the enemy and lands where you were looking — pan away
+// to dodge. Whether it connects is decided ON SCREEN (see shot_proj()).
+constexpr float SHOT_HIT_Z = 0.07f;    // depth at which a shot "arrives"
+// A shot's screen position stops magnifying below this depth. The raw 1/z
+// projection would fling anything a few degrees off-axis far off screen in its
+// last frames; clamping it keeps the bolt in view right up to arrival, so what
+// you see land near the reticle is exactly what hits.
+constexpr float SHOT_ZREF = 0.30f;
+constexpr float SHOT_HIT_R = 190.0f;   // px from the reticle that still connects (~0.16 rad)
 struct EShot {
     float sa, se;          // start direction (firer)
     float ta, te;          // target / aim direction
     float z, z0, vz;       // depth, start depth, approach speed
     Color color;
     bool alive = true;
-    bool hit_done = false;
-    float prog() const { return z0 > 0.001f ? clampf(1.0f - z / z0, 0.0f, 1.0f) : 1.0f; }
+    float prog() const {
+        float span = z0 - SHOT_HIT_Z;
+        return span > 0.001f ? clampf((z0 - z) / span, 0.0f, 1.0f) : 1.0f;
+    }
     float ca() const { return sa + (ta - sa) * prog(); }  // current azimuth
     float ce() const { return se + (te - se) * prog(); }  // current elevation
 };
-// Build an enemy shot from a firer direction toward a target direction.
+// Build an enemy shot from a firer direction toward a target direction. The
+// approach speed is capped so even a close-range shot takes long enough to dodge.
 inline EShot make_eshot(float sa, float se, float ta, float te, float z, float vz, Color c) {
     EShot s; s.sa = sa; s.se = se; s.ta = ta; s.te = te;
-    s.z = z; s.z0 = z; s.vz = vz; s.color = c; return s;
+    s.z = z; s.z0 = z;
+    s.vz = std::min(vz, std::max(0.05f, (z - SHOT_HIT_Z) / 0.50f));
+    s.color = c; return s;
 }
 
 // ── Player laser streak (cosmetic convergence beam) ──────────────────────────
 struct Laser { float side; float t; };  // side: -1 left, +1 right
 
 struct Flash { std::string text; float x, y, life, max_life; Color color; bool big; };
+
+// One queued announcement (wave cleared / next wave / boss warning …). They play
+// one at a time, above the action, so they never stack or cover the reticle.
+struct Note { std::string title, sub; Color color; float dur; };
 
 // ── Boss ─────────────────────────────────────────────────────────────────────
 // A SMALL, AGILE void-raider. Instead of a giant slow target, it is a compact
@@ -400,7 +429,7 @@ struct Boss {
     std::string name;
     Color color;
     int hp, max_hp;
-    float a, e, z;         // direction + depth (mid depth; darts around)
+    float a, e, z;         // glide position + depth (mid depth; darts around)
     float sway_t = 0;
     float hit_flash = 0;
     // ── agile movement: chase a series of dart targets, occasionally feint ──
@@ -425,9 +454,17 @@ struct Boss {
     float hp_ratio() const { return std::max(0.0f, float(hp) / max_hp); }
     bool damageable() const { return !dying && invuln <= 0; }
     void phase_from_hp() { float r = hp_ratio(); phase = r > 0.6f ? 1 : r > 0.3f ? 2 : 3; }
+    // Where the body actually IS: the glide position plus a faint wobble so it
+    // never sits perfectly still. The wobble is a pure function of time (an
+    // offset, not something accumulated every frame), so it is the same size at
+    // any frame rate.
+    float pa() const { return a + std::sin(sway_t * 7.0f) * 0.016f; }
+    float pe() const { return e + std::cos(sway_t * 8.0f) * 0.012f; }
+    float wa() const { return pa() + wp_a; }   // weak-spot direction
+    float we() const { return pe() + wp_e; }
 };
 
-enum class St { Intro, Play, Dead, Win, GameOver };
+enum class St { Intro, Play, Dead, GameOver };
 
 class VoidGunnerGame : public Scene {
 public:
@@ -449,6 +486,7 @@ private:
     static constexpr int N_STARS = 420;  // a dense starfield sells the 3D motion
     static constexpr float MAX_ENERGY = 100.0f;
     static constexpr float VIEW_LIM = 1.25f;       // clamp on view pan
+    static constexpr float ARC_LIM = 1.12f;        // enemies never leave the arc you can aim at
     // Slower, weightier turning. The view doesn't snap to the held direction; it
     // tracks a pan *velocity* that accelerates toward the input and decays when
     // released, so panning feels like swinging your head/ship with momentum.
@@ -461,7 +499,14 @@ private:
     static constexpr float LASER_COST = 0.10f;     // ~9 shots before lockout (0.90 usable / 0.10)
     static constexpr float LASER_REGEN = 0.70f;    // /s while not firing → ~1.4s refill
     static constexpr float LASER_PAUSE = 0.18f;    // brief regen lockout after a shot
-    static constexpr float LASER_MIN_FIRE = 0.10f; // can't fire below this (overheat)
+    static constexpr float LASER_MIN_FIRE = 0.10f; // running it below this overheats the laser
+    static constexpr float LASER_RESUME = 0.35f;   // an overheated laser fires again from here
+
+    static constexpr float RAM_Z = 0.24f;          // below this depth an enemy swings in to ram you
+    static constexpr float RAM_RUSH = 1.9f;        // approach-speed multiplier during the ramming run
+    static constexpr float HURT_IFRAMES = 0.35f;   // no second hit inside this window
+    static constexpr int   LIFE_EVERY = 25000;     // first bonus life; each later one costs more
+    static constexpr int   LIVES_MAX = 4;
 
     PauseMenu pause_;
     InitialsEntry initials_;
@@ -471,6 +516,7 @@ private:
 
     int score_ = 0, wave_ = 0;
     int lives_ = 3;
+    int next_life_at_ = LIFE_EVERY, life_step_ = LIFE_EVERY;
     float energy_ = MAX_ENERGY;
     St state_ = St::Intro;
 
@@ -479,7 +525,7 @@ private:
     float laser_ = LASER_MAX;           // 0..1 laser energy
     float laser_pause_ = 0;             // regen lockout timer after firing
     float overheat_t_ = 0;              // visual: crosshair reds when denied
-    float deny_cd_ = 0;                 // throttle for the denied blip
+    bool overheated_ = false;           // locked out until LASER_RESUME
     // ── weapons: upgradeable laser + auto-lock missiles ──
     int laser_lvl_ = 1;                 // 1..LASER_LVL_MAX; more damage + faster fire
     static constexpr int LASER_LVL_MAX = 4;
@@ -495,6 +541,8 @@ private:
     std::vector<EShot> eshots_;
     std::vector<Laser> lasers_;
     std::vector<Flash> flash_;
+    std::vector<Note> notes_;      // queued announcements; front() is showing
+    float note_t_ = 0;             // how long the front note has been up
     std::unique_ptr<Boss> boss_;
 
     int to_spawn_ = 0;             // enemies left to release this wave
@@ -510,40 +558,52 @@ private:
     float fire_cd_ = 0;
     float lock_glow_ = 0;          // pulse when something's under the reticle
     float hit_flash_ = 0;          // red screen flash on energy hit
-    float dead_t_ = 0, win_t_ = 0, intro_t_ = 0, respawn_t_ = 0;
+    float dead_t_ = 0, intro_t_ = 0, go_t_ = 0;
     float invinc_ = 0;             // post-respawn invincibility
+    float hurt_t_ = 0;             // brief i-frames after any hit
     float pip_t_ = 0;              // low-energy beep cadence
     float chirp_t_ = 0;            // throttle: min gap between spawn chirps
     bool lock_active_ = false;     // edge-detect crosshair lock for lock_on()
+    bool threat_ = false;          // an incoming shot is on course to hit (reticle warning)
     bool boss_wave_ = false;
-    bool submitted_ = false;
+    bool submitted_ = false, new_hi_ = false;
     bool bot_ = false;
+    bool pad_ = false;             // a gamepad is connected → show pad prompts
     float game_t_ = 0;
 
     void tele(const J& j) { if (ctx_.tele) ctx_.tele->event(j); }
 
     void new_game() {
         score_ = 0; wave_ = 0; lives_ = 3; energy_ = MAX_ENERGY;
+        next_life_at_ = life_step_ = LIFE_EVERY;
         view_a_ = view_e_ = 0; pan_va_ = pan_ve_ = 0;
-        laser_ = LASER_MAX; laser_pause_ = 0; overheat_t_ = 0; deny_cd_ = 0;
+        laser_ = LASER_MAX; laser_pause_ = 0; overheat_t_ = 0; overheated_ = false;
         laser_lvl_ = 1; missiles_ = 3; missile_cd_ = 0; next_eid_ = 1;
         enemies_.clear(); tanks_.clear(); eshots_.clear(); lasers_.clear(); flash_.clear();
         pmissiles_.clear();
+        notes_.clear(); note_t_ = 0;
         boss_.reset();
         particles_.clear();
-        submitted_ = false; entry_started_ = false;
-        invinc_ = 0; hit_flash_ = 0;
-        chirp_t_ = 0; lock_active_ = false;
+        submitted_ = false; new_hi_ = false; entry_started_ = false; go_t_ = 0;
+        invinc_ = 0; hurt_t_ = 0; hit_flash_ = 0; fire_cd_ = 0; lock_glow_ = 0; pip_t_ = 0;
+        chirp_t_ = 0; lock_active_ = false; threat_ = false;
+        if (ctx_.combo) ctx_.combo->reset();
         bot_ = std::getenv("VOID_BOT") != nullptr || ctx_.demo;
+        if (ctx_.sfx && !ctx_.demo) ctx_.sfx->start_music(5);
         int start = 1;
         if (const char* e = std::getenv("VOID_WAVE")) start = std::max(1, atoi(e));
         start_wave(start);
     }
 
+    // Queue an announcement; they show one after another near the top.
+    void announce(const std::string& title, const std::string& sub, Color c, float dur = 1.3f) {
+        notes_.push_back({title, sub, c, dur});
+    }
+
     void start_wave(int w) {
         // Seamless after the first wave: you keep flying/shooting through the
-        // transition (no freeze) — the wave is announced with a fading banner.
-        bool seamless = (w > 1);
+        // transition (no freeze) — the wave is announced with a queued banner.
+        bool seamless = (wave_ > 0);
         wave_ = w;
         boss_wave_ = (w % 4 == 0) || std::getenv("VOID_GBOSS");  // debug: force boss
         eshots_.clear();
@@ -561,11 +621,9 @@ private:
         tank_t_ = rnd_uniform(5.0f, 9.0f);
         if (ctx_.fx) ctx_.fx->palette_hue = 0.20f * std::sin(w * 0.6f) + (boss_wave_ ? -0.10f : 0.0f);
         if (seamless) {
-            state_ = St::Play;   // never stop — announce with a non-blocking flash
-            add_flash(boss_wave_ ? "WARNING" : "WAVE " + std::to_string(w),
-                      ctx_.W / 2, ctx_.H / 2 - 30, boss_wave_ ? RED : CYAN, 1.5f, true);
-            add_flash(boss_wave_ ? "A VOID BOSS APPROACHES" : "ENEMIES INCOMING",
-                      ctx_.W / 2, ctx_.H / 2 + 22, boss_wave_ ? RED : DIM, 1.5f);
+            state_ = St::Play;   // never stop — announce with a non-blocking banner
+            if (boss_wave_) announce("WARNING", "A VOID BOSS APPROACHES", RED, 1.8f);
+            else announce("WAVE " + std::to_string(w), "ENEMIES INCOMING", CYAN, 1.3f);
         } else {
             state_ = St::Intro;
             intro_t_ = 1.8f;
@@ -588,12 +646,15 @@ private:
         // smaller, agile boss has less HP than the old giant — it's hard to TRACK,
         // not hard to chip; but still a meaningful multi-phase fight.
         boss_->max_hp = boss_->hp = 38 + tier * 15;
-        boss_->a = 0; boss_->e = -0.05f;
-        boss_->z = 0.55f;                     // mid depth — modest on-screen size
-        boss_->ta = 0; boss_->te = -0.05f;
-        boss_->move_t = 0.6f;
+        // Entrance: it starts as a speck deep in the void, dead ahead, and rushes
+        // up to its fighting depth while its shield (invuln) is still up.
+        boss_->a = view_a_; boss_->e = clampf(view_e_ - 0.05f, -0.4f, 0.4f);
+        boss_->z = 1.0f;
+        boss_->ta = boss_->a; boss_->te = boss_->e;
+        boss_->move_t = 2.0f;
         boss_->atk_iv = std::max(0.8f, 1.7f - tier * 0.12f);
-        boss_->invuln = 1.6f;
+        boss_->invuln = 2.0f;
+        if (ctx_.sfx) ctx_.sfx->boss_alarm();
     }
 
     void add_flash(const std::string& t, float x, float y, Color c, float life = 1.0f, bool big = false) {
@@ -606,8 +667,7 @@ private:
         submitted_ = true;
         tele(J().add("ev", "game_over").add("wave", wave_).add("score", score_).add("t", (double)game_t_));
         if (ctx_.scores) {
-            bool hi = ctx_.scores->submit_void_gunner(score_, wave_);
-            if (hi) add_flash("NEW HI-SCORE!", ctx_.W / 2, ctx_.H / 2 - 40, YELLOW, 2.5f, true);
+            new_hi_ = ctx_.scores->submit_void_gunner(score_, wave_);
             high_score_ = ctx_.scores->high_score("void_gunner");
         }
     }
@@ -647,15 +707,56 @@ private:
         tanks_.push_back(t);
     }
 
-    // The shot kills the enemy whose projected screen pos is within CROSS_R of
-    // centre; nearest (smallest z) wins. Also hits tanks and the boss weak point.
+    Proj proj(float a, float e, float z) const {
+        return project(a, e, z, view_a_, view_e_, ctx_.W, ctx_.H);
+    }
+    // Is the reticle on a target whose sprite is `size_px` across? ONE test for
+    // the laser and the lock indicator: the sprite's on-screen box plus a little
+    // forgiveness, so a huge near enemy is hit anywhere on its body.
+    bool reticle_on(float a, float e, float z, int size_px) const {
+        Proj p = proj(a, e, z);
+        // most of the sprite's box (its corners are empty) plus a forgiveness pad
+        // that is generous for distant specks and shrinks as the target looms
+        float half = size_px * 0.4f + std::max(10.0f, 46.0f - size_px * 0.12f);
+        return std::fabs(p.sx - ctx_.W * 0.5f) <= half && std::fabs(p.sy - ctx_.H * 0.5f) <= half;
+    }
+    bool reticle_on_weak_spot() const {
+        Proj wp = proj(boss_->wa(), boss_->we(), boss_->z);
+        float dx = wp.sx - ctx_.W * 0.5f, dy = wp.sy - ctx_.H * 0.5f;
+        return dx * dx + dy * dy <= CROSS_R * CROSS_R;
+    }
+    // Where an enemy shot is on screen (position magnification clamped at
+    // SHOT_ZREF — see the constant). Used for drawing AND for the hit test.
+    Proj shot_proj(const EShot& s) const {
+        float zz = std::max(s.z, SHOT_ZREF);
+        Proj p;
+        p.sx = ctx_.W * 0.5f + (s.ca() - view_a_) * SPREAD / zz;
+        p.sy = ctx_.H * 0.5f + (s.ce() - view_e_) * SPREAD / zz;
+        p.scale = 1.0f / zz;
+        p.on_screen = p.sx > -200 && p.sx < ctx_.W + 200 && p.sy > -200 && p.sy < ctx_.H + 200;
+        return p;
+    }
+    // Would this shot connect if it arrived right now (i.e. is its landing point
+    // within SHOT_HIT_R px of the reticle)?
+    bool shot_on_course(const EShot& s) const {
+        float dx = (s.ta - view_a_) * SPREAD / SHOT_ZREF, dy = (s.te - view_e_) * SPREAD / SHOT_ZREF;
+        return dx * dx + dy * dy <= SHOT_HIT_R * SHOT_HIT_R;
+    }
+    void deny_blip() {
+        if (ctx_.sfx) { ctx_.sfx->pan_next(0.5f); ctx_.sfx->low_energy_pip(); }
+    }
+
+    // The shot kills the enemy under the reticle; nearest (smallest z) wins. Also
+    // hits tanks and the boss weak point.
     void fire();
     void fire_missile();
     void update_missiles(float dt);
     void detonate_missile(const Missile& m);
-    void energy_hit(float amount, bool from_shot);
+    bool energy_hit(float amount);
     void update_play(float dt, const Input& in);
-    void update_boss(float dt);
+    void update_game_over(float dt, const Input& in);
+    void update_boss(float dt, bool player_alive);
+    void boss_take(int dmg, float stun);
     void bot_decide(float& pan_a, float& pan_e, bool& want_fire);
 
     // formation spawning
@@ -667,7 +768,12 @@ private:
     void draw_crosshair(Surface& s);
     void draw_hud(Surface& s);
     void draw_flash(Surface& s);
+    void draw_notes(Surface& s);
     void draw_radar(Surface& s);
+    void draw_eshot(Surface& s, const EShot& sh);
+    void draw_enemy(Surface& s, const Enemy& e);
+    void draw_tank(Surface& s, const Tank& t);
+    void draw_boss(Surface& s);
 };
 
 // ── Enemy type roll (weighted, Tank gated by wave) ──────────────────────────
@@ -731,7 +837,7 @@ void VoidGunnerGame::release_one() {
             int half = i / 2; float sgn = (i & 1) ? 1.0f : -1.0f;
             if (i == 0) { sgn = 0; half = 0; }
             float spread = 0.22f;
-            e.form_a = clampf(form_lane_a_ + sgn * half * spread, -1.1f, 1.1f);
+            e.form_a = clampf(form_lane_a_ + sgn * half * spread, -1.05f, 1.05f);
             e.form_e = clampf(form_lane_e_ - half * 0.10f, -0.8f, 0.8f);  // V dips
             e.a0 = e.a = e.form_a;
             e.e0 = e.e = e.form_e;
@@ -778,43 +884,49 @@ void VoidGunnerGame::release_one() {
     if (--form_left_ <= 0) form_kind_ = -1;  // formation exhausted
 }
 
+// Damage the boss (laser or missile) and start its death if that finishes it.
+void VoidGunnerGame::boss_take(int dmg, float stun) {
+    boss_->hp -= dmg; boss_->hit_flash = 0.16f;
+    boss_->hurt_t = std::max(boss_->hurt_t, stun);
+    if (boss_->hp <= 0 && !boss_->dying) { boss_->dying = true; boss_->die_t = 0; }
+}
+
 // ── Fire ─────────────────────────────────────────────────────────────────────
 void VoidGunnerGame::fire() {
     if (fire_cd_ > 0) return;
-    // ── laser energy gate: can't fire when overheated/too low ──
+    // ── laser energy gate: an overheated laser stays locked out until it has
+    //    recharged to LASER_RESUME (one blip when it trips, not a stutter). ──
+    if (overheated_) { overheat_t_ = 0.35f; return; }
     if (laser_ < LASER_MIN_FIRE) {
-        overheat_t_ = 0.35f;
-        if (deny_cd_ <= 0) {
-            deny_cd_ = 0.18f;
-            if (ctx_.sfx) { ctx_.sfx->pan_next(0.5f); ctx_.sfx->shield_hit(); }
-        }
+        overheated_ = true; overheat_t_ = 0.35f;
+        deny_blip();
         return;
     }
     laser_ -= LASER_COST;
     laser_pause_ = LASER_PAUSE;     // brief regen lockout after each shot
+    if (laser_ < LASER_MIN_FIRE) { overheated_ = true; deny_blip(); }
     fire_cd_ = 0.16f - 0.02f * (laser_lvl_ - 1);   // upgraded lasers fire faster
     lasers_.push_back({-1.0f, 0.0f});
     lasers_.push_back({+1.0f, 0.0f});
     if (ctx_.sfx) ctx_.sfx->beam_fire();   // bright convergent player laser
     if (ctx_.fx) ctx_.fx->rumble_tap();
 
-    int W = ctx_.W, H = ctx_.H;
+    int W = ctx_.W;
     // Boss weak point first (it's the priority target on boss waves).
-    if (boss_ && boss_->damageable()) {
-        Proj wp = project(boss_->a + boss_->wp_a, boss_->e + boss_->wp_e, boss_->z,
-                          view_a_, view_e_, W, H);
-        float dx = wp.sx - W * 0.5f, dy = wp.sy - H * 0.5f;
-        if (dx * dx + dy * dy <= CROSS_R * CROSS_R) {
-            boss_->hp -= 3 + laser_lvl_ * 2; boss_->hit_flash = 0.16f; boss_->hurt_t = 0.22f;
-            score_ += 15 * (ctx_.combo ? ctx_.combo->hit() : 1);
-            particles_.explode_invader(int(wp.sx), int(wp.sy), boss_->color, 10);
-            if (ctx_.sfx) ctx_.sfx->invader_hit();
-            if (ctx_.fx) ctx_.fx->shake(3);
-            if (boss_->hp <= 0 && !boss_->dying) {
-                boss_->dying = true; boss_->die_t = 0;
-            }
+    if (boss_ && !boss_->dying && reticle_on_weak_spot()) {
+        Proj wp = proj(boss_->wa(), boss_->we(), boss_->z);
+        if (!boss_->damageable()) {
+            // still shielded (arriving): the shot visibly glances off
+            particles_.explode_invader(int(wp.sx), int(wp.sy), Color(160, 215, 255), 4);
+            if (ctx_.sfx) ctx_.sfx->armor_tink();
             return;
         }
+        boss_take(3 + laser_lvl_ * 2, 0.22f);
+        score_ += 15 * (ctx_.combo ? ctx_.combo->hit() : 1);
+        particles_.explode_invader(int(wp.sx), int(wp.sy), boss_->color, 10);
+        if (ctx_.sfx) ctx_.sfx->invader_hit();
+        if (ctx_.fx) ctx_.fx->shake(3);
+        return;
     }
 
     // Best (nearest) enemy under the reticle.
@@ -822,20 +934,14 @@ void VoidGunnerGame::fire() {
     for (int i = 0; i < (int)enemies_.size(); ++i) {
         Enemy& e = enemies_[i];
         if (!e.alive) continue;
-        Proj p = project(e.a, e.e, e.z, view_a_, view_e_, W, H);
-        float dx = p.sx - W * 0.5f, dy = p.sy - H * 0.5f;
-        // generous radius scaled mildly by how big the enemy is on screen
-        float r = CROSS_R + std::min(40.0f, BASE * p.scale * 0.4f);
-        if (dx * dx + dy * dy <= r * r && e.z < best_z) { best_z = e.z; best = i; }
+        if (reticle_on(e.a, e.e, e.z, enemy_px(e.z)) && e.z < best_z) { best_z = e.z; best = i; }
     }
-    // Energy tanks too (gold; refill).
+    // Energy canisters too (refill).
     int best_tank = -1; float bt_z = 1e9f;
     for (int i = 0; i < (int)tanks_.size(); ++i) {
         Tank& t = tanks_[i];
         if (!t.alive) continue;
-        Proj p = project(t.a, t.e, t.z, view_a_, view_e_, W, H);
-        float dx = p.sx - W * 0.5f, dy = p.sy - H * 0.5f;
-        if (dx * dx + dy * dy <= CROSS_R * CROSS_R && t.z < bt_z) { bt_z = t.z; best_tank = i; }
+        if (reticle_on(t.a, t.e, t.z, tank_px(t.z)) && t.z < bt_z) { bt_z = t.z; best_tank = i; }
     }
 
     // Whichever is nearer (enemy vs tank) gets hit; tanks are valuable so a tie
@@ -845,40 +951,41 @@ void VoidGunnerGame::fire() {
         t.alive = false;
         energy_ = std::min(MAX_ENERGY, energy_ + 40.0f);
         laser_ = std::min(LASER_MAX, laser_ + 0.6f);  // tanks recharge the laser too
+        overheated_ = false;
         bool got_missile = missiles_ < MISSILES_MAX;
         if (got_missile) missiles_++;                 // ...and top up a missile
         overheat_t_ = 0;
-        Proj p = project(t.a, t.e, t.z, view_a_, view_e_, W, H);
+        Proj p = proj(t.a, t.e, t.z);
         particles_.ufo_explode(int(p.sx), int(p.sy), 24);
         add_flash(got_missile ? "+ENERGY +LASER +MISSILE" : "+ENERGY +LASER",
-                  p.sx, p.sy - 30, GOLD, 1.1f, true);
-        if (ctx_.sfx) { ctx_.sfx->pan_next(p.sx / float(W)); ctx_.sfx->energy_refill(); }
+                  p.sx, p.sy - 30, CAN, 1.1f, true);
+        if (ctx_.sfx) { ctx_.sfx->pan_next(clampf(p.sx / float(W), 0.f, 1.f)); ctx_.sfx->energy_refill(); }
         if (ctx_.fx) { ctx_.fx->rumble_pickup(); ctx_.fx->shake(4); }
         return;
     }
     if (best >= 0) {
         Enemy& e = enemies_[best];
         e.hp -= laser_lvl_; e.hit_flash = 0.18f;
+        Proj p = proj(e.a, e.e, e.z);
         if (e.hp <= 0) {
             e.alive = false;
             int pts = e.points();
             int mult = ctx_.combo ? ctx_.combo->hit() : 1;
             score_ += pts * mult;
-            Proj p = project(e.a, e.e, e.z, view_a_, view_e_, W, H);
             particles_.explode_invader(int(p.sx), int(p.sy), e.color(),
                                        int(18 + 22 * p.scale * 0.1f));
-            add_flash("+" + std::to_string(pts), p.sx, p.sy - 22, YELLOW);
+            add_flash("+" + std::to_string(pts * mult), p.sx, p.sy - 22, YELLOW);
             if (ctx_.sfx) {
-                ctx_.sfx->pan_next(p.sx / float(W));
+                ctx_.sfx->pan_next(clampf(p.sx / float(W), 0.f, 1.f));
                 // the armoured beetle gets a meatier kill; others a sharp zap
                 if (e.type == EType::Tank) ctx_.sfx->boss_explosion();
                 else { ctx_.sfx->zap(); ctx_.sfx->invader_hit(); }
             }
             if (ctx_.fx) ctx_.fx->shake(3 + std::min(6.0f, p.scale));
         } else {
-            Proj p = project(e.a, e.e, e.z, view_a_, view_e_, W, H);
+            // armour chipped, not dead yet
             particles_.explode_invader(int(p.sx), int(p.sy), e.color(), 6);
-            if (ctx_.sfx) ctx_.sfx->invader_hit();
+            if (ctx_.sfx) { ctx_.sfx->pan_next(clampf(p.sx / float(W), 0.f, 1.f)); ctx_.sfx->armor_tink(); }
         }
     }
 }
@@ -888,20 +995,14 @@ void VoidGunnerGame::fire() {
 // the enemy nearest the reticle (or the boss). Detonates with splash damage.
 void VoidGunnerGame::fire_missile() {
     if (missile_cd_ > 0) return;
-    if (missiles_ <= 0) {  // out of ammo — the same denied blip as an empty laser
-        if (deny_cd_ <= 0) {
-            deny_cd_ = 0.18f;
-            if (ctx_.sfx) { ctx_.sfx->pan_next(0.5f); ctx_.sfx->shield_hit(); }
-        }
-        return;
-    }
+    if (missiles_ <= 0) { deny_blip(); return; }   // out of ammo
     int W = ctx_.W, H = ctx_.H;
     // Auto-lock: the enemy nearest the reticle wins (depth breaks ties).
     int best = -1; float best_score = 1e18f;
     for (int i = 0; i < (int)enemies_.size(); ++i) {
         Enemy& e = enemies_[i];
         if (!e.alive) continue;
-        Proj p = project(e.a, e.e, e.z, view_a_, view_e_, W, H);
+        Proj p = proj(e.a, e.e, e.z);
         float dx = p.sx - W * 0.5f, dy = p.sy - H * 0.5f;
         float sc = dx * dx + dy * dy + e.z * 4000.0f;
         if (sc < best_score) { best_score = sc; best = i; }
@@ -912,11 +1013,17 @@ void VoidGunnerGame::fire_missile() {
     if (best >= 0) {
         Enemy& e = enemies_[best];
         m.target_id = e.id;
-        Proj p = project(e.a, e.e, e.z, view_a_, view_e_, W, H);
+        Proj p = proj(e.a, e.e, e.z);
         m.tx = p.sx; m.ty = p.sy;
-    } else if (boss_ && boss_->damageable()) {
+    } else if (boss_ && !boss_->dying) {
+        if (!boss_->damageable()) {
+            // shield still up: hold the missile instead of wasting it
+            if (ctx_.sfx) { ctx_.sfx->pan_next(0.5f); ctx_.sfx->armor_tink(); }
+            missile_cd_ = 0.25f;
+            return;
+        }
         m.target_id = -2;   // -2 = boss weak point
-        Proj p = project(boss_->a + boss_->wp_a, boss_->e + boss_->wp_e, boss_->z, view_a_, view_e_, W, H);
+        Proj p = proj(boss_->wa(), boss_->we(), boss_->z);
         m.tx = p.sx; m.ty = p.sy;
     } else {
         m.target_id = -1;   // nothing to lock — fly toward the reticle
@@ -930,7 +1037,6 @@ void VoidGunnerGame::fire_missile() {
 }
 
 void VoidGunnerGame::update_missiles(float dt) {
-    int W = ctx_.W, H = ctx_.H;
     for (auto& m : pmissiles_) {
         if (!m.alive) continue;
         m.t += dt;
@@ -938,10 +1044,10 @@ void VoidGunnerGame::update_missiles(float dt) {
         if (m.target_id >= 0) {
             const Enemy* tgt = nullptr;
             for (auto& e : enemies_) if (e.alive && e.id == m.target_id) { tgt = &e; break; }
-            if (tgt) { Proj p = project(tgt->a, tgt->e, tgt->z, view_a_, view_e_, W, H); m.tx = p.sx; m.ty = p.sy; }
+            if (tgt) { Proj p = proj(tgt->a, tgt->e, tgt->z); m.tx = p.sx; m.ty = p.sy; }
             else m.target_id = -1;
         } else if (m.target_id == -2 && boss_ && boss_->damageable()) {
-            Proj p = project(boss_->a + boss_->wp_a, boss_->e + boss_->wp_e, boss_->z, view_a_, view_e_, W, H);
+            Proj p = proj(boss_->wa(), boss_->we(), boss_->z);
             m.tx = p.sx; m.ty = p.sy;
         }
         float dx = m.tx - m.sx, dy = m.ty - m.sy;
@@ -960,16 +1066,17 @@ void VoidGunnerGame::update_missiles(float dt) {
 }
 
 void VoidGunnerGame::detonate_missile(const Missile& m) {
-    int W = ctx_.W, H = ctx_.H;
+    int W = ctx_.W;
     particles_.explode_invader(int(m.sx), int(m.sy), Color(255, 180, 90), 26);
-    if (ctx_.sfx) { ctx_.sfx->pan_next(m.sx / float(W)); ctx_.sfx->big_explosion(); }
+    if (ctx_.sfx) { ctx_.sfx->pan_next(clampf(m.sx / float(W), 0.f, 1.f)); ctx_.sfx->big_explosion(); }
     if (ctx_.fx) ctx_.fx->shake(6);
     const float R = 95.0f;   // splash radius, in screen px around the blast
     for (auto& e : enemies_) {
         if (!e.alive) continue;
-        Proj p = project(e.a, e.e, e.z, view_a_, view_e_, W, H);
+        Proj p = proj(e.a, e.e, e.z);
         float dx = p.sx - m.sx, dy = p.sy - m.sy;
-        if (dx * dx + dy * dy > R * R) continue;
+        float reach = R + enemy_px(e.z) * 0.5f;   // the blast catches the sprite, not just its centre
+        if (dx * dx + dy * dy > reach * reach) continue;
         e.hp -= (e.id == m.target_id) ? 4 : 2;   // direct hit hurts more than the splash
         e.hit_flash = 0.18f;
         if (e.hp <= 0) {
@@ -978,56 +1085,66 @@ void VoidGunnerGame::detonate_missile(const Missile& m) {
             int mult = ctx_.combo ? ctx_.combo->hit() : 1;
             score_ += pts * mult;
             particles_.explode_invader(int(p.sx), int(p.sy), e.color(), 16);
-            add_flash("+" + std::to_string(pts), p.sx, p.sy - 20, YELLOW);
+            add_flash("+" + std::to_string(pts * mult), p.sx, p.sy - 20, YELLOW);
         }
     }
     if (boss_ && boss_->damageable()) {
-        Proj p = project(boss_->a + boss_->wp_a, boss_->e + boss_->wp_e, boss_->z, view_a_, view_e_, W, H);
+        Proj p = proj(boss_->wa(), boss_->we(), boss_->z);
         float dx = p.sx - m.sx, dy = p.sy - m.sy;
         if (dx * dx + dy * dy <= (R * 1.2f) * (R * 1.2f)) {
-            boss_->hp -= 6; boss_->hit_flash = 0.16f; boss_->hurt_t = 0.35f;
-            if (boss_->hp <= 0 && !boss_->dying) { boss_->dying = true; boss_->die_t = 0; }
+            boss_take(6, 0.35f);
+            int pts = 40 * (ctx_.combo ? ctx_.combo->hit() : 1);
+            score_ += pts;
+            particles_.explode_invader(int(p.sx), int(p.sy), boss_->color, 16);
+            add_flash("+" + std::to_string(pts), p.sx, p.sy - 34, YELLOW);
         }
     }
 }
 
-void VoidGunnerGame::energy_hit(float amount, bool from_shot) {
-    if (invinc_ > 0) return;
+// Returns true if the hit actually landed (not shrugged off by i-frames).
+bool VoidGunnerGame::energy_hit(float amount) {
+    if (state_ != St::Play || invinc_ > 0 || hurt_t_ > 0) return false;
     energy_ -= amount;
     hit_flash_ = 1.0f;
-    if (ctx_.sfx) ctx_.sfx->player_death();   // gritty noise hit
+    hurt_t_ = HURT_IFRAMES;   // one volley = one hit; no multi-bolt stacking
     if (ctx_.fx) { ctx_.fx->shake(12); ctx_.fx->rumble_hit(); ctx_.fx->hitstop(0.05f); }
-    (void)from_shot;
-    if (energy_ <= 0) {
-        energy_ = 0;
-        lives_--;
-        particles_.explode_player(ctx_.W / 2, ctx_.H / 2, 60);
-        if (ctx_.sfx) ctx_.sfx->player_death();
-        if (ctx_.fx) { ctx_.fx->shake(22); ctx_.fx->hitstop(0.10f); ctx_.fx->rumble_death(); ctx_.fx->shockwave(0.5f, 0.5f); }
-        state_ = St::Dead; dead_t_ = 2.0f;
-        tele(J().add("ev", "death").add("wave", wave_).add("t", (double)game_t_).add("lives_left", lives_));
+    if (energy_ > 0) {
+        if (ctx_.sfx) ctx_.sfx->shield_hit();     // a hit: shields ping…
+        return true;
     }
+    energy_ = 0;
+    lives_--;
+    particles_.explode_player(ctx_.W / 2, ctx_.H / 2, 60);
+    if (ctx_.sfx) ctx_.sfx->player_death();       // …only a kill gets the death sound
+    if (ctx_.fx) { ctx_.fx->shake(22); ctx_.fx->hitstop(0.10f); ctx_.fx->rumble_death(); ctx_.fx->shockwave(0.5f, 0.5f); }
+    state_ = St::Dead; dead_t_ = 2.0f;
+    tele(J().add("ev", "death").add("wave", wave_).add("t", (double)game_t_).add("lives_left", lives_));
+    return true;
 }
 
 // ── Update ───────────────────────────────────────────────────────────────────
 void VoidGunnerGame::update(float dt, const Input& in) {
-    for (auto k : in.pressed)
-        if (k == SDLK_p && state_ == St::Play) pause_.toggle();
+    pad_ = in.pad_connected;
+    // Pause works everywhere except the game-over screen (where START/P = menu).
+    // ESC opens the pause menu too (quit lives there) instead of dropping the run.
+    if ((in.just(SDLK_p) || (in.just(SDLK_ESCAPE) && !pause_.active())) && state_ != St::GameOver) pause_.toggle();
     if (pause_.active()) {
         if (pause_.update(in) == PauseResult::QuitToMenu) quit_to_menu = true;
         return;
     }
-    for (auto k : in.pressed)
-        if (k == SDLK_ESCAPE) { quit_to_menu = true; return; }
 
     game_t_ += dt;
-    if (ctx_.combo) ctx_.combo->update(dt);
+    // (the shared combo timer is ticked by main.cpp — ticking it here too halved the window)
     particles_.update(dt);
     if (hit_flash_ > 0) hit_flash_ -= dt * 2.2f;
     if (lock_glow_ > 0) lock_glow_ -= dt * 3.0f;
     for (auto& f : flash_) f.life -= dt;
     flash_.erase(std::remove_if(flash_.begin(), flash_.end(),
                  [](const Flash& f) { return f.life <= 0; }), flash_.end());
+    if (!notes_.empty()) {
+        note_t_ += dt;
+        if (note_t_ >= notes_.front().dur) { notes_.erase(notes_.begin()); note_t_ = 0; }
+    }
 
     // Starfield always streaming (intro + play) for the "flowing at you" feel.
     for (auto& st : stars_) {
@@ -1042,70 +1159,82 @@ void VoidGunnerGame::update(float dt, const Input& in) {
     // intro — pausing only briefly right after a shot. (Was Play-only before.)
     if (laser_pause_ > 0) laser_pause_ -= dt;
     else if (laser_ < LASER_MAX) laser_ = std::min(LASER_MAX, laser_ + LASER_REGEN * dt);
+    if (overheated_ && laser_ >= LASER_RESUME) overheated_ = false;
     if (overheat_t_ > 0) overheat_t_ -= dt;
 
+    if (state_ == St::GameOver) { update_game_over(dt, in); return; }
     if (state_ == St::Intro) {
         intro_t_ -= dt;
         if (intro_t_ <= 0) state_ = St::Play;
-    } else if (state_ == St::Play) {
-        update_play(dt, in);
-    } else if (state_ == St::Dead) {
+        return;
+    }
+    // Play AND Dead both run the scene: while you are down the void keeps moving
+    // (enemies hang back, shots fly past) instead of freezing for two seconds.
+    update_play(dt, in);
+    if (state_ == St::Dead) {
         dead_t_ -= dt;
         if (dead_t_ <= 0) {
             if (lives_ > 0) {
                 energy_ = MAX_ENERGY;
                 invinc_ = 2.5f;
-                view_a_ = view_e_ = 0;
                 eshots_.clear();
                 state_ = St::Play;
                 if (ctx_.sfx) ctx_.sfx->spawn_chime();
             } else {
-                state_ = St::GameOver; submit_scores();
+                state_ = St::GameOver; go_t_ = 0;
+                notes_.clear(); pmissiles_.clear(); eshots_.clear();
+                submit_scores();
+                if (ctx_.sfx && !bot_) ctx_.sfx->game_over();
             }
         }
-    } else if (state_ == St::Win) {
-        win_t_ -= dt;
-        if (win_t_ <= 0) start_wave(wave_ + 1);
-    } else if (state_ == St::GameOver) {
-        if (bot_) { new_game(); return; }
-        if (ctx_.scores) {
-            const std::string gid = "void_gunner";
-            if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
-                entry_started_ = true;
-                int rank = 1;
-                for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
-                initials_.begin("VOID GUNNER", score_, rank);
-            }
-            if (initials_.active()) {
-                if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
-                return;
-            }
-        }
-        for (auto k : in.pressed)
-            if (k == SDLK_RETURN || k == SDLK_SPACE) new_game();
     }
 }
 
-void VoidGunnerGame::update_play(float dt, const Input& in) {
-    if (fire_cd_ > 0) fire_cd_ -= dt;
-    if (invinc_ > 0) invinc_ -= dt;
-    if (chirp_t_ > 0) chirp_t_ -= dt;
-    if (deny_cd_ > 0) deny_cd_ -= dt;  // overheat_t_ now decays in update() (all states)
+void VoidGunnerGame::update_game_over(float dt, const Input& in) {
+    go_t_ += dt;
+    if (bot_) { new_game(); return; }
+    if (ctx_.scores) {
+        const std::string gid = "void_gunner";
+        if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
+            entry_started_ = true;
+            int rank = 1;
+            for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
+            initials_.begin("VOID GUNNER", score_, rank);
+        }
+        if (initials_.active()) {
+            if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
+            return;
+        }
+    }
+    if (ui::game_over_retry(in, go_t_)) new_game();
+    else if (ui::game_over_menu(in, go_t_)) quit_to_menu = true;
+}
 
+void VoidGunnerGame::update_play(float dt, const Input& in) {
+    // `live` = the player is in the fight. While dead the scene still animates,
+    // but nothing spawns, shoots or closes in.
+    const bool live = state_ == St::Play;
+    if (fire_cd_ > 0) fire_cd_ -= dt;
+    if (live && invinc_ > 0) invinc_ -= dt;
+    if (hurt_t_ > 0) hurt_t_ -= dt;
+    if (chirp_t_ > 0) chirp_t_ -= dt;
     if (missile_cd_ > 0) missile_cd_ -= dt;
+
     // ── input / bot: pan the view & fire ──
     float pan_a = 0, pan_e = 0; bool want_fire = false, want_missile = false;
-    if (bot_) {
+    if (!live) {
+        msl_btn_prev_ = in.pad[PadThrUp] || in.pad[PadThrDown];
+    } else if (bot_) {
         bot_decide(pan_a, pan_e, want_fire);
         // occasionally lob a missile so the bot demos the weapon
-        if (missiles_ > 0 && missile_cd_ <= 0 && !enemies_.empty() && rnd01() < 0.03f) want_missile = true;
+        if (missiles_ > 0 && missile_cd_ <= 0 && !enemies_.empty() && rnd01() < 1.8f * dt) want_missile = true;
     } else {
         pan_a = (in.down(SDLK_RIGHT) || in.down(SDLK_d)) - (in.down(SDLK_LEFT) || in.down(SDLK_a));
         pan_e = (in.down(SDLK_DOWN) || in.down(SDLK_s)) - (in.down(SDLK_UP) || in.down(SDLK_w));
         want_fire = in.down(SDLK_SPACE);
         // missile: keyboard B / LSHIFT (one per press), gamepad Y (→B) OR either
         // shoulder button (edge-detected so a held shoulder fires just one).
-        for (auto k : in.pressed) if (k == SDLK_b || k == SDLK_LSHIFT) want_missile = true;
+        if (in.just(SDLK_b) || in.just(SDLK_LSHIFT)) want_missile = true;
         bool msl_btn = in.pad[PadThrUp] || in.pad[PadThrDown];  // RB / LB
         if (msl_btn && !msl_btn_prev_) want_missile = true;
         msl_btn_prev_ = msl_btn;
@@ -1122,9 +1251,12 @@ void VoidGunnerGame::update_play(float dt, const Input& in) {
     // Gentle spring back toward centre when not actively panning.
     if (pan_a == 0) view_a_ -= clampf(view_a_, -1.0f, 1.0f) * 0.9f * dt;
     if (pan_e == 0) view_e_ -= clampf(view_e_, -1.0f, 1.0f) * 0.9f * dt;
-    // bleed pan velocity to zero at the clamp edges so it doesn't "stick"
-    if (view_a_ <= -VIEW_LIM || view_a_ >= VIEW_LIM) pan_va_ *= 0.4f;
-    if (view_e_ <= -VIEW_LIM || view_e_ >= VIEW_LIM) pan_ve_ *= 0.4f;
+    // At the pan limit, kill any velocity still pushing outward so the view
+    // doesn't "stick" there (frame-rate independent, unlike a per-frame decay).
+    if (view_a_ <= -VIEW_LIM && pan_va_ < 0) pan_va_ = 0;
+    if (view_a_ >= VIEW_LIM && pan_va_ > 0) pan_va_ = 0;
+    if (view_e_ <= -VIEW_LIM && pan_ve_ < 0) pan_ve_ = 0;
+    if (view_e_ >= VIEW_LIM && pan_ve_ > 0) pan_ve_ = 0;
     view_a_ = clampf(view_a_, -VIEW_LIM, VIEW_LIM);
     view_e_ = clampf(view_e_, -VIEW_LIM, VIEW_LIM);
 
@@ -1133,7 +1265,7 @@ void VoidGunnerGame::update_play(float dt, const Input& in) {
     update_missiles(dt);
 
     // ── spawn enemies as coordinated formations / tanks ──
-    if (!boss_wave_) {
+    if (live && !boss_wave_) {
         spawn_t_ -= dt;
         if (to_spawn_ > 0 && spawn_t_ <= 0) {
             // Start a new formation if the previous one finished releasing.
@@ -1149,19 +1281,26 @@ void VoidGunnerGame::update_play(float dt, const Input& in) {
             }
         }
     }
-    tank_t_ -= dt;
-    if (tank_t_ <= 0) { spawn_tank(); tank_t_ = rnd_uniform(7.0f, 12.0f); }
+    if (live) {
+        tank_t_ -= dt;
+        if (tank_t_ <= 0) { spawn_tank(); tank_t_ = rnd_uniform(7.0f, 12.0f); }
+    }
 
     // ── enemies approach ──
     for (auto& e : enemies_) {
         if (!e.alive) continue;
         if (e.hit_flash > 0) e.hit_flash -= dt * 5;
-        e.z -= e.vz * dt;
+        // closing in while you fight; drifting back a little while you are down
+        // (and once committed to the ramming run it lunges — RAM_RUSH× faster)
+        if (state_ == St::Play) e.z -= e.vz * (e.z < RAM_Z ? RAM_RUSH : 1.0f) * dt;
+        else e.z = std::min(1.0f, e.z + 0.07f * dt);
         e.life_t += dt;
         // animate faster as they near you (legs/wings flap quicker up close)
         e.anim_t += dt * (4.0f + (1.0f - e.z) * 6.0f);
         e.frame = (int(e.anim_t) & 1);
         e.phase += e.weave_freq * dt;
+        // back onto the scripted path (drop last frame's ramming offset)
+        e.a -= e.ram_da; e.e -= e.ram_de;
         // ── scripted formation/path motion ──
         if (e.pat == Pattern::Squadron && !e.peeled) {
             // ease toward the formation slot; hold until peel time.
@@ -1189,26 +1328,39 @@ void VoidGunnerGame::update_play(float dt, const Input& in) {
             e.a = e.a0 + std::sin(e.phase) * e.weave_amp;
             e.e = e.e0 + std::cos(e.phase * 0.7f) * e.weave_amp * 0.5f;
         }
-        // Shooters fire toward your CURRENT view (so dodging by panning works).
-        if (e.type == EType::Shooter || e.type == EType::Tank) {
+        // Never beyond the arc the player can actually aim at: a wide weave
+        // flattens against the edge instead of hiding where no shot can reach.
+        e.a = clampf(e.a, -ARC_LIM, ARC_LIM);
+        e.e = clampf(e.e, -ARC_LIM, ARC_LIM);
+        // ── ramming run: in its last stretch it swings off its path and straight
+        //    at you, so the hit you take is the enemy you SEE filling the screen
+        //    (and it gives you one last clean shot at it). ──
+        {
+            float t = clampf((RAM_Z - e.z) / (RAM_Z - 0.05f), 0.0f, 1.0f);
+            float k = 1.0f - (1.0f - t) * (1.0f - t);
+            e.ram_da = (view_a_ - e.a) * k; e.ram_de = (view_e_ - e.e) * k;
+            e.a += e.ram_da; e.e += e.ram_de;
+        }
+        // Shooters fire toward your CURRENT view (so dodging by panning works) —
+        // never from point-blank, where no pan could get you clear in time.
+        if (state_ == St::Play && (e.type == EType::Shooter || e.type == EType::Tank)) {
             e.fire_t -= dt;
-            if (e.fire_t <= 0 && e.z > 0.18f && e.z < 0.85f) {
+            if (e.fire_t <= 0 && e.z > 0.36f && e.z < 0.85f) {
                 e.fire_t = rnd_uniform(1.6f, 2.8f);
                 eshots_.push_back(make_eshot(e.a, e.e, view_a_, view_e_, e.z,
-                                             0.55f + wave_ * 0.02f, e.color()));
+                                             std::min(0.95f, 0.55f + wave_ * 0.02f), e.color()));
                 if (ctx_.sfx) {
-                    Proj ep = project(e.a, e.e, e.z, view_a_, view_e_, ctx_.W, ctx_.H);
+                    Proj ep = proj(e.a, e.e, e.z);
                     ctx_.sfx->pan_next(clampf(ep.sx / float(ctx_.W), 0.f, 1.f));
                     ctx_.sfx->enemy_shot();
                 }
             }
         }
         // Reached you -> energy hit (direct collision).
-        if (e.z <= 0.05f) {
+        if (state_ == St::Play && e.z <= 0.05f) {
             e.alive = false;
-            energy_hit(20.0f, false);
-            add_flash("IMPACT!", ctx_.W / 2, ctx_.H / 2 + 60, RED, 0.9f, true);
-            if (state_ != St::Play) return;
+            if (energy_hit(20.0f))
+                add_flash("IMPACT!", ctx_.W / 2, ctx_.H / 2 + 96, RED, 0.9f, true);
         }
     }
     enemies_.erase(std::remove_if(enemies_.begin(), enemies_.end(),
@@ -1224,29 +1376,30 @@ void VoidGunnerGame::update_play(float dt, const Input& in) {
     tanks_.erase(std::remove_if(tanks_.begin(), tanks_.end(),
                  [](const Tank& t) { return !t.alive; }), tanks_.end());
 
-    // ── enemy shots: approach the direction they were aimed at; hit if you're
-    //    still aligned when they arrive ──
+    // ── enemy shots: fly to the direction they were aimed at; on arrival they
+    //    connect only if they land near the reticle ON SCREEN ──
+    threat_ = false;
     for (auto& s : eshots_) {
         if (!s.alive) continue;
         s.z -= s.vz * dt;
-        if (s.z <= 0.07f && !s.hit_done) {
-            s.hit_done = true; s.alive = false;
-            float da = s.ta - view_a_, de = s.te - view_e_;
-            // Aligned within this angular tolerance -> it connects. Pan away to dodge.
-            if (std::fabs(da) < 0.16f && std::fabs(de) < 0.16f) {
-                energy_hit(14.0f, true);
-                if (state_ != St::Play) return;
-            } else {
-                // whiffed past you
-                if (ctx_.sfx) ctx_.sfx->bunker_hit();
+        if (s.z <= SHOT_HIT_Z) {
+            s.z = SHOT_HIT_Z; s.alive = false;
+            if (shot_on_course(s)) {
+                energy_hit(14.0f);
+            } else if (state_ == St::Play && ctx_.sfx) {
+                ctx_.sfx->bunker_hit();   // whiffed past you
             }
+        } else if (s.prog() > 0.45f && shot_on_course(s)) {
+            threat_ = true;               // reticle warning: pan away NOW
         }
     }
     eshots_.erase(std::remove_if(eshots_.begin(), eshots_.end(),
                   [](const EShot& s) { return !s.alive; }), eshots_.end());
 
     // ── boss ──
-    if (boss_) update_boss(dt);
+    if (boss_) update_boss(dt, state_ == St::Play);
+
+    if (state_ != St::Play) { lock_active_ = false; return; }
 
     // ── low-energy accelerating warning pips ──
     if (energy_ < 25.0f && energy_ > 0) {
@@ -1258,37 +1411,44 @@ void VoidGunnerGame::update_play(float dt, const Input& in) {
         }
     }
 
-    // ── lock highlight: is something under the reticle? ──
+    // ── lock highlight: is something under the reticle? (same test as fire()) ──
     {
         bool locked = false;
-        int W = ctx_.W, H = ctx_.H;
-        auto under = [&](float a, float e, float z) {
-            Proj p = project(a, e, z, view_a_, view_e_, W, H);
-            float dx = p.sx - W * 0.5f, dy = p.sy - H * 0.5f;
-            return dx * dx + dy * dy <= CROSS_R * CROSS_R;
-        };
-        for (auto& e : enemies_) if (e.alive && under(e.a, e.e, e.z)) { locked = true; break; }
-        if (!locked) for (auto& t : tanks_) if (t.alive && under(t.a, t.e, t.z)) { locked = true; break; }
-        if (!locked && boss_ && boss_->damageable() && under(boss_->a + boss_->wp_a, boss_->e + boss_->wp_e, boss_->z)) locked = true;
+        for (auto& e : enemies_) if (e.alive && reticle_on(e.a, e.e, e.z, enemy_px(e.z))) { locked = true; break; }
+        if (!locked) for (auto& t : tanks_) if (t.alive && reticle_on(t.a, t.e, t.z, tank_px(t.z))) { locked = true; break; }
+        if (!locked && boss_ && boss_->damageable() && reticle_on_weak_spot()) locked = true;
         if (locked) lock_glow_ = 1.0f;
         // play lock_on() once on the rising edge (don't spam every locked frame)
         if (locked && !lock_active_ && ctx_.sfx) ctx_.sfx->lock_on();
         lock_active_ = locked;
     }
 
+    // ── bonus life every LIFE_EVERY points ──
+    while (score_ >= next_life_at_) {
+        life_step_ *= 2;                 // 25k, 75k, 175k, … so lives stay precious
+        next_life_at_ += life_step_;
+        if (lives_ < LIVES_MAX) {
+            lives_++;
+            add_flash("EXTRA LIFE!", ctx_.W - 90, ctx_.H - 64, CYAN, 1.6f);
+            if (ctx_.sfx) ctx_.sfx->one_up();
+        }
+    }
+
     // ── wave clear ──
-    if (!boss_wave_ && to_spawn_ == 0 && enemies_.empty() && state_ == St::Play) {
-        add_flash("WAVE CLEARED!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 1.6f, true);
-        score_ += 200 * wave_;
+    if (!boss_wave_ && to_spawn_ == 0 && enemies_.empty()) {
+        int bonus = 200 * wave_;
+        announce("WAVE CLEARED!", "+" + std::to_string(bonus) + " BONUS", YELLOW, 1.1f);
+        score_ += bonus;
         if (ctx_.sfx) ctx_.sfx->level_clear();
         tele(J().add("ev", "wave_clear").add("wave", wave_).add("score", score_).add("t", (double)game_t_));
         start_wave(wave_ + 1);   // seamless — keep traveling into the next wave
     }
 }
 
-void VoidGunnerGame::update_boss(float dt) {
+void VoidGunnerGame::update_boss(float dt, bool player_alive) {
     Boss& b = *boss_;
     if (b.hit_flash > 0) b.hit_flash -= dt * 6;
+    bool arriving = b.invuln > 0;
     if (b.invuln > 0) b.invuln -= dt;
     b.sway_t += dt;
     b.wp_t += dt;
@@ -1297,27 +1457,28 @@ void VoidGunnerGame::update_boss(float dt) {
 
     if (b.dying) {
         b.die_t += dt;
-        if (rnd01() < 0.6f) {
-            Proj p = project(b.a + rnd_uniform(-0.3f, 0.3f), b.e + rnd_uniform(-0.2f, 0.2f), b.z,
-                             view_a_, view_e_, ctx_.W, ctx_.H);
+        if (rnd01() < 36.0f * dt) {
+            Proj p = proj(b.pa() + rnd_uniform(-0.3f, 0.3f), b.pe() + rnd_uniform(-0.2f, 0.2f), b.z);
             particles_.ufo_explode(int(p.sx), int(p.sy), 12);
         }
-        if (b.die_t >= 1.6f && state_ == St::Play) {
-            score_ += 1000 * (wave_ / 4);
-            add_flash(b.name + " DESTROYED!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 2.2f, true);
-            Proj p = project(b.a, b.e, b.z, view_a_, view_e_, ctx_.W, ctx_.H);
+        if (b.die_t >= 1.6f && player_alive) {
+            int bonus = 1000 * std::max(1, wave_ / 4);
+            score_ += bonus;
+            Proj p = proj(b.pa(), b.pe(), b.z);
             if (ctx_.fx) {
                 ctx_.fx->shake(30); ctx_.fx->hitstop(0.10f);
                 ctx_.fx->rumble_explosion();
-                ctx_.fx->shockwave(p.sx / float(ctx_.W), p.sy / float(ctx_.H));
+                ctx_.fx->shockwave(clampf(p.sx / float(ctx_.W), 0.f, 1.f),
+                                   clampf(p.sy / float(ctx_.H), 0.f, 1.f));
             }
             if (ctx_.sfx) ctx_.sfx->big_explosion();   // bigger than boss_explosion
             // boss reward: LASER UPGRADE + restock missiles
+            std::string reward = "+" + std::to_string(bonus) + "   MISSILES RESTOCKED";
             if (laser_lvl_ < LASER_LVL_MAX) {
                 laser_lvl_++;
-                add_flash("LASER UPGRADED  Lv" + std::to_string(laser_lvl_),
-                          ctx_.W / 2, ctx_.H / 2 + 22, CYAN, 2.2f, true);
+                reward = "LASER UPGRADED  Lv" + std::to_string(laser_lvl_) + "   +3 MISSILES";
             }
+            announce(b.name + " DESTROYED!", reward, YELLOW, 2.0f);
             missiles_ = std::min(MISSILES_MAX, missiles_ + 3);
             tele(J().add("ev", "boss_clear").add("wave", wave_).add("name", b.name)
                     .add("laser_lvl", laser_lvl_).add("t", (double)game_t_));
@@ -1352,22 +1513,30 @@ void VoidGunnerGame::update_boss(float dt) {
         // bias a strafe relative to your view so it weaves around you
         if (rnd01() < 0.4f) b.ta = clampf(view_a_ + rnd_uniform(-0.6f, 0.6f), -0.95f, 0.95f);
     }
-    // glide toward the target (smooth, not snappy) → readable, trackable motion
+    // glide toward the target (smooth, not snappy) → readable, trackable motion.
+    // (The faint wobble lives in Boss::pa()/pe() as an offset, not added here.)
     float chase = std::min(1.0f, dt * (3.0f * agility));
     b.a += (b.ta - b.a) * chase;
     b.e += (b.te - b.e) * chase;
-    // faint jitter so it never sits perfectly still
-    b.a += std::sin(b.sway_t * 7.0f) * 0.006f;
-    b.e += std::cos(b.sway_t * 8.0f) * 0.005f;
-    // drift depth slightly (feints toward you on phase 3) but stays mid-depth
+    // Depth: rushes in from the void on arrival, then holds mid-depth (feinting
+    // a little closer on phase 3).
     float zt = b.phase == 3 ? 0.46f : 0.55f;
-    b.z += (zt - b.z) * std::min(1.0f, dt * 0.8f);
+    b.z += (zt - b.z) * std::min(1.0f, dt * (arriving ? 2.6f : 0.8f));
+
+    if (arriving || !player_alive) return;   // no attacks while arriving / while you are down
 
     float iv = b.atk_iv * (b.phase == 3 ? 0.6f : b.phase == 2 ? 0.82f : 1.0f);
+    // every burst gets exactly ONE shot sound, panned to the boss
+    auto shot_sfx = [&]() {
+        if (!ctx_.sfx) return;
+        Proj p = proj(b.pa(), b.pe(), b.z);
+        ctx_.sfx->pan_next(clampf(p.sx / float(ctx_.W), 0.f, 1.f));
+        ctx_.sfx->enemy_shot();
+    };
 
     if (b.telegraph > 0) {
         b.telegraph -= adt;
-        if (b.telegraph <= 0) { b.cur = b.pending; b.sub_t = 0; b.atk_t = 0;
+        if (b.telegraph <= 0) { b.cur = b.pending; b.sub_t = 99; b.atk_t = 0;
             if (ctx_.sfx) ctx_.sfx->dive_warble(); }
     } else if (b.cur >= 0) {
         // run sustained attack
@@ -1375,19 +1544,21 @@ void VoidGunnerGame::update_boss(float dt) {
         // 0 RADIAL burst, 1 AIMED stream at your view, 2 SPREAD fan
         if (b.cur == 0) {  // RADIAL: spray outward from the boss in a fan
             for (int i = 0; i < 9; ++i)
-                eshots_.push_back(make_eshot(b.a, b.e, b.a + (i - 4) * 0.26f,
-                                             b.e + rnd_uniform(-0.25f, 0.25f), b.z, 0.5f, b.color));
+                eshots_.push_back(make_eshot(b.pa(), b.pe(), b.pa() + (i - 4) * 0.26f,
+                                             b.pe() + rnd_uniform(-0.25f, 0.25f), b.z, 0.5f, b.color));
+            shot_sfx();
             b.cur = -1;
         } else if (b.cur == 1) {  // AIMED: stream at your view, from the boss
             if (b.sub_t >= 0.18f) { b.sub_t = 0;
-                eshots_.push_back(make_eshot(b.a, b.e, view_a_, view_e_, b.z, 0.7f, b.color)); }
+                eshots_.push_back(make_eshot(b.pa(), b.pe(), view_a_, view_e_, b.z, 0.7f, b.color));
+                shot_sfx(); }
             if (b.atk_t >= 1.4f) b.cur = -1;
         } else if (b.cur == 2) {  // SPREAD: a fan biased toward you, from the boss
             for (int i = -3; i <= 3; ++i)
-                eshots_.push_back(make_eshot(b.a, b.e, b.a + i * 0.14f, b.e + 0.1f, b.z, 0.55f, b.color));
+                eshots_.push_back(make_eshot(b.pa(), b.pe(), b.pa() + i * 0.14f, b.pe() + 0.1f, b.z, 0.55f, b.color));
+            shot_sfx();
             b.cur = -1;
         } else b.cur = -1;
-        if (b.cur >= 0 && ctx_.sfx) ctx_.sfx->enemy_shot();
     } else {
         b.atk_t += adt;
         if (b.atk_t >= iv) {
@@ -1414,7 +1585,7 @@ void VoidGunnerGame::bot_decide(float& pan_a, float& pan_e, bool& want_fire) {
         }
     }
     if (!have && boss_ && boss_->damageable()) {
-        ta = boss_->a + boss_->wp_a; te = boss_->e + boss_->wp_e; have = true; best = boss_->z;
+        ta = boss_->wa(); te = boss_->we(); have = true; best = boss_->z;
     }
     if (!have) {
         // nearest enemy (lowest z), bias toward shooters slightly via z weighting
@@ -1445,8 +1616,8 @@ void VoidGunnerGame::bot_decide(float& pan_a, float& pan_e, bool& want_fire) {
         bool on_target = dx * dx + dy * dy <= (CROSS_R * 1.05f) * (CROSS_R * 1.05f);
         // Pace fire to laser energy: don't fire when low so a paced refill kicks
         // in; resume freely once it's recovered. Keep a small reserve for the boss.
-        float need = (boss_ ? LASER_MIN_FIRE + LASER_COST : LASER_MIN_FIRE);
-        if (on_target && laser_ >= need) want_fire = true;
+        float need = LASER_MIN_FIRE + LASER_COST;
+        if (on_target && !overheated_ && laser_ >= need) want_fire = true;
     } else {
         pan_a = pan_e = 0;
     }
@@ -1455,7 +1626,7 @@ void VoidGunnerGame::bot_decide(float& pan_a, float& pan_e, bool& want_fire) {
     // away (override aim).
     for (auto& s : eshots_) {
         if (!s.alive) continue;
-        if (s.z > 0.32f) continue;
+        if (s.prog() < 0.4f) continue;
         float da = s.ta - view_a_, de = s.te - view_e_;
         if (std::fabs(da) < 0.22f && std::fabs(de) < 0.22f) {
             pan_a = 1.0f; pan_e = (de > 0 ? -1.0f : 1.0f);  // swing aside
@@ -1489,12 +1660,23 @@ void VoidGunnerGame::draw_crosshair(Surface& s) {
     int cx = ctx_.W / 2, cy = ctx_.H / 2;
     bool locked = lock_glow_ > 0;
     // Overheated (out of laser energy) → crosshair reds & dims to read "can't fire".
-    bool overheat = overheat_t_ > 0 || laser_ < LASER_MIN_FIRE;
+    bool overheat = overheat_t_ > 0 || overheated_;
     Color base = overheat ? Color(255, 80, 70) : locked ? YELLOW : CYAN;
-    if (overheat && laser_ >= LASER_MIN_FIRE) base = lerp_color(CYAN, Color(255, 80, 70), 0.7f);
+    if (overheat && !overheated_) base = lerp_color(CYAN, Color(255, 80, 70), 0.7f);
     if (overheat) { base.r = base.r * 7 / 10; base.g = base.g * 7 / 10; base.b = base.b * 7 / 10; }
     locked = locked && !overheat;
     float glow = 0.4f + 0.4f * std::sin(game_t_ * 6) + (locked ? 0.3f * lock_glow_ : 0);
+    // incoming-fire warning: a shot is on course to land here — pan away
+    if (threat_ && state_ == St::Play) {
+        float pp = 0.5f + 0.5f * std::sin(game_t_ * 26);
+        int r = int(CROSS_R) + 16;
+        Color wc(255, 70, 70, int(90 + 140 * pp));
+        for (int q = 0; q < 4; ++q) {   // four corner brackets
+            int sx = (q & 1) ? 1 : -1, sy = (q & 2) ? 1 : -1;
+            draw::line(s, wc, cx + sx * r, cy + sy * r, cx + sx * (r - 14), cy + sy * r, 3);
+            draw::line(s, wc, cx + sx * r, cy + sy * r, cx + sx * r, cy + sy * (r - 14), 3);
+        }
+    }
     // outer ring
     draw::circle(s, Color(base.r, base.g, base.b, int(160)), cx, cy, int(CROSS_R), 2);
     if (locked) {
@@ -1502,15 +1684,127 @@ void VoidGunnerGame::draw_crosshair(Surface& s) {
         draw::circle(s, Color(255, 220, 60, int(60 * lock_glow_)), cx, cy, int(CROSS_R) + 9, 1);
     }
     // ticks
-    int g = 10, len = 16;
+    int g = 10;
     draw::line(s, base, cx - int(CROSS_R) - 2, cy, cx - g, cy, 2);
     draw::line(s, base, cx + g, cy, cx + int(CROSS_R) + 2, cy, 2);
     draw::line(s, base, cx, cy - int(CROSS_R) - 2, cx, cy - g, 2);
     draw::line(s, base, cx, cy + g, cx, cy + int(CROSS_R) + 2, 2);
-    (void)len;
     // centre dot
     draw::circle(s, base, cx, cy, 3);
     draw::circle(s, Color(base.r, base.g, base.b, int(70 * (glow + 0.3f))), cx, cy, 6, 1);
+}
+
+void VoidGunnerGame::draw_eshot(Surface& s, const EShot& sh) {
+    Proj p = shot_proj(sh);
+    if (!p.on_screen) return;
+    int r = std::max(3, int(7.0f / std::max(sh.z, 0.07f)));
+    r = std::min(r, 30);
+    // Blocky bolt (retro): a glow plate, a solid core, a hot pixel centre.
+    int gx = int(p.sx), gy = int(p.sy);
+    draw::rect(s, Color(sh.color.r, sh.color.g, sh.color.b, 80), {gx - r - 3, gy - r - 3, 2 * r + 6, 2 * r + 6});
+    draw::rect(s, sh.color, {gx - r, gy - r, 2 * r, 2 * r});
+    int ir = std::max(1, r / 2);
+    draw::rect(s, WHITE, {gx - ir, gy - ir, 2 * ir, 2 * ir});
+}
+
+void VoidGunnerGame::draw_enemy(Surface& s, const Enemy& e) {
+    Proj p = proj(e.a, e.e, e.z);
+    if (!p.on_screen) return;
+    int sz = enemy_px(e.z);
+    Color c = e.hit_flash > 0 ? lerp_color(e.color(), WHITE, 0.75f) : e.color();
+    int cx = int(p.sx), cy = int(p.sy);
+    // Very far/tiny: a cheap lit blob (don't draw a grid of micro-rects).
+    if (sz < 16) {
+        draw::circle(s, Color(c.r, c.g, c.b, 110), cx, cy, sz / 2 + 2);
+        draw::circle(s, c, cx, cy, std::max(2, sz / 2));
+        draw::circle(s, lerp_color(c, WHITE, 0.5f), cx, cy, std::max(1, sz / 5));
+        return;
+    }
+    int bx = cx - sz / 2, by = cy - sz / 2;
+    draw_pixel_sprite(s, enemy_sprite(e.type, e.frame), bx, by, sz, sz, c);
+    // glowing eyes — sit in the head band, scale with size, pulse a little
+    if (sz > 22) {
+        int er = std::max(2, sz / 14);
+        int eo = sz / 5;
+        int ey = cy - sz / 6;
+        Color eye = e.type == EType::Tank ? RED
+                  : e.type == EType::Shooter ? YELLOW
+                  : e.type == EType::Weaver ? Color(230, 180, 255)
+                  : Color(255, 240, 180);
+        draw::circle(s, eye, cx - eo, ey, er);
+        draw::circle(s, eye, cx + eo, ey, er);
+        draw::circle(s, WHITE, cx - eo, ey, std::max(1, er / 2));
+        draw::circle(s, WHITE, cx + eo, ey, std::max(1, er / 2));
+    }
+    // hp pips for the armoured beetle
+    if (e.type == EType::Tank && e.max_hp > 1 && sz > 26) {
+        for (int i = 0; i < e.max_hp; ++i)
+            draw::rect(s, i < e.hp ? RED : Color(50, 50, 50), {cx - 12 + i * 9, by - 8, 6, 3});
+    }
+}
+
+// Energy canister: pale mint with a green halo and an "E" — reads as a pickup,
+// never as the (gold) armoured beetle.
+void VoidGunnerGame::draw_tank(Surface& s, const Tank& t) {
+    Proj p = proj(t.a, t.e, t.z);
+    if (!p.on_screen) return;
+    int sz = tank_px(t.z);
+    float pulse = 0.6f + 0.4f * std::sin(t.phase * 5 + game_t_ * 4);
+    int cx = int(p.sx), cy = int(p.sy);
+    int frame = (int(game_t_ * 5 + t.phase) & 1);
+    // pulsing containment glow behind the canister
+    draw::circle(s, Color(CAN_GLOW.r, CAN_GLOW.g, CAN_GLOW.b, int(110 * pulse)), cx, cy, sz / 2 + 6);
+    if (sz < 16) {
+        draw::circle(s, CAN, cx, cy, std::max(2, sz / 2));
+        draw::circle(s, WHITE, cx, cy, std::max(1, sz / 4));
+        return;
+    }
+    int bx = cx - sz / 2, by = cy - sz / 2;
+    // brighten as it pulses so the core glows in the shader
+    Color body = lerp_color(CAN, WHITE, 0.3f * pulse);
+    draw_pixel_sprite(s, SPR_CANISTER[frame], bx, by, sz, sz, body);
+    // hot energy core in the middle
+    draw::circle(s, Color(235, 255, 245, int(200 * pulse)), cx, cy, std::max(2, sz / 6));
+    if (sz > 22) draw_text_centered(s, *ctx_.fonts.small, "E", cx, cy - 8, Color(10, 70, 40));
+}
+
+void VoidGunnerGame::draw_boss(Surface& s) {
+    Boss& b = *boss_;
+    int W = ctx_.W, H = ctx_.H;
+    float sc = b.dying ? std::max(0.0f, 1.0f - b.die_t / 1.6f) : 1.0f;
+    Proj p = project(b.pa(), b.pe(), b.z, view_a_, view_e_, W, H);
+    // Compact agile boss: modest on-screen size (was 9.0x → now 3.4x).
+    int bw = int(BASE / std::max(b.z, 0.07f) * 3.4f * sc);
+    int bh = int(bw * 0.82f);
+    bw = std::min(bw, 280); bh = std::min(bh, 240);
+    if (bw <= 6 || bh <= 6) return;
+    int bx = int(p.sx) - bw / 2, by = int(p.sy) - bh / 2;
+    Color body = b.hit_flash > 0 ? lerp_color(b.color, WHITE, 0.6f) : b.color;
+    draw::rect(s, Color(body.r, body.g, body.b, 50), {bx - 8, by - 8, bw + 16, bh + 16});
+    // compact raider sprite — distinct, fast-animating menace
+    int frame = int(b.sway_t * 12) % 2;
+    draw_pixel_sprite(s, SPR_RAIDER[frame], bx, by, bw, bh, body);
+    if (b.invuln > 0) {
+        float pp = 0.5f + 0.5f * std::sin(b.sway_t * 18);
+        draw::rect(s, Color(120, 200, 255, int(120 * pp)), {bx - 6, by - 6, bw + 12, bh + 12}, 3);
+    }
+    if (b.telegraph > 0) {
+        float pp = 0.4f + 0.6f * std::sin(b.sway_t * 30);
+        draw::rect(s, Color(255, 60, 60, int(150 * pp)), {bx - 5, by - 5, bw + 10, bh + 10}, 3);
+    }
+    // ── weak-spot: a small blocky "eye" socket inside the hull. Subtle —
+    // a pulsing pixel pupil the bloom makes glow, not a big reticle. ──
+    if (!b.dying) {
+        Proj wp = project(b.wa(), b.we(), b.z, view_a_, view_e_, W, H);
+        float pulse = 0.45f + 0.55f * std::sin(game_t_ * 6);
+        int wr = std::max(3, bw / 15);
+        int wx = int(wp.sx), wy = int(wp.sy);
+        Color eye = lerp_color(RED, YELLOW, pulse);
+        draw::rect(s, Color(10, 0, 0), {wx - wr - 1, wy - wr - 1, 2 * wr + 2, 2 * wr + 2});  // dark socket
+        draw::rect(s, Color(eye.r, eye.g, eye.b, int(120 * pulse)), {wx - wr - 2, wy - wr - 2, 2 * wr + 4, 2 * wr + 4});  // glow
+        draw::rect(s, eye, {wx - wr, wy - wr, 2 * wr, 2 * wr});                                // pupil
+        draw::rect(s, WHITE, {wx - wr / 2, wy - wr / 2, std::max(1, wr), std::max(1, wr)});    // hot core
+    }
 }
 
 void VoidGunnerGame::draw(Surface& s) {
@@ -1521,134 +1815,27 @@ void VoidGunnerGame::draw(Surface& s) {
 
     int W = ctx_.W, H = ctx_.H;
 
-    // ── enemy shots (draw far-to-near) ──
+    // ── the whole scene in ONE far-to-near list, so an incoming bolt is drawn
+    //    over the enemy/boss that fired it instead of hiding behind it ──
     {
-        std::vector<EShot*> order;
-        for (auto& sh : eshots_) if (sh.alive) order.push_back(&sh);
-        std::sort(order.begin(), order.end(), [](EShot* x, EShot* y) { return x->z > y->z; });
-        for (auto* sh : order) {
-            Proj p = project(sh->ca(), sh->ce(), sh->z, view_a_, view_e_, W, H);
-            if (!p.on_screen) continue;
-            int r = std::max(3, int(7.0f / std::max(sh->z, 0.07f)));
-            r = std::min(r, 30);
-            // Blocky bolt (retro): a glow plate, a solid core, a hot pixel centre.
-            int gx = int(p.sx), gy = int(p.sy);
-            draw::rect(s, Color(sh->color.r, sh->color.g, sh->color.b, 80), {gx - r - 3, gy - r - 3, 2 * r + 6, 2 * r + 6});
-            draw::rect(s, sh->color, {gx - r, gy - r, 2 * r, 2 * r});
-            int ir = std::max(1, r / 2);
-            draw::rect(s, WHITE, {gx - ir, gy - ir, 2 * ir, 2 * ir});
-        }
-    }
-
-    // ── enemies (far-to-near so near ones overdraw) ──
-    {
-        std::vector<Enemy*> order;
-        for (auto& e : enemies_) if (e.alive) order.push_back(&e);
-        std::sort(order.begin(), order.end(), [](Enemy* x, Enemy* y) { return x->z > y->z; });
-        for (auto* e : order) {
-            Proj p = project(e->a, e->e, e->z, view_a_, view_e_, W, H);
-            if (!p.on_screen) continue;
-            int sz = std::max(6, int(BASE / std::max(e->z, 0.07f)));
-            sz = std::min(sz, 300);
-            Color c = e->hit_flash > 0 ? lerp_color(e->color(), WHITE, 0.75f) : e->color();
-            int cx = int(p.sx), cy = int(p.sy);
-            // Very far/tiny: a cheap lit blob (don't draw a grid of micro-rects).
-            if (sz < 16) {
-                draw::circle(s, Color(c.r, c.g, c.b, 110), cx, cy, sz / 2 + 2);
-                draw::circle(s, c, cx, cy, std::max(2, sz / 2));
-                draw::circle(s, lerp_color(c, WHITE, 0.5f), cx, cy, std::max(1, sz / 5));
-                continue;
-            }
-            int bx = cx - sz / 2, by = cy - sz / 2;
-            draw_pixel_sprite(s, enemy_sprite(e->type, e->frame), bx, by, sz, sz, c);
-            // glowing eyes — sit in the head band, scale with size, pulse a little
-            if (sz > 22) {
-                int er = std::max(2, sz / 14);
-                int eo = sz / 5;
-                int ey = cy - sz / 6;
-                Color eye = e->type == EType::Tank ? RED
-                          : e->type == EType::Shooter ? YELLOW
-                          : e->type == EType::Weaver ? Color(230, 180, 255)
-                          : Color(255, 240, 180);
-                draw::circle(s, eye, cx - eo, ey, er);
-                draw::circle(s, eye, cx + eo, ey, er);
-                draw::circle(s, WHITE, cx - eo, ey, std::max(1, er / 2));
-                draw::circle(s, WHITE, cx + eo, ey, std::max(1, er / 2));
-            }
-            // hp pips for the armoured beetle
-            if (e->type == EType::Tank && e->max_hp > 1 && sz > 26) {
-                for (int i = 0; i < e->max_hp; ++i)
-                    draw::rect(s, i < e->hp ? RED : Color(50, 50, 50), {cx - 12 + i * 9, by - 8, 6, 3});
-            }
-        }
-    }
-
-    // ── energy tanks (gold, pulsing) ──
-    {
-        std::vector<Tank*> order;
-        for (auto& t : tanks_) if (t.alive) order.push_back(&t);
-        std::sort(order.begin(), order.end(), [](Tank* x, Tank* y) { return x->z > y->z; });
-        for (auto* t : order) {
-            Proj p = project(t->a, t->e, t->z, view_a_, view_e_, W, H);
-            if (!p.on_screen) continue;
-            int sz = std::max(10, int(BASE / std::max(t->z, 0.07f)));
-            sz = std::min(sz, 200);
-            float pulse = 0.6f + 0.4f * std::sin(t->phase * 5 + game_t_ * 4);
-            int cx = int(p.sx), cy = int(p.sy);
-            int frame = (int(game_t_ * 5 + t->phase) & 1);
-            // pulsing containment glow behind the canister
-            draw::circle(s, Color(255, 200, 70, int(110 * pulse)), cx, cy, sz / 2 + 6);
-            if (sz < 16) {
-                draw::circle(s, GOLD, cx, cy, std::max(2, sz / 2));
-                draw::circle(s, Color(255, 245, 200), cx, cy, std::max(1, sz / 4));
-                continue;
-            }
-            int bx = cx - sz / 2, by = cy - sz / 2;
-            // brighten the gold as it pulses so the core glows in the shader
-            Color body = lerp_color(GOLD, Color(255, 245, 200), 0.25f * pulse);
-            draw_pixel_sprite(s, SPR_CANISTER[frame], bx, by, sz, sz, body);
-            // hot energy core in the middle
-            draw::circle(s, Color(255, 245, 200, int(200 * pulse)), cx, cy, std::max(2, sz / 6));
-            if (sz > 22) draw_text_centered(s, *ctx_.fonts.small, "E", cx, cy - 6, Color(60, 40, 0));
-        }
-    }
-
-    // ── boss ──
-    if (boss_) {
-        Boss& b = *boss_;
-        float sc = b.dying ? std::max(0.0f, 1.0f - b.die_t / 1.6f) : 1.0f;
-        Proj p = project(b.a, b.e, b.z, view_a_, view_e_, W, H);
-        // Compact agile boss: modest on-screen size (was 9.0x → now 3.4x).
-        int bw = int(BASE / std::max(b.z, 0.07f) * 3.4f * sc);
-        int bh = int(bw * 0.82f);
-        bw = std::min(bw, 280); bh = std::min(bh, 240);
-        if (bw > 6 && bh > 6) {
-            int bx = int(p.sx) - bw / 2, by = int(p.sy) - bh / 2;
-            Color body = b.hit_flash > 0 ? lerp_color(b.color, WHITE, 0.6f) : b.color;
-            draw::rect(s, Color(body.r, body.g, body.b, 50), {bx - 8, by - 8, bw + 16, bh + 16});
-            // compact raider sprite — distinct, fast-animating menace
-            int frame = int(b.sway_t * 12) % 2;
-            draw_pixel_sprite(s, SPR_RAIDER[frame], bx, by, bw, bh, body);
-            if (b.invuln > 0) {
-                float pp = 0.5f + 0.5f * std::sin(b.sway_t * 18);
-                draw::rect(s, Color(120, 200, 255, int(120 * pp)), {bx - 6, by - 6, bw + 12, bh + 12}, 3);
-            }
-            if (b.telegraph > 0) {
-                float pp = 0.4f + 0.6f * std::sin(b.sway_t * 30);
-                draw::rect(s, Color(255, 60, 60, int(150 * pp)), {bx - 5, by - 5, bw + 10, bh + 10}, 3);
-            }
-            // ── weak-spot: a small blocky "eye" socket inside the hull. Subtle —
-            // a pulsing pixel pupil the bloom makes glow, not a big reticle. ──
-            if (!b.dying) {
-                Proj wp = project(b.a + b.wp_a, b.e + b.wp_e, b.z, view_a_, view_e_, W, H);
-                float pulse = 0.45f + 0.55f * std::sin(game_t_ * 6);
-                int wr = std::max(3, bw / 15);
-                int wx = int(wp.sx), wy = int(wp.sy);
-                Color eye = lerp_color(RED, YELLOW, pulse);
-                draw::rect(s, Color(10, 0, 0), {wx - wr - 1, wy - wr - 1, 2 * wr + 2, 2 * wr + 2});  // dark socket
-                draw::rect(s, Color(eye.r, eye.g, eye.b, int(120 * pulse)), {wx - wr - 2, wy - wr - 2, 2 * wr + 4, 2 * wr + 4});  // glow
-                draw::rect(s, eye, {wx - wr, wy - wr, 2 * wr, 2 * wr});                                // pupil
-                draw::rect(s, WHITE, {wx - wr / 2, wy - wr / 2, std::max(1, wr), std::max(1, wr)});    // hot core
+        struct Item { float z; int kind; int idx; };
+        std::vector<Item> order;
+        order.reserve(eshots_.size() + enemies_.size() + tanks_.size() + 1);
+        for (int i = 0; i < (int)eshots_.size(); ++i)
+            if (eshots_[i].alive) order.push_back({eshots_[i].z, 0, i});
+        for (int i = 0; i < (int)enemies_.size(); ++i)
+            if (enemies_[i].alive) order.push_back({enemies_[i].z, 1, i});
+        for (int i = 0; i < (int)tanks_.size(); ++i)
+            if (tanks_[i].alive) order.push_back({tanks_[i].z, 2, i});
+        if (boss_) order.push_back({boss_->z + 0.001f, 3, 0});   // ties: its own shots go on top
+        std::stable_sort(order.begin(), order.end(),
+                         [](const Item& x, const Item& y) { return x.z > y.z; });
+        for (auto& it : order) {
+            switch (it.kind) {
+                case 0: draw_eshot(s, eshots_[it.idx]); break;
+                case 1: draw_enemy(s, enemies_[it.idx]); break;
+                case 2: draw_tank(s, tanks_[it.idx]); break;
+                default: draw_boss(s); break;
             }
         }
     }
@@ -1677,7 +1864,7 @@ void VoidGunnerGame::draw(Surface& s) {
         draw::circle(s, Color(255, 235, 170), int(m.sx), int(m.sy), 3);
     }
 
-    draw_crosshair(s);
+    if (state_ != St::Dead && state_ != St::GameOver) draw_crosshair(s);
     draw_radar(s);
     draw_hud(s);
 
@@ -1685,33 +1872,51 @@ void VoidGunnerGame::draw(Surface& s) {
     if (hit_flash_ > 0)
         draw::rect(s, Color(255, 40, 40, int(110 * std::min(1.0f, hit_flash_))), {0, 0, W, H});
 
-    // intro banner
+    // intro banner (first wave only — later waves are announced on the fly)
     if (state_ == St::Intro) {
         float a = std::min(1.0f, intro_t_ * 1.5f);
         if (boss_wave_)
-            draw_text_centered(s, *ctx_.fonts.big, "WARNING", W / 2, H / 2 - 30,
+            draw_text_centered(s, *ctx_.fonts.big, "WARNING", W / 2, 190,
                                Color(255, int(80 * a), int(80 * a)));
         else
-            draw_text_centered(s, *ctx_.fonts.big, "WAVE " + std::to_string(wave_), W / 2, H / 2 - 30,
+            draw_text_centered(s, *ctx_.fonts.big, "WAVE " + std::to_string(wave_), W / 2, 190,
                                Color(int(90 + 165 * a), 220, 255));
         draw_text_centered(s, *ctx_.fonts.small,
                            boss_wave_ ? "A VOID BOSS APPROACHES" : "ENEMIES INCOMING",
-                           W / 2, H / 2 + 26, boss_wave_ ? RED : DIM);
-        draw_text_centered(s, *ctx_.fonts.small, "ARROWS AIM   SPACE FIRE", W / 2, H / 2 + 56, DIM);
+                           W / 2, 246, boss_wave_ ? RED : ui::LABEL);
+        if (!ctx_.demo) {
+            std::string l1 = pad_
+                ? std::string("STICK AIM    A FIRE    Y MISSILE")
+                : std::string("ARROWS AIM    SPACE FIRE    B MISSILE");
+            draw_text_centered(s, *ctx_.fonts.small, l1, W / 2, 440, ui::HINT);
+            draw_text_centered(s, *ctx_.fonts.small, "SHOOT THE PALE CANISTERS TO RECHARGE",
+                               W / 2, 462, ui::HINT);
+        }
     }
 
     draw_flash(s);
+    if (state_ == St::Dead && lives_ > 0)
+        draw_text_centered(s, *ctx_.fonts.med, "SHIELDS DOWN", W / 2, H / 2 - 14, RED);
 
     if (state_ == St::GameOver) {
-        draw::rect(s, Color(0, 0, 0, 150), {0, 0, W, H});
-        draw_text_centered(s, *ctx_.fonts.big, "GAME  OVER", W / 2, H / 2 - 50, RED);
-        draw_text_centered(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), W / 2, H / 2 + 10, WHITE);
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS SPACE TO RETRY", W / 2, H / 2 + 60, DIM);
-        if (initials_.active()) initials_.draw(s);
+        if (initials_.active()) {
+            // initials entry owns the screen: just the dim plate behind it, so the
+            // game-over text doesn't show through the entry box
+            draw::rect(s, Color(0, 0, 0, 165), {0, 0, W, H});
+            initials_.draw(s);
+        } else {
+            ui::game_over(s, ctx_.fonts, W, H, go_t_, score_, new_hi_, pad_,
+                          "WAVE " + std::to_string(wave_));
+        }
+    } else {
+        draw_notes(s);
     }
     pause_.draw(s);
 }
 
+// HUD rows (top): 8 score/hi/wave · 36 combo text · 62 combo bar · 74 boss name ·
+// 94 boss HP bar · 112 boss hint · 146/176 announcements. The reticle (y 314–406)
+// is never written over.
 void VoidGunnerGame::draw_hud(Surface& s) {
     int W = ctx_.W, H = ctx_.H;
     draw_text(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
@@ -1724,8 +1929,8 @@ void VoidGunnerGame::draw_hud(Surface& s) {
         Color cc = m >= 6 ? RED : m >= 4 ? ORANGE : YELLOW;
         draw_text_centered(s, *ctx_.fonts.med, "x" + std::to_string(m) + " COMBO", W / 2, 36, cc);
         int bw = 120, bx = W / 2 - bw / 2;
-        draw::rect(s, Color(40, 40, 40), {bx, 60, bw, 4});
-        draw::rect(s, cc, {bx, 60, int(bw * ctx_.combo->ratio()), 4});
+        draw::rect(s, Color(40, 40, 40), {bx, 62, bw, 4});
+        draw::rect(s, cc, {bx, 62, int(bw * ctx_.combo->ratio()), 4});
     }
 
     // ── energy bar (bottom centre) ──
@@ -1736,13 +1941,13 @@ void VoidGunnerGame::draw_hud(Surface& s) {
         float fl = 0.5f + 0.5f * std::sin(game_t_ * 12);
         ec = lerp_color(ec, WHITE, 0.3f * fl);
     }
-    draw_text(s, *ctx_.fonts.small, "ENERGY", ex, ey - 16, DIM);
+    draw_text(s, *ctx_.fonts.small, "ENERGY", ex, ey - 18, ui::LABEL);
     draw::rect(s, Color(20, 25, 35), {ex, ey, ew, 14}, 0, 5);
     draw::rect(s, ec, {ex, ey, int(ew * std::max(0.0f, r)), 14}, 0, 5);
     draw::rect(s, Color(ec.r, ec.g, ec.b, 120), {ex, ey, ew, 14}, 1, 5);
 
     // ── laser energy bar (above ENERGY, cyan, clearly distinct) ──
-    bool overheat = laser_ < LASER_MIN_FIRE;
+    bool overheat = overheated_;
     int lw = ew, lx = W / 2 - lw / 2, ly = ey - 38;  // same width as the ENERGY bar
     float lr = laser_ / LASER_MAX;
     Color lc = overheat ? RED : laser_ < 0.3f ? ORANGE : CYAN;
@@ -1750,44 +1955,54 @@ void VoidGunnerGame::draw_hud(Surface& s) {
         float fl = 0.5f + 0.5f * std::sin(game_t_ * 16);
         lc = lerp_color(RED, WHITE, 0.4f * fl);
     }
-    std::string llabel = overheat ? std::string("LASER  RECHARGE")
+    std::string llabel = overheat ? std::string("LASER  RECHARGING")
                                    : "LASER  Lv" + std::to_string(laser_lvl_);
-    draw_text(s, *ctx_.fonts.small, llabel, lx, ly - 16,
-              overheat ? lc : Color(60, 130, 160));
+    draw_text(s, *ctx_.fonts.small, llabel, lx, ly - 18, overheat ? lc : ui::LABEL);
     draw::rect(s, Color(14, 24, 32), {lx, ly, lw, 10}, 0, 4);
     draw::rect(s, lc, {lx, ly, int(lw * std::max(0.0f, lr)), 10}, 0, 4);
     draw::rect(s, Color(lc.r, lc.g, lc.b, 130), {lx, ly, lw, 10}, 1, 4);
-    // a min-fire tick so the player can read the overheat threshold
-    int tickx = lx + int(lw * (LASER_MIN_FIRE / LASER_MAX));
+    // a tick at the level an overheated laser comes back online
+    int tickx = lx + int(lw * (LASER_RESUME / LASER_MAX));
     draw::line(s, Color(160, 220, 255, 140), tickx, ly - 2, tickx, ly + 12, 1);
 
-    // ── missiles (bottom-left): count + little dart icons ──
-    draw_text(s, *ctx_.fonts.small, "MISSILES", 16, H - 46, missiles_ > 0 ? Color(255, 170, 80) : DIM);
-    for (int i = 0; i < missiles_; ++i) {
-        int mx = 22 + i * 15, my = H - 26;
-        draw::polygon(s, Color(255, 190, 90), {{mx, my + 8}, {mx - 4, my}, {mx + 4, my}});
+    // ── missiles: to the RIGHT of the scanner (never inside it), with the key ──
+    {
+        int mx0 = 152, my0 = H - 84;
+        draw_text(s, *ctx_.fonts.small, "MISSILES", mx0, my0,
+                  missiles_ > 0 ? Color(255, 170, 80) : ui::LABEL);
+        for (int i = 0; i < missiles_; ++i) {
+            int mx = mx0 + 5 + i * 13, my = my0 + 22;
+            draw::polygon(s, Color(255, 190, 90), {{mx, my + 8}, {mx - 4, my}, {mx + 4, my}});
+        }
+        draw_text(s, *ctx_.fonts.small, "[" + std::string(ui::nuke_key(pad_)) + "] LAUNCH",
+                  mx0, my0 + 36, ui::LABEL);
     }
 
     // ── lives ──
-    draw_text_right(s, *ctx_.fonts.small, "LIVES", W - 90, H - 30, DIM);
+    draw_text_right(s, *ctx_.fonts.small, "LIVES", W - 124, H - 30, ui::LABEL);
     for (int i = 0; i < lives_; ++i)
-        draw::polygon(s, CYAN, {{W - 80 + i * 22, H - 14}, {W - 80 + i * 22 + 7, H - 24}, {W - 80 + i * 22 + 14, H - 14}});
+        draw::polygon(s, CYAN, {{W - 114 + i * 22, H - 14}, {W - 114 + i * 22 + 7, H - 24}, {W - 114 + i * 22 + 14, H - 14}});
+    if (state_ != St::GameOver)
+        draw_text_right(s, *ctx_.fonts.small, std::string(ui::pause_key(pad_)) + "  PAUSE",
+                        W - 16, H - 54, ui::LABEL);
 
-    // ── boss HP ──
+    // ── boss HP (its own rows, below the combo meter) ──
     if (boss_ && !boss_->dying) {
-        int bw = 420, bx = W / 2 - bw / 2, by = 60;
-        draw_text_centered(s, *ctx_.fonts.small, boss_->name, W / 2, by - 16, boss_->color);
+        int bw = 420, bx = W / 2 - bw / 2, by = 94;
+        draw_text_centered(s, *ctx_.fonts.small, boss_->name, W / 2, by - 20, boss_->color);
         draw::rect(s, Color(20, 20, 30), {bx, by, bw, 12}, 0, 4);
         int fillw = int(bw * boss_->hp_ratio());
         Color hc = boss_->hp_ratio() > 0.5f ? GREEN : boss_->hp_ratio() > 0.25f ? YELLOW : RED;
         draw::rect(s, hc, {bx, by, fillw, 12}, 0, 4);
         draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
-        draw_text_centered(s, *ctx_.fonts.small, "AIM AT THE GLOWING WEAK POINT", W / 2, by + 16, DIM);
+        draw_text_centered(s, *ctx_.fonts.small,
+                           boss_->invuln > 0 ? "SHIELDED — WAIT FOR IT" : "AIM AT THE GLOWING WEAK POINT",
+                           W / 2, by + 16, ui::LABEL);
     }
 
     // invincibility hint
     if (invinc_ > 0 && state_ == St::Play && int(invinc_ * 6) % 2 == 0)
-        draw_text_centered(s, *ctx_.fonts.small, "SHIELDS REGENERATING", W / 2, H - 56, CYAN);
+        draw_text_centered(s, *ctx_.fonts.small, "SHIELDS REGENERATING", W / 2, H - 112, CYAN);
 }
 
 // ── Scanner (situational awareness) ──────────────────────────────────────────
@@ -1796,9 +2011,10 @@ void VoidGunnerGame::draw_hud(Surface& s) {
 // — azimuth (a−view_a) → X (right +), elevation (e−view_e) → Y (down +), matching
 // the main view's projection — clamped to the frame so off-axis contacts sit on
 // the edge that points toward them. Closer contacts draw as bigger blips.
+// Enemies are round blips in their own colour; energy canisters are a pale "+".
 void VoidGunnerGame::draw_radar(Surface& s) {
     int R = 60;                         // half-size of the square scope
-    int cx = 20 + R, cy = ctx_.H - 20 - R;
+    int cx = 20 + R, cy = ctx_.H - 30 - R;
     int x0 = cx - R, y0 = cy - R, sz2 = R * 2;
     // square scope backing + frame (glow through the CRT)
     draw::rect(s, Color(6, 16, 22, 200), {x0, y0, sz2, sz2}, 0, 4);
@@ -1813,11 +2029,13 @@ void VoidGunnerGame::draw_radar(Surface& s) {
     // Azimuth/elevation that maps to the frame edge. Beyond this, contacts clamp
     // to the edge pointing toward them.
     const float FOV = 1.4f;
-    auto plot = [&](float ra, float re, float z, Color c, int sz, bool pulse) {
+    auto spot = [&](float ra, float re) {
         float nx = clampf(ra / FOV, -1.0f, 1.0f);
         float ny = clampf(re / FOV, -1.0f, 1.0f);
-        int bx = cx + int(nx * (R - 5));
-        int by = cy + int(ny * (R - 5));
+        return std::make_pair(cx + int(nx * (R - 6)), cy + int(ny * (R - 6)));
+    };
+    auto plot = [&](float ra, float re, float z, Color c, int sz, bool pulse) {
+        auto [bx, by] = spot(ra, re);
         float prox = clampf(1.0f - z, 0.0f, 1.0f);   // 0=far, 1=on top of you
         int ps = sz + int(prox * 2);
         if (pulse) {
@@ -1832,12 +2050,16 @@ void VoidGunnerGame::draw_radar(Surface& s) {
         if (!e.alive) continue;
         plot(e.a - view_a_, e.e - view_e_, e.z, e.color(), 2, false);
     }
-    for (auto& t : tanks_)
-        if (t.alive) plot(t.a - view_a_, t.e - view_e_, t.z, GOLD, 2, false);
+    for (auto& t : tanks_) {
+        if (!t.alive) continue;
+        auto [bx, by] = spot(t.a - view_a_, t.e - view_e_);
+        draw::line(s, CAN, bx - 4, by, bx + 4, by, 2);
+        draw::line(s, CAN, bx, by - 4, bx, by + 4, 2);
+    }
     if (boss_ && !boss_->dying)
-        plot(boss_->a - view_a_, boss_->e - view_e_, boss_->z, boss_->color, 4, true);
+        plot(boss_->pa() - view_a_, boss_->pe() - view_e_, boss_->z, boss_->color, 4, true);
 
-    draw_text_centered(s, *ctx_.fonts.small, "SCANNER", cx, cy + R + 4, Color(70, 150, 180));
+    draw_text_centered(s, *ctx_.fonts.small, "SCANNER", cx, cy + R + 3, ui::LABEL);
 }
 
 void VoidGunnerGame::draw_flash(Surface& s) {
@@ -1847,6 +2069,21 @@ void VoidGunnerGame::draw_flash(Surface& s) {
         c.a = uint8_t(255 * a);
         Font& font = f.big ? *ctx_.fonts.med : *ctx_.fonts.small;
         draw_text_centered(s, font, f.text, int(f.x), int(f.y), c);
+    }
+}
+
+// The announcement at the head of the queue: title + one sub-line, faded in and
+// out, on rows of their own above the action.
+void VoidGunnerGame::draw_notes(Surface& s) {
+    if (notes_.empty()) return;
+    const Note& n = notes_.front();
+    float a = std::min({1.0f, note_t_ / 0.15f, (n.dur - note_t_) / 0.30f});
+    a = clampf(a, 0.0f, 1.0f);
+    Color c = n.color; c.a = uint8_t(255 * a);
+    draw_text_centered(s, *ctx_.fonts.med, n.title, ctx_.W / 2, 146, c);
+    if (!n.sub.empty()) {
+        Color sc = ui::HINT; sc.a = uint8_t(255 * a);
+        draw_text_centered(s, *ctx_.fonts.small, n.sub, ctx_.W / 2, 176, sc);
     }
 }
 }  // namespace

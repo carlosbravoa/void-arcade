@@ -26,11 +26,12 @@
 #include "engine/surface.h"
 #include "engine/telemetry.h"
 #include "engine/text.h"
+#include "engine/ui.h"
 
 namespace {
 const Color BLACK(0, 0, 0), WHITE(255, 255, 255), GREEN(80, 255, 80);
 const Color CYAN(80, 200, 255), RED(255, 60, 60), YELLOW(255, 220, 40);
-const Color DIM(40, 80, 40), ORANGE(255, 140, 40), STEEL(170, 185, 205);
+const Color ORANGE(255, 140, 40), STEEL(170, 185, 205), ELITE_GOLD(230, 200, 120);
 constexpr float PI = 3.14159265358979323846f;
 
 constexpr int SCALE = 3;
@@ -57,6 +58,7 @@ Color invader_color(char k) {
     if (k == 'A') return Color(200, 100, 255);
     if (k == 'B') return Color(100, 220, 255);
     if (k == 'D') return STEEL;                  // armored
+    if (k == 'E') return ELITE_GOLD;             // elite captain
     return Color(100, 255, 140);                 // C
 }
 
@@ -68,7 +70,6 @@ std::string zpad(int v, int width) {
     if ((int)s.size() < width) s = std::string(width - s.size(), '0') + s;
     return s;
 }
-Color darker(Color c, float f) { return Color(int(c.r * f), int(c.g * f), int(c.b * f)); }
 
 // ── Bullet (now supports angled travel + piercing + damage) ──────────────────
 struct Bullet {
@@ -138,10 +139,10 @@ struct PowerUp {
 
 // ── Player ───────────────────────────────────────────────────────────────────
 struct Player {
-    static constexpr float SPEED = 300, RESPAWN_T = 2.5f;
+    static constexpr float SPEED = 300;
     float x, y;
     bool alive = true;
-    float fire_cd = 0, respawn_t = 0, invincible = 0;
+    float fire_cd = 0, invincible = 0;
     int lives = 3;
     std::shared_ptr<Surface> surf;
     int glow_off = 10, w, h;
@@ -155,16 +156,14 @@ struct Player {
     Rect rect() const { return {int(x), int(y), w, h}; }
     std::pair<int, int> center() const { return {int(x + w / 2.0f), int(y + h / 2.0f)}; }
     void update(float dt, float move_dir, int screen_w) {
-        if (!alive) { respawn_t -= dt; return; }
+        if (!alive) return;
         if (invincible > 0) invincible -= dt;
         if (fire_cd > 0) fire_cd -= dt;
         x += move_dir * SPEED * dt;
         x = std::max(0.0f, std::min(float(screen_w - w), x));
     }
-    void kill() { alive = false; lives--; respawn_t = RESPAWN_T; }
-    void respawn(int nx) {
-        if (!alive && respawn_t <= 0) { alive = true; x = nx; invincible = 2.0f; }
-    }
+    void kill() { alive = false; lives--; }
+    void respawn(int nx) { alive = true; x = nx; invincible = 2.0f; fire_cd = 0; }
     void draw(Surface& s) const {
         if (!alive) return;
         if (invincible > 0 && int(invincible * 8) % 2 == 0) return;
@@ -173,7 +172,7 @@ struct Player {
 };
 
 // ── Invader ──────────────────────────────────────────────────────────────────
-struct InvaderFrames { std::shared_ptr<Surface> f[2]; };
+struct InvaderFrames { std::shared_ptr<Surface> f[2], flash[2]; };
 struct Invader {
     int col, row;
     float x, y;
@@ -188,16 +187,23 @@ struct Invader {
     std::pair<int, int> center() const { return {int(x + w / 2.0f), int(y + h / 2.0f)}; }
     Color color() const { return invader_color(kind); }
     int points() const {
-        int base = kind == 'A' ? 30 : kind == 'B' ? 20 : kind == 'D' ? 50 : 10;
+        int base = kind == 'A' ? 30 : kind == 'B' ? 20 : kind == 'D' ? 50 : kind == 'E' ? 80 : 10;
         return base;
     }
     void toggle_frame() { frame ^= 1; }
     void draw(Surface& s) const {
         if (!alive) return;
         s.blit(*frames->f[frame], int(x) - glow_off, int(y) - glow_off);
-        if (hit_flash > 0) {  // armoured grunts flash white + recoil when chipped
-            draw::rect(s, Color(255, 255, 255, int(200 * hit_flash)), rect());        // filled flash
-            draw::rect(s, Color(255, 255, 255, int(160 * hit_flash)), rect(), 2, 2);  // bright rim
+        if (hit_flash > 0) {  // shape-correct white flicker when chipped
+            Surface& fl = *frames->flash[frame];
+            fl.set_alpha(int(200 * std::min(1.0f, hit_flash)));
+            s.blit(fl, int(x) - glow_off, int(y) - glow_off);
+            fl.set_alpha(-1);
+        }
+        if (max_hp > 1 && hp < max_hp) {  // armour remaining, once it has been chipped
+            int bw = w - 4, fw = std::max(1, bw * hp / max_hp);
+            draw::rect(s, Color(30, 34, 40), {int(x) + 2, int(y) + h + 3, bw, 2});
+            draw::rect(s, hp * 2 <= max_hp ? ORANGE : WHITE, {int(x) + 2, int(y) + h + 3, fw, 2});
         }
     }
 };
@@ -218,47 +224,57 @@ struct InvaderGrid {
     std::vector<Invader> invaders;
     std::vector<Bullet> bullets;
     float anim_t = 0, shoot_t = 0, rest_t = 0;
+    float slide_left = 0;      // px still to slide down during the wave intro
     int burst_count = 0;
     bool anim_ticked = false;
-    InvaderFrames frame_cache[4];  // A, B, C, armored(D)
+    InvaderFrames frame_cache[5];  // A, B, C, armored(D), elite captain(E)
+    static constexpr float SLIDE = 320.0f;
 
-    InvaderGrid(int sw, int top_y, int wv, WaveKind wk = WaveKind::Normal)
+    // `tier` = the player's current weapon tier: an ELITE wave met with a bare
+    // gun gets slightly thinner armour so it isn't a multi-minute slog.
+    InvaderGrid(int sw, int top_y, int wv, WaveKind wk = WaveKind::Normal, int tier = 0)
         : screen_w(sw), wave(wv), kind(wk) {
         speed = std::min(180.0f, 50.0f + wv * 7.0f);
         shoot_factor = std::max(0.25f, 0.8f - wv * 0.04f);  // meaner trigger fingers
         // SWARM is faster & jumpier; ELITE is a touch slower but relentless.
         if (kind == WaveKind::Swarm)  { speed *= 1.25f; shoot_factor *= 0.85f; }
         if (kind == WaveKind::Elite)  { speed *= 0.90f; point_mult = 2.0f; }
-        const SL* maps[4] = {INVADER_A, INVADER_B, INVADER_C, ARMOR_SP};
-        char kinds[4] = {'A', 'B', 'C', 'D'};
-        for (int i = 0; i < 4; ++i) {
+        const SL* maps[5] = {INVADER_A, INVADER_B, INVADER_C, ARMOR_SP, ARMOR_SP};
+        char kinds[5] = {'A', 'B', 'C', 'D', 'E'};
+        for (int i = 0; i < 5; ++i) {
             Color c = invader_color(kinds[i]);
-            for (int f = 0; f < 2; ++f)
+            for (int f = 0; f < 2; ++f) {
                 frame_cache[i].f[f] = glow_surface(make_sprite_surface(maps[i][f], c, SCALE), c, 8);
+                frame_cache[i].flash[f] =
+                    glow_surface(make_sprite_surface(maps[i][f], WHITE, SCALE), WHITE, 8);
+            }
         }
         int kind_map[ROWS] = {0, 1, 1, 2, 2};
         float armor_p = std::min(0.6f, std::max(0.0f, (wv - 2) * 0.07f));  // more armor later
         int armor_hp = 2 + wv / 6;                                         // and tankier
         // SWARM packs extra columns of fodder; ELITE drops to a smaller, all-armored block.
         int cols = COLS, rows = ROWS;
-        if (kind == WaveKind::Swarm) { cols = COLS; rows = ROWS; }  // density via spacing below
         int h_step = H_STEP, v_step = V_STEP, x0 = 60;
         if (kind == WaveKind::Swarm) { h_step = 44; v_step = 40; x0 = 36; cols = 13; }
         if (kind == WaveKind::Elite) { cols = 8; x0 = 110; }
+        slide_left = SLIDE;
         for (int row = 0; row < rows; ++row)
             for (int col = 0; col < cols; ++col) {
                 Invader inv;
                 inv.col = col; inv.row = row;
-                inv.x = x0 + col * h_step; inv.y = top_y + row * v_step;
+                inv.x = x0 + col * h_step; inv.y = top_y + row * v_step - SLIDE;
                 bool armored;
                 if (kind == WaveKind::Elite)      armored = true;                       // all tanky
                 else if (kind == WaveKind::Swarm) armored = false;                       // all fodder
                 else                              armored = (wv >= 3) && rnd01() < armor_p;
                 int ki = armored ? 3 : kind_map[row];
+                int hp = armored ? armor_hp : 1;
+                if (kind == WaveKind::Elite) {
+                    hp = armor_hp + (tier >= 2 ? 1 : 0);   // steel rank and file
+                    if (row == 0) { ki = 4; hp += 1; }     // a gold row of captains on top
+                }
                 inv.kind = kinds[ki];
                 inv.frames = &frame_cache[ki];
-                int hp = armored ? armor_hp : 1;
-                if (kind == WaveKind::Elite) hp = armor_hp + 2;  // extra-tanky elites
                 inv.hp = inv.max_hp = hp;
                 auto sz = sprite_size(maps[ki][0], SCALE);
                 inv.w = sz.first; inv.h = sz.second;
@@ -266,34 +282,55 @@ struct InvaderGrid {
             }
     }
     int alive_count() const { int n = 0; for (auto& i : invaders) if (i.alive) ++n; return n; }
-    float anim_interval() const {
-        float r = std::clamp(alive_count() / float(COLS * ROWS), 0.0f, 1.0f);
-        return 0.06f + (0.7f - 0.06f) * r;
+    float alive_ratio() const {
+        return std::clamp(alive_count() / float(std::max<size_t>(1, invaders.size())), 0.0f, 1.0f);
     }
-    float shoot_interval() const {
-        float r = std::clamp(alive_count() / float(COLS * ROWS), 0.0f, 1.0f);
-        return (0.4f + (1.8f - 0.4f) * r) * shoot_factor;
+    float anim_interval() const { return 0.06f + (0.7f - 0.06f) * alive_ratio(); }
+    float shoot_interval() const { return (0.4f + (1.8f - 0.4f) * alive_ratio()) * shoot_factor; }
+    // Lowest edge of the living swarm (very negative when none are left).
+    float bottom() const {
+        float b = -1e9f;
+        for (auto& i : invaders) if (i.alive) b = std::max(b, i.y + i.h);
+        return b;
     }
-    void update(float dt, int screen_h, float player_x) {
+    // Wave intro: the block glides down into place. `rate` is px/s.
+    void slide_in(float dt, float rate) {
+        if (slide_left <= 0) return;
+        float d = std::min(slide_left, rate * dt);
+        slide_left -= d;
+        for (auto& i : invaders) i.y += d;
+    }
+    void finish_slide() { slide_in(1.0f, 1e6f); }
+
+    // `march` = the swarm advances; `fire` = it may shoot. Bullets always fly.
+    void update(float dt, int screen_h, float player_x, bool march, bool fire) {
+        anim_ticked = false;
         for (auto& i : invaders) if (i.hit_flash > 0) i.hit_flash -= dt * 5;
         std::vector<Invader*> alive;
         for (auto& i : invaders) if (i.alive) alive.push_back(&i);
-        if (!alive.empty()) {
+        if (!alive.empty() && march) {
             float move = speed * dt * dx;
             for (auto* inv : alive) inv->x += move;
             float right = -1e9f, left = 1e9f;
             for (auto* inv : alive) { right = std::max(right, inv->x + inv->w); left = std::min(left, inv->x); }
-            if (right >= screen_w - 10 || left <= 10) {
-                dx *= -1;
-                for (auto* inv : alive) inv->y += DESCEND;
+            // Bounce only when heading INTO that wall, and pull the block back
+            // inside it — otherwise a long frame followed by a short one leaves
+            // it "still at the edge" and it flips (and drops a row) every frame.
+            float over = 0;
+            if (dx > 0 && right >= screen_w - 10) over = right - (screen_w - 10);
+            else if (dx < 0 && left <= 10)        over = left - 10;
+            if (over != 0 || (dx > 0 && right >= screen_w - 10) || (dx < 0 && left <= 10)) {
+                for (auto* inv : alive) { inv->x -= over; inv->y += DESCEND; }
+                dx = -dx;
                 speed = std::min(speed + 4, 240.0f);
             }
             anim_t += dt;
-            anim_ticked = false;
             if (anim_t >= anim_interval()) {
                 anim_t = 0; anim_ticked = true;
                 for (auto* inv : alive) inv->toggle_frame();
             }
+        }
+        if (!alive.empty() && march && fire) {
             shoot_t += dt;
             if (rest_t > 0) {
                 rest_t -= dt;  // breather between bursts: always a window to escape
@@ -344,9 +381,11 @@ struct BunkerGrid {
     static constexpr int BSCALE = 4, NBUNKERS = 4;
     std::vector<BunkerCell> cells;
     float center_x[NBUNKERS] = {0};  // for picking the nearest bunker to rebuild
+    int top_y = 0;
     BunkerGrid(int screen_w, int screen_h) {
         int bw = int(BUNKER_SP[0].size()) * BSCALE;
         int gap = screen_w / 5, y = screen_h - 160;
+        top_y = y;
         for (int b = 0; b < NBUNKERS; ++b) {
             int bx = gap * (b + 1) - bw / 2;
             center_x[b] = bx + bw / 2.0f;
@@ -407,6 +446,18 @@ struct BunkerGrid {
         particles.bunker_hit(float(ix), float(iy));
         return true;
     }
+    // Anything solid ploughing through (a descending invader, a slamming boss)
+    // flattens the cells it covers. Returns how many were destroyed.
+    int crush(Rect r, ParticleSystem& particles) {
+        int n = 0;
+        for (auto& cell : cells) {
+            if (!cell.alive || !overlap(cell.rect, r)) continue;
+            cell.alive = false;
+            if (++n % 4 == 1)
+                particles.bunker_hit(cell.rect.x + cell.rect.w / 2.0f, cell.rect.y + cell.rect.h / 2.0f, 4);
+        }
+        return n;
+    }
     void draw(Surface& s) const {
         for (auto& cell : cells) {
             if (!cell.alive) continue;
@@ -426,7 +477,7 @@ struct MysteryShip {
     static const Color MINI_COLOR;
     int screen_w;
     bool active = false;
-    float x = 0, y = 30;
+    float x = 0, y = 38;   // its own lane: below the HUD text, above the swarm
     int dx = 1, score_val = 100;
     float spawn_cd;
     std::shared_ptr<Surface> surf, mini_surf;
@@ -454,9 +505,11 @@ struct MysteryShip {
     }
     // out/parts let the mini-boss spit aimed bullets at the player. Returns true
     // the moment it spawns as a mini-boss (so the game can telegraph it).
-    bool update(float dt, float player_x, std::vector<Bullet>& out) {
+    // `can_spawn` / `can_fire` are false outside live play (intro, wave clear).
+    bool update(float dt, float player_x, std::vector<Bullet>& out, bool can_spawn, bool can_fire) {
         pulse_t += dt;
         if (!active) {
+            if (!can_spawn) return false;
             spawn_cd -= dt;
             if (spawn_cd <= 0) {
                 active = true; dx = rnd_choice<int>({-1, 1});
@@ -479,7 +532,7 @@ struct MysteryShip {
         }
         float spd = mini ? MINI_SPEED : SPEED;
         x += dx * spd * dt;
-        if (mini) {  // lob a few aimed shots down as it crosses
+        if (mini && can_fire) {  // lob a few aimed shots down as it crosses
             fire_t -= dt;
             if (fire_t <= 0) {
                 fire_t = rnd_uniform(0.7f, 1.1f);
@@ -510,7 +563,6 @@ struct MysteryShip {
         if (mini) {
             // pulsing warning halo so it reads as a threat, not a freebie
             float p = 0.5f + 0.5f * std::sin(pulse_t * 12);
-            auto [cx, cy] = center();
             draw::rect(s, Color(255, 200, 60, int(90 * p)),
                        {int(x) - 10, int(y) - 10, mini_w + 20, mini_h + 20}, 0, 10);
             s.blit(*mini_surf, int(x) - mini_glow, int(y) - mini_glow);
@@ -519,9 +571,8 @@ struct MysteryShip {
             for (int i = 0; i < n; ++i) {
                 bool on = i < hp;
                 draw::rect(s, on ? MINI_COLOR : Color(40, 40, 40),
-                           {int(x) + i * 7, int(y) - 14, 5, 3});
+                           {int(x) + i * 7, int(y) - 6, 5, 3});
             }
-            (void)cx; (void)cy;
             return;
         }
         s.blit(*surf, int(x) - glow_off, int(y) - glow_off);
@@ -551,7 +602,7 @@ struct Boss {
     static constexpr float DEATH_DUR = 1.5f;
     // grand entrance: a few seconds in, the boss stomps down through the swarm
     bool entering = false, just_stomped = false;
-    float enter_delay = 0, stomp_t = 0, battle_y = 64, invuln_ = 0;
+    float enter_delay = 0, stomp_t = 0, battle_y = 80, invuln_ = 0;
 
     // attack system: HP phases, telegraphed pick, one-shot + sustained patterns
     int tier = 1, phase = 1, cur_attack = -1, pending_attack = -1, slam_phase = 0, sprite_idx = 0;
@@ -572,9 +623,9 @@ struct Boss {
         w = d.w + loop * 24; h = d.h + loop * 12;
         max_hp = hp = int(d.hp * (1.0f + 0.5f * (tier - 1)));
         atk_iv = std::max(0.6f, d.atk_iv - loop * 0.1f);
-        x = (screen_w - w) / 2.0f; y = -float(h);
+        x = (screen_w - w) / 2.0f; y = -float(h) - 24.0f;  // glow + bob stay off-screen too
         vx = (70 + tier * 8) * (rnd01() < 0.5f ? 1 : -1);
-        entering = true; enter_delay = 2.6f; battle_y = 64;
+        entering = true; enter_delay = 2.6f; battle_y = 80;
     }
     Rect rect() const { return {int(x), int(y), w, h}; }
     float hp_ratio() const { return std::max(0.0f, float(hp) / max_hp); }
@@ -602,12 +653,10 @@ struct Boss {
         return pool[rnd_int(0, (int)pool.size() - 1)];
     }
     void begin_attack(int a) {
-        cur_attack = a; attack_t = 0; sub_t = 99; slam_phase = 0; shock_done = false;
+        cur_attack = a; attack_t = 0; sub_t = 0; slam_phase = 0; shock_done = false;
         if (a == 1 || a == 7) mouth_open = 0.7f;
     }
-    void run_attack(float dt, float pcx, float pcy, int screen_w,
-                    std::vector<Bullet>& out, ParticleSystem& parts) {
-        (void)parts; (void)screen_w;
+    void run_attack(float dt, float pcx, float pcy, std::vector<Bullet>& out) {
         attack_t += dt; sub_t += dt;
         float bx = x + w / 2, by = y + h - 8;
         switch (cur_attack) {
@@ -635,25 +684,43 @@ struct Boss {
                 }
                 cur_attack = -1; break;
             }
+            // Sustained patterns emit on a fixed cadence (`sub_t -= interval`) so the
+            // bullet density is the same at 60, 144 or 240 Hz.
             case 5:  // SPIRAL: rotating spray
-                if (sub_t >= 0.07f) { sub_t = 0; spin += 0.5f;
+                while (sub_t >= 0.07f) {
+                    sub_t -= 0.07f; spin += 0.5f;
                     out.push_back(bb(bx, by, spin, 200));
-                    out.push_back(bb(bx, by, spin + 3.14159f, 200)); }
-                if (attack_t >= 1.7f) cur_attack = -1; break;
+                    out.push_back(bb(bx, by, spin + 3.14159f, 200));
+                }
+                if (attack_t >= 1.7f) cur_attack = -1;
+                break;
             case 6:  // RAIN: bullets from random points across the boss
-                if (sub_t >= 0.09f) { sub_t = 0; out.push_back(bb(rnd_uniform(x, x + w), by, 0, 235)); }
-                if (attack_t >= 1.5f) cur_attack = -1; break;
+                while (sub_t >= 0.09f) {
+                    sub_t -= 0.09f;
+                    out.push_back(bb(rnd_uniform(x, x + w), by, 0, 235));
+                }
+                if (attack_t >= 1.5f) cur_attack = -1;
+                break;
             case 7:  // LASER: a sweeping beam of fast bullets
                 laser_angle = -0.7f + (attack_t / 1.7f) * 1.4f;
-                if (sub_t >= 0.025f) { sub_t = 0; out.push_back(bb(bx, by, laser_angle, 380)); }
-                if (attack_t >= 1.7f) cur_attack = -1; break;
-            case 8: {  // SLAM: wind up, dive at the player, shockwave, return
-                float target = battle_y + 300;
+                while (sub_t >= 0.025f) {
+                    sub_t -= 0.025f;
+                    out.push_back(bb(bx, by, laser_angle, 380));
+                }
+                if (attack_t >= 1.7f) cur_attack = -1;
+                break;
+            case 8: {  // SLAM: wind up, dive onto the player's row, shockwave, return
+                // The plunge is measured from the player's row, so the body really
+                // does come down on the ship (and through any bunker in the way).
+                float target = std::max(battle_y + 120.0f, pcy + 6.0f - h);
                 if (slam_phase == 0) { if (attack_t >= 0.45f) slam_phase = 1; }
                 else if (slam_phase == 1) { y += 900 * dt; if (y >= target) { y = target; slam_phase = 2; } }
                 else if (slam_phase == 2) {
-                    if (!shock_done) { shock_done = true;
-                        for (int i = 0; i < 14; ++i) out.push_back(bb(x + w / 2, y + h - 8, -1.5f + i * (3.0f / 13), 240)); }
+                    if (!shock_done) {
+                        shock_done = true;
+                        for (int i = 0; i < 14; ++i)
+                            out.push_back(bb(x + w / 2, y + h - 8, -1.5f + i * (3.0f / 13), 240));
+                    }
                     slam_phase = 3;
                 } else { y -= 700 * dt; if (y <= battle_y) { y = battle_y; cur_attack = -1; } }
                 break;
@@ -662,7 +729,7 @@ struct Boss {
         }
     }
 
-    void take_damage(int dmg, ParticleSystem& parts) {
+    void take_damage(int dmg) {
         if (!damageable()) return;
         hp -= dmg; hit_flash = 0.14f;
         if (hp <= 0) { dying = true; die_t = 0; hp = 0; return; }
@@ -689,7 +756,7 @@ struct Boss {
         bob += dt;
         if (dying) {
             die_t += dt;
-            if (rnd01() < 0.6f) {  // confetti / chained blasts
+            if (!finished && rnd01() < 36.0f * dt) {  // confetti / chained blasts (dt-scaled)
                 float rx = x + rnd_uniform(0, w), ry = y + rnd_uniform(0, h);
                 parts.ufo_explode(rx, ry, 10);
             }
@@ -716,7 +783,7 @@ struct Boss {
             telegraph -= dt;
             if (telegraph <= 0) begin_attack(pending_attack);
         } else if (cur_attack >= 0) {        // a sustained attack is running
-            run_attack(dt, player_cx, player_cy, screen_w, out, parts);
+            run_attack(dt, player_cx, player_cy, out);
         } else {                             // idle: pick the next attack after a beat
             atk_t += dt;
             if (atk_t >= iv) {
@@ -820,6 +887,9 @@ struct Boss {
 struct Flash { std::string text; float x, y, life, max_life; Color color; bool big; };
 
 // ── Game ─────────────────────────────────────────────────────────────────────
+// The world keeps simulating in every state except GameOver: Intro / Dead / Win
+// only gate what the player and the enemies are allowed to do, so nothing ever
+// hangs frozen in mid-air and drops stay collectable between waves.
 enum class St { Intro, Play, Dead, Win, GameOver };
 
 class SpaceInvadersGame : public Scene {
@@ -828,7 +898,6 @@ public:
         : Scene(ctx), pause_(ctx.W, ctx.H, ctx.fonts), initials_(ctx.W, ctx.H, ctx.fonts) {
         high_score_ = ctx.scores ? ctx.scores->high_score("space_invaders") : 0;
         new_game();
-        if (ctx_.sfx) ctx_.sfx->start_ambient(0);
     }
     void update(float dt, const Input& in) override;
     void draw(Surface& s) override;
@@ -839,12 +908,16 @@ public:
 
 private:
     static constexpr float AMBIENT_STAR_T = 0.15f;
+    static constexpr float INTRO_T = 1.5f;
+    static constexpr int GRID_TOP = 78;
+    static constexpr int CAP_RAPID = 3, CAP_SPREAD = 2, CAP_SIDE = 2;
     PauseMenu pause_;
     InitialsEntry initials_;
     bool entry_started_ = false;
     ParticleSystem particles_;
     int high_score_ = 0;
-    float star_t_ = 0;
+    float star_t_ = 0, anim_t_ = 0;
+    bool pad_ = false;          // a gamepad is connected → pad-flavoured prompts
 
     int score_, wave_;
     std::unique_ptr<Player> player_;
@@ -855,17 +928,21 @@ private:
     std::vector<Bullet> p_bullets_, boss_bullets_;
     std::vector<PowerUp> powerups_;
     St state_;
-    float dead_t_ = 0, win_t_ = 0, intro_t_ = 0;
+    float dead_t_ = 0, win_t_ = 0, intro_t_ = 0, game_over_t_ = 0;
     bool boss_wave_ = false, boss_revealed_ = false, nuke_hint_ = false;
+    bool invaded_ = false;      // the swarm landed: this death ends the run
+    bool new_hi_ = false;
     WaveKind wave_kind_ = WaveKind::Normal;
     std::vector<Flash> flash_;
     bool submitted_ = false;
 
     // weapon progression (persists across the run)
-    int w_rapid_ = 0, w_spread_ = 0, w_side_ = 0, w_pierce_ = 0, nukes_ = 0;
+    int w_rapid_ = 0, w_spread_ = 0, w_side_ = 0, nukes_ = 0;
     int kills_since_drop_ = 0;
     float shield_ = 0, nuke_flash_ = 0;
-    float pierce_t_ = 0;   // PIERCE is now a timed buff (was a permanent stacking level)
+    float pierce_t_ = 0;        // PIERCE is a timed buff
+    float deflect_fx_ = 0;      // shield / spawn-guard just ate a shot
+    float tink_cd_ = 0;         // rate-limits the "deflected" sound
 
     // bot + telemetry
     bool bot_ = false;
@@ -874,7 +951,7 @@ private:
 
     std::string loadout() const {
         return "r" + std::to_string(w_rapid_) + "s" + std::to_string(w_spread_) +
-               "w" + std::to_string(w_side_) + "p" + std::to_string(w_pierce_);
+               "w" + std::to_string(w_side_) + "p" + std::to_string(pierce_t_ > 0 ? 1 : 0);
     }
     int bunkers_left() const {
         int n = 0; for (auto& c : bunkers_->cells) if (c.alive) ++n; return n;
@@ -882,15 +959,16 @@ private:
     void tele(const J& j) { if (ctx_.tele) ctx_.tele->event(j); }
     void bot_decide(float& move_dir, bool& want_fire, bool& want_nuke);
 
-    int weapon_tier() const { return w_rapid_ + w_spread_ + w_side_ + w_pierce_; }
+    int weapon_tier() const { return w_rapid_ + w_spread_ + w_side_; }
 
     void new_game() {
         score_ = 0; wave_ = 0;
-        entry_started_ = false; submitted_ = false;
-        w_rapid_ = w_spread_ = w_side_ = w_pierce_ = nukes_ = 0;
+        entry_started_ = false; submitted_ = false; new_hi_ = false;
+        w_rapid_ = w_spread_ = w_side_ = nukes_ = 0;
         kills_since_drop_ = 0;
-        nuke_hint_ = false;
-        shield_ = nuke_flash_ = 0;
+        nuke_hint_ = false; invaded_ = false;
+        shield_ = nuke_flash_ = pierce_t_ = deflect_fx_ = tink_cd_ = 0;
+        game_over_t_ = 0;
         player_ = std::make_unique<Player>(ctx_.W / 2 - 15, ctx_.H - 70);
         particles_.clear();
         flash_.clear();
@@ -899,9 +977,11 @@ private:
         if (const char* e = std::getenv("VOID_WAVE")) start = std::max(1, atoi(e));
         if (const char* e = std::getenv("VOID_WEAPON")) {
             int t = atoi(e);
-            w_rapid_ = std::min(5, t); w_spread_ = std::min(3, t);
-            w_side_ = std::min(3, t); w_pierce_ = std::min(3, t); nukes_ = t;
+            w_rapid_ = std::min(CAP_RAPID, t); w_spread_ = std::min(CAP_SPREAD, t);
+            w_side_ = std::min(CAP_SIDE, t); nukes_ = t;
         }
+        if (const char* e = std::getenv("VOID_LIVES")) player_->lives = std::max(1, atoi(e));
+        if (ctx_.sfx && !ctx_.demo) ctx_.sfx->start_music(0);
         start_wave(start);
     }
     void start_wave(int w) {
@@ -916,16 +996,17 @@ private:
         if (!bunkers_ || w % 5 == 1)
             bunkers_ = std::make_unique<BunkerGrid>(ctx_.W, ctx_.H);
         boss_revealed_ = false;
+        invaded_ = false;
         // Branching: every few non-boss waves (from wave 3 on) roll ELITE vs SWARM.
         wave_kind_ = WaveKind::Normal;
         if (!boss_wave_ && w >= 3 && (w % 3 == 0)) {
             wave_kind_ = rnd01() < 0.5f ? WaveKind::Elite : WaveKind::Swarm;
         }
         if (boss_wave_) {  // looks like a normal wave... until it doesn't
-            grid_ = std::make_unique<InvaderGrid>(ctx_.W, 70, w, WaveKind::Normal);
+            grid_ = std::make_unique<InvaderGrid>(ctx_.W, GRID_TOP, w, WaveKind::Normal, weapon_tier());
             boss_ = std::make_unique<Boss>(w, ctx_.W);
         } else {
-            grid_ = std::make_unique<InvaderGrid>(ctx_.W, 70, w, wave_kind_);
+            grid_ = std::make_unique<InvaderGrid>(ctx_.W, GRID_TOP, w, wave_kind_, weapon_tier());
             boss_.reset();
         }
         // Palette drift: a slow per-wave hue oscillation so deep waves feel
@@ -933,7 +1014,7 @@ private:
         if (ctx_.fx)
             ctx_.fx->palette_hue = 0.18f * std::sin(w * 0.5f) + (boss_wave_ ? -0.12f : 0.0f);
         state_ = St::Intro;
-        intro_t_ = 1.9f;
+        intro_t_ = INTRO_T;
         wave_t0_ = game_t_;
         wave_kills_ = wave_shots_ = wave_pu_ = wave_deaths_ = wave_nukes_ = 0;
         const char* wk = wave_kind_ == WaveKind::Elite ? "elite"
@@ -952,10 +1033,15 @@ private:
         tele(J().add("ev", "game_over").add("wave", wave_).add("score", score_)
                 .add("t", (double)game_t_).add("load", loadout()));
         if (ctx_.scores) {
-            bool hi = ctx_.scores->submit_space_invaders(score_, wave_);
-            if (hi) add_flash("NEW HI-SCORE!", ctx_.W / 2, ctx_.H / 2 - 40, YELLOW, 2.5f);
+            new_hi_ = ctx_.scores->submit_space_invaders(score_, wave_);
             high_score_ = ctx_.scores->high_score("space_invaders");
         }
+    }
+    void enter_game_over() {
+        state_ = St::GameOver;
+        game_over_t_ = 0;
+        submit_scores();
+        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->game_over(); }
     }
 
     Color tier_color() const {
@@ -1009,28 +1095,37 @@ private:
     }
     void apply_powerup(PU k) {
         if (k == PU::Mystery) k = rnd_choice<PU>({PU::Rapid, PU::Spread, PU::Side, PU::Pierce, PU::Nuke, PU::Shield});
-        const char* msg = "";
+        std::string msg;
+        // A weapon that is already maxed pays out in points instead of nothing.
+        auto level_up = [&](int& lvl, int cap, const char* name) {
+            if (lvl >= cap) { score_ += 500; msg = std::string(name) + " MAXED  +500"; }
+            else { ++lvl; msg = std::string(name) + (lvl >= cap ? " MAX!" : "!"); }
+        };
         switch (k) {
-            case PU::Rapid:  w_rapid_ = std::min(3, w_rapid_ + 1); msg = "RAPID FIRE!"; break;
-            case PU::Spread: w_spread_ = std::min(2, w_spread_ + 1); msg = "SPREAD SHOT!"; break;
-            case PU::Side:   w_side_ = std::min(2, w_side_ + 1); msg = "WING CANNONS!"; break;
+            case PU::Rapid:  level_up(w_rapid_, CAP_RAPID, "RAPID FIRE"); break;
+            case PU::Spread: level_up(w_spread_, CAP_SPREAD, "SPREAD SHOT"); break;
+            case PU::Side:   level_up(w_side_, CAP_SIDE, "WING CANNONS"); break;
             case PU::Pierce: pierce_t_ = std::min(12.0f, pierce_t_ + 8.0f); msg = "PIERCING ROUNDS!"; break;
             case PU::Shield: shield_ = 7.0f; msg = "SHIELD UP!"; break;
-            case PU::Life:   player_->lives++; msg = "EXTRA LIFE!"; break;
+            case PU::Life:
+                player_->lives++; msg = "EXTRA LIFE!";
+                if (ctx_.sfx) ctx_.sfx->one_up();
+                break;
             case PU::Rebuild:
                 // Regenerate a chunk of the bunker nearest the player.
                 if (bunkers_ && bunkers_->rebuild_near(player_->x + player_->w / 2.0f, 16, particles_)) {
                     msg = "BUNKER REBUILT!";
                     if (ctx_.fx) ctx_.fx->shake(4);
                 } else {
-                    msg = "BUNKERS INTACT!";
+                    score_ += 250; msg = "BUNKERS INTACT  +250";
                 }
                 break;
             case PU::Nuke:
                 nukes_++; msg = "NUKE ACQUIRED!";
                 if (!nuke_hint_) {
                     nuke_hint_ = true;
-                    add_flash("PRESS  ↑  OR  B  TO NUKE!", ctx_.W / 2, ctx_.H / 2 + 50, RED, 3.0f, true);
+                    add_flash(std::string("PRESS  ") + ui::nuke_key(pad_) + "  TO NUKE!",
+                              ctx_.W / 2, ctx_.H / 2 + 50, RED, 3.0f, true);
                 }
                 break;
             default: break;
@@ -1043,7 +1138,7 @@ private:
         if (ctx_.fx) ctx_.fx->rumble_pickup();
     }
     void detonate_nuke() {
-        if (nukes_ <= 0 || state_ != St::Play) return;
+        if (nukes_ <= 0 || state_ != St::Play || !player_->alive) return;
         nukes_--;
         nuke_flash_ = 1.0f;
         boss_bullets_.clear();
@@ -1067,10 +1162,17 @@ private:
                     }
                 }
         }
-        if (boss_) {
-            int dmg = std::max(25, boss_->max_hp / 5 + 20);
-            boss_->take_damage(dmg, particles_);
-            add_flash("DIRECT HIT!", boss_->x + boss_->w / 2, boss_->y + boss_->h / 2, YELLOW, 1.2f, true);
+        if (boss_ && !boss_->dying) {
+            float fx = boss_->x + boss_->w / 2;
+            float fy = std::max(110.0f, boss_->y + boss_->h / 2);
+            if (boss_->damageable()) {
+                int dmg = std::max(25, boss_->max_hp / 5 + 20);
+                boss_->take_damage(dmg);
+                add_flash("DIRECT HIT!", fx, fy, YELLOW, 1.2f, true);
+            } else {  // entrance / spawn-shield / fake-out: say so instead of lying
+                add_flash("BOSS IMMUNE!", fx, fy, STEEL, 1.2f, true);
+                if (ctx_.sfx) ctx_.sfx->armor_tink();
+            }
         }
         add_flash("☢  NUKE  ☢", ctx_.W / 2, ctx_.H / 2 - 30, RED, 1.4f, true);
         if (ctx_.sfx) ctx_.sfx->big_explosion();
@@ -1080,30 +1182,54 @@ private:
             ctx_.fx->shockwave(0.5f, 0.5f);   // ripple out from screen centre
         }
     }
+    // A shot bounced off the shield / spawn-guard / an immune boss.
+    void deflect(float x, float y, bool on_player) {
+        particles_.bunker_hit(x, y, 6);
+        if (on_player) deflect_fx_ = 0.25f;
+        if (tink_cd_ <= 0 && ctx_.sfx) {
+            tink_cd_ = 0.08f;
+            ctx_.sfx->pan_next(x / float(ctx_.W));
+            if (on_player) ctx_.sfx->shield_hit(); else ctx_.sfx->armor_tink();
+        }
+    }
+    void clear_enemy_fire() {  // pop every hostile shot with a small spark
+        auto pop = [&](std::vector<Bullet>& bs) {
+            for (auto& b : bs) if (b.alive) particles_.bunker_hit(b.x, b.y, 3);
+            bs.clear();
+        };
+        if (grid_) pop(grid_->bullets);
+        pop(boss_bullets_);
+    }
 
-    void update_play(float dt, const Input& in);
+    void step_world(float dt, const Input& in);
     void hit_player();
+    void invasion();
     void draw_hud(Surface& s);
     void draw_flash(Surface& s);
     void draw_banner(Surface& s);
 };
 
 void SpaceInvadersGame::update(float dt, const Input& in) {
-    for (auto k : in.pressed)
-        if (k == SDLK_p && state_ == St::Play) {
-            pause_.toggle();
-            if (ctx_.sfx && pause_.active()) ctx_.sfx->stop_ufo();
-        }
+    pad_ = in.pad_connected;
+    // Pause works everywhere except the game-over screen (where P / START = menu).
+    // ESC opens the pause menu too (quit lives there) instead of dropping the run.
+    if ((in.just(SDLK_p) || (in.just(SDLK_ESCAPE) && !pause_.active())) && state_ != St::GameOver) {
+        pause_.toggle();
+        if (ctx_.sfx && pause_.active()) ctx_.sfx->stop_ufo();
+    }
     if (pause_.active()) {
         if (pause_.update(in) == PauseResult::QuitToMenu) quit_to_menu = true;
         return;
     }
-    for (auto k : in.pressed)
-        if (k == SDLK_ESCAPE) { quit_to_menu = true; return; }
+    if (in.just(SDLK_ESCAPE) && initials_.active()) {
+        quit_to_menu = true;
+        return;
+    }
 
     game_t_ += dt;
+    anim_t_ += dt;
     star_t_ += dt;
-    if (star_t_ >= AMBIENT_STAR_T) { star_t_ = 0; particles_.ambient_star(ctx_.W, ctx_.H); }
+    if (star_t_ >= AMBIENT_STAR_T) { star_t_ -= AMBIENT_STAR_T; particles_.ambient_star(ctx_.W, ctx_.H); }
     particles_.update(dt);
     if (nuke_flash_ > 0) nuke_flash_ -= dt * 1.6f;
     for (auto& f : flash_) f.life -= dt;
@@ -1112,37 +1238,54 @@ void SpaceInvadersGame::update(float dt, const Input& in) {
 
     if (state_ == St::Intro) {
         intro_t_ -= dt;
-        float idir = (in.down(SDLK_RIGHT) || in.down(SDLK_d)) - (in.down(SDLK_LEFT) || in.down(SDLK_a));
-        player_->update(dt, idir, ctx_.W);
-        if (intro_t_ <= 0) state_ = St::Play;
+        step_world(dt, in);
+        if (state_ == St::Intro && intro_t_ <= 0) {
+            if (grid_) grid_->finish_slide();
+            state_ = St::Play;
+        }
     } else if (state_ == St::Play) {
-        update_play(dt, in);
+        step_world(dt, in);
     } else if (state_ == St::Dead) {
         dead_t_ -= dt;
-        if (dead_t_ <= 0) {
-            if (player_->lives > 0) { player_->respawn(ctx_.W / 2 - 15); state_ = St::Play; }
-            else { state_ = St::GameOver; submit_scores(); }
+        step_world(dt, in);
+        if (state_ == St::Dead && dead_t_ <= 0) {
+            if (!invaded_ && player_->lives > 0) {
+                clear_enemy_fire();  // respawn into a clean screen, not a wall of fire
+                player_->respawn(ctx_.W / 2 - 15);
+                state_ = St::Play;
+            } else {
+                enter_game_over();
+            }
         }
     } else if (state_ == St::Win) {
         win_t_ -= dt;
-        if (win_t_ <= 0) { start_wave(wave_ + 1); }
+        step_world(dt, in);
+        // Hold the next wave until any drops still falling are grabbed or gone.
+        if (state_ == St::Win && win_t_ <= 0 && (powerups_.empty() || win_t_ < -5.0f))
+            start_wave(wave_ + 1);
     } else if (state_ == St::GameOver) {
-        if (bot_) { new_game(); return; }  // self-play loops for more data
+        game_over_t_ += dt;
+        if (bot_) {  // self-play loops for more data (after a beat on the panel)
+            if (game_over_t_ >= 2.5f) new_game();
+            return;
+        }
         if (ctx_.scores) {
             const std::string gid = "space_invaders";
-            if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
+            if (!entry_started_ && game_over_t_ >= ui::GAME_OVER_LOCK &&
+                ctx_.scores->qualifies(gid, score_)) {
                 entry_started_ = true;
                 int rank = 1;
                 for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
                 initials_.begin("VOID INVADERS", score_, rank);
+                return;  // don't feed the opening frame's key press to the entry
             }
             if (initials_.active()) {
                 if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
                 return;
             }
         }
-        for (auto k : in.pressed)
-            if (k == SDLK_RETURN || k == SDLK_SPACE) new_game();
+        if (ui::game_over_retry(in, game_over_t_)) new_game();
+        else if (ui::game_over_menu(in, game_over_t_)) quit_to_menu = true;
     }
 }
 
@@ -1150,51 +1293,90 @@ void SpaceInvadersGame::hit_player() {
     auto [cx, cy] = player_->center();
     particles_.explode_player(cx, cy);
     // Death costs you your arsenal — start the weapon climb over (nukes survive).
-    bool had_weapons = w_rapid_ || w_spread_ || w_side_ || w_pierce_;
-    w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0; pierce_t_ = 0;
+    bool had_weapons = w_rapid_ || w_spread_ || w_side_ || pierce_t_ > 0;
+    w_rapid_ = w_spread_ = w_side_ = 0; pierce_t_ = 0;
     shield_ = 0;
     if (had_weapons) add_flash("WEAPONS LOST!", cx, cy - 44, RED, 1.8f, true);
-    player_->kill(); state_ = St::Dead; dead_t_ = 2.2f;
+    player_->kill(); state_ = St::Dead; dead_t_ = 2.0f;
     wave_deaths_++;
     tele(J().add("ev", "death").add("wave", wave_).add("t", (double)game_t_)
             .add("load", loadout()).add("lives_left", player_->lives));
-    if (grid_) grid_->bullets.clear();  // respawn into a clean screen, not a wall of fire
+    if (grid_) grid_->bullets.clear();
     boss_bullets_.clear();
-    if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->player_death(); }
+    if (ctx_.sfx) ctx_.sfx->player_death();
     if (ctx_.fx) { ctx_.fx->shake(16); ctx_.fx->hitstop(0.09f); ctx_.fx->rumble_death(); }
 }
 
-void SpaceInvadersGame::update_play(float dt, const Input& in) {
+// The swarm reached the ground: the ship goes up with it and the run ends,
+// whatever lives were left — but with a proper beat instead of a hard cut.
+void SpaceInvadersGame::invasion() {
+    if (invaded_) return;
+    invaded_ = true;
+    add_flash("THE SWARM HAS LANDED!", ctx_.W / 2, ctx_.H / 2 + 70, RED, 2.4f, true);
+    if (grid_) grid_->bullets.clear();
+    boss_bullets_.clear();
+    if (player_->alive) {
+        auto [cx, cy] = player_->center();
+        particles_.explode_player(cx, cy);
+        player_->alive = false;
+        if (ctx_.sfx) ctx_.sfx->player_death();
+        if (ctx_.fx) { ctx_.fx->shake(18); ctx_.fx->hitstop(0.09f); ctx_.fx->rumble_death(); }
+    }
+    state_ = St::Dead;
+    dead_t_ = std::max(dead_t_, 1.8f);
+}
+
+// One step of the whole world. Called in Intro / Play / Dead / Win; the state
+// only decides who may act:
+//   Intro — the swarm glides in, the ship can already move and shoot
+//   Play  — everything
+//   Dead  — the swarm keeps marching (but holds fire), shots and drops keep moving
+//   Win   — no enemies; the ship mops up falling drops
+void SpaceInvadersGame::step_world(float dt, const Input& in) {
+    const bool playing = state_ == St::Play;
+    const bool dead = state_ == St::Dead;
+    const bool can_act = player_->alive && !dead;
     float move_dir = 0; bool want_fire = false, want_nuke = false;
-    if (bot_) {
-        bot_decide(move_dir, want_fire, want_nuke);
-    } else {
-        move_dir = (in.down(SDLK_RIGHT) || in.down(SDLK_d)) - (in.down(SDLK_LEFT) || in.down(SDLK_a));
-        want_fire = in.down(SDLK_SPACE) || in.down(SDLK_w);
-        for (auto k : in.pressed) if (k == SDLK_b || k == SDLK_UP) want_nuke = true;
+    if (can_act) {
+        if (bot_) {
+            bot_decide(move_dir, want_fire, want_nuke);
+        } else {
+            move_dir = float(in.down(SDLK_RIGHT) || in.down(SDLK_d)) -
+                       float(in.down(SDLK_LEFT) || in.down(SDLK_a));
+            want_fire = in.down(SDLK_SPACE) || in.down(SDLK_w) || in.down(SDLK_UP);
+            want_nuke = in.just(SDLK_b);   // B on keyboard, Y on a pad — never a direction
+        }
     }
     if (want_nuke) detonate_nuke();
 
-    if (shield_ > 0) shield_ -= dt;
-    if (pierce_t_ > 0) pierce_t_ -= dt;
+    if (playing) {  // timed buffs only burn while the fight is actually on
+        if (shield_ > 0) shield_ -= dt;
+        if (pierce_t_ > 0) pierce_t_ -= dt;
+    }
+    if (deflect_fx_ > 0) deflect_fx_ -= dt;
+    if (tink_cd_ > 0) tink_cd_ -= dt;
     player_->update(dt, move_dir, ctx_.W);
-    if (!player_->alive) { if (player_->respawn_t <= 0) player_->respawn(ctx_.W / 2 - 15); return; }
     if (want_fire) fire();
 
+    const float trail_p = 30.0f * dt;  // ≈ every other frame at 60 Hz, at any refresh rate
     for (auto& b : p_bullets_) {
         b.update(dt, ctx_.W, ctx_.H);
-        if (rnd01() < 0.5f) { auto [tx, ty] = b.tip(); particles_.bullet_trail(tx, ty, b.color, true); }
+        if (rnd01() < trail_p) { auto [tx, ty] = b.tip(); particles_.bullet_trail(tx, ty, b.color, true); }
     }
+
+    const float pcx = player_->x + player_->w / 2.0f;
 
     // ── enemies update ──
     if (grid_) {
-        grid_->update(dt, ctx_.H, player_->x + player_->w / 2.0f);
+        if (state_ == St::Intro) grid_->slide_in(dt, InvaderGrid::SLIDE / (INTRO_T - 0.25f));
+        bool march = playing || (dead && !invaded_);
+        grid_->update(dt, ctx_.H, pcx, march, playing);
         if (ctx_.sfx && grid_->anim_ticked) ctx_.sfx->march_tick();
     }
-    if (boss_) {
-        auto [pcx, pcy] = player_->center();
+    if (boss_ && (playing || dead)) {
+        auto [bpx, bpy] = player_->center();
         size_t bb_before = boss_bullets_.size();
-        boss_->update(dt, pcx, pcy, ctx_.W, boss_bullets_, particles_);
+        boss_->update(dt, bpx, bpy, ctx_.W, boss_bullets_, particles_);
         // give boss attacks a voice so the fight is never eerily silent
         if (boss_bullets_.size() > bb_before && ctx_.sfx) {
             ctx_.sfx->pan_next((boss_->x + boss_->w / 2) / float(ctx_.W));
@@ -1204,7 +1386,8 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
             boss_->just_stomped = false;
             if (!boss_revealed_) {  // the surprise reveal, mid-wave
                 boss_revealed_ = true;
-                add_flash("⚠  " + boss_->name + "  ⚠", ctx_.W / 2, 132, RED, 1.8f, true);
+                add_flash("⚠  " + boss_->name + "  ⚠", ctx_.W / 2, 150, RED, 1.8f, true);
+                if (ctx_.sfx) ctx_.sfx->boss_alarm();
             }
             if (grid_)  // crush any invader unlucky enough to be underfoot
                 for (auto& inv : grid_->invaders)
@@ -1228,21 +1411,33 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
             boss_->fake_started = false;
             add_flash("...JUST KIDDING!", boss_->x + boss_->w / 2, boss_->y - 10, YELLOW, 1.6f, true);
         }
+        // A slamming boss flattens whatever cover it lands on.
+        if (boss_->cur_attack == 8 && boss_->slam_phase >= 1 &&
+            boss_->y + boss_->h >= bunkers_->top_y) {
+            if (bunkers_->crush(boss_->rect(), particles_) > 0 && ctx_.sfx) ctx_.sfx->bunker_hit();
+        }
     }
 
+    // The UFO only launches during live play on non-boss waves (the boss bar
+    // owns that lane); one already in flight always finishes its pass.
+    size_t ufo_before = boss_bullets_.size();
     bool ufo_was = ufo_->active;
-    bool mini_spawned = ufo_->update(dt, player_->x + player_->w / 2.0f, boss_bullets_);
+    bool mini_spawned = ufo_->update(dt, pcx, boss_bullets_, playing && !boss_wave_, playing);
     if (mini_spawned) {  // telegraph the mini-boss arrival
-        add_flash("⚠  MINI-BOSS UFO  ⚠", ctx_.W / 2, 60, MysteryShip::MINI_COLOR, 1.8f, true);
+        add_flash("⚠  MINI-BOSS UFO  ⚠", ctx_.W / 2, 96, MysteryShip::MINI_COLOR, 1.8f, true);
         if (ctx_.fx) ctx_.fx->shake(6);
     }
-    // boss_bullets_ also carries mini-boss UFO fire, so move them every frame
-    // (boss or not), after the UFO has had a chance to spawn this frame's shots.
+    if (boss_bullets_.size() > ufo_before && ctx_.sfx) {  // mini-boss fire is audible too
+        ctx_.sfx->pan_next(ufo_->x / float(ctx_.W));
+        ctx_.sfx->enemy_shot();
+    }
+    // boss_bullets_ also carries mini-boss UFO fire, so move them every frame.
     for (auto& b : boss_bullets_) b.update(dt, ctx_.W, ctx_.H);
     if (ctx_.sfx) {
-        if (ufo_->active && !ufo_was) ctx_.sfx->start_ufo();
-        else if (!ufo_->active && ufo_was) ctx_.sfx->stop_ufo();
-        if (ufo_->active) ctx_.sfx->set_ufo_pan(ufo_->x / float(ctx_.W));
+        // start_ufo() is a no-op while the loop is already playing, so asking
+        // every frame also brings the siren back after a pause.
+        if (ufo_->active) { ctx_.sfx->start_ufo(); ctx_.sfx->set_ufo_pan(ufo_->x / float(ctx_.W)); }
+        else if (ufo_was) ctx_.sfx->stop_ufo();
     }
 
     // ── player bullets → things ──
@@ -1255,8 +1450,9 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
                 if (inv.hp <= 0) {
                     inv.alive = false;
                     wave_kills_++;
-                    int pts = int(inv.points() * grid_->point_mult);
-                    score_ += pts * (ctx_.combo ? ctx_.combo->hit() : 1);
+                    int pts = int(inv.points() * grid_->point_mult) *
+                              (ctx_.combo ? ctx_.combo->hit() : 1);
+                    score_ += pts;
                     auto [cx, cy] = inv.center();
                     particles_.explode_invader(cx, cy, inv.color());
                     add_flash("+" + std::to_string(pts), cx, cy - 18, YELLOW);
@@ -1264,11 +1460,11 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
                     if (ctx_.sfx) { ctx_.sfx->pan_next(cx / float(ctx_.W)); ctx_.sfx->invader_hit(); }
                 } else {
                     // Chipped but ALIVE (armoured): make the hit read — a burst of
-                    // armour sparks at the impact + a metallic "clink", so the
+                    // armour sparks at the impact + a metallic "tink", so the
                     // player sees the shot landed even though it didn't kill.
                     auto [cx, cy] = inv.center();
                     particles_.bunker_hit(float(cx), float(cy), 7);
-                    if (ctx_.sfx) { ctx_.sfx->pan_next(cx / float(ctx_.W)); ctx_.sfx->zap(); }
+                    if (ctx_.sfx) { ctx_.sfx->pan_next(cx / float(ctx_.W)); ctx_.sfx->armor_tink(); }
                 }
                 // Pierce only carries through enemies it KILLS outright — armored
                 // grunts that merely get chipped stop the bolt cold.
@@ -1276,13 +1472,17 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
                 break;
             }
         }
-        if (b.alive && boss_ && boss_->damageable() && overlap(b.rect(), boss_->rect())) {
-            boss_->take_damage(b.damage, particles_);
-            score_ += 5 * b.damage;
+        if (b.alive && boss_ && !boss_->dying && overlap(b.rect(), boss_->rect())) {
             auto [tx, ty] = b.tip();
-            particles_.explode_invader(tx, ty, boss_->color, 6);
-            if (ctx_.sfx) ctx_.sfx->invader_hit();
-            if (ctx_.fx) ctx_.fx->shake(2);
+            if (boss_->damageable()) {
+                boss_->take_damage(b.damage);
+                score_ += 5 * b.damage;
+                particles_.explode_invader(tx, ty, boss_->color, 6);
+                if (ctx_.sfx) ctx_.sfx->invader_hit();
+                if (ctx_.fx) ctx_.fx->shake(2);
+            } else {  // entrance / spawn-shield / fake-out: the bolt visibly bounces
+                deflect(float(tx), float(ty), false);
+            }
             b.alive = false;  // bolts always stop on the boss (no pierce-through)
         }
         if (b.alive && ufo_->active && overlap(b.rect(), ufo_->rect())) {
@@ -1292,16 +1492,17 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
             if (pts < 0) {  // mini-boss soaked a hit
                 score_ += 10 * b.damage;
                 particles_.ufo_explode(cx, cy, 8);
-                if (ctx_.sfx) ctx_.sfx->invader_hit();
+                if (ctx_.sfx) ctx_.sfx->armor_tink();
                 if (ctx_.fx) ctx_.fx->shake(3);
             } else {
-                score_ += pts * (ctx_.combo ? ctx_.combo->hit() : 1);
+                pts *= (ctx_.combo ? ctx_.combo->hit() : 1);
+                score_ += pts;
                 particles_.ufo_explode(cx, cy);
-                add_flash("+" + std::to_string(pts) + "!", cx, cy - 20,
+                add_flash("+" + std::to_string(pts) + "!", cx, cy + 26,
                           was_mini ? MysteryShip::MINI_COLOR : RED);
                 if (was_mini) {  // GUARANTEED power-up from a mini-boss kill
                     spawn_powerup(float(cx), float(cy));
-                    add_flash("MINI-BOSS DOWN!", ctx_.W / 2, ctx_.H / 2 - 40,
+                    add_flash("MINI-BOSS DOWN!", ctx_.W / 2, ctx_.H / 2 - 70,
                               MysteryShip::MINI_COLOR, 1.6f, true);
                     if (ctx_.fx) { ctx_.fx->shake(14); ctx_.fx->hitstop(0.06f); }
                     if (ctx_.sfx) ctx_.sfx->boss_explosion();
@@ -1325,13 +1526,14 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
                      [](const Bullet& b) { return !b.alive; }), p_bullets_.end());
 
     // ── boss finished its death throes → win ──
-    if (boss_ && boss_->finished) {
+    if (playing && boss_ && boss_->finished) {
         score_ += 500 * (wave_ / 5);
         auto rainx = boss_->x + boss_->w / 2;
-        powerups_.push_back({rainx, boss_->y + 40, 0, PU::Nuke});
-        powerups_.push_back({rainx - 50, boss_->y + 40, 0, PU::Side});
-        powerups_.push_back({rainx + 50, boss_->y + 40, 0, PU::Spread});
-        add_flash(boss_->name + " GOES SPLAT!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 2.2f, true);
+        float rainy = std::max(60.0f, boss_->y + 40);
+        powerups_.push_back({rainx, rainy, 0, PU::Nuke});
+        powerups_.push_back({rainx - 50, rainy, 0, PU::Side});
+        powerups_.push_back({rainx + 50, rainy, 0, PU::Spread});
+        add_flash(boss_->name + " GOES SPLAT!", ctx_.W / 2, ctx_.H / 2 + 20, YELLOW, 2.2f, true);
         if (ctx_.sfx) ctx_.sfx->big_explosion();
         if (ctx_.fx) {
             ctx_.fx->shake(30); ctx_.fx->hitstop(0.10f);
@@ -1342,10 +1544,18 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
         tele(J().add("ev", "boss_clear").add("wave", wave_).add("dt", (double)(game_t_ - wave_t0_))
                 .add("name", boss_->name).add("load", loadout()).add("lives", player_->lives));
         boss_.reset();
-        if (ctx_.sfx) ctx_.sfx->stop_ufo();
-        state_ = St::Win; win_t_ = 2.6f;
+        // The escort doesn't outlive its boss: every straggler pops with it.
+        if (grid_)
+            for (auto& inv : grid_->invaders)
+                if (inv.alive) {
+                    inv.alive = false;
+                    auto [cx, cy] = inv.center();
+                    particles_.explode_invader(cx, cy, inv.color(), 14);
+                    score_ += int(inv.points() * grid_->point_mult);
+                }
+        clear_enemy_fire();
+        state_ = St::Win; win_t_ = 2.2f;
         if (ctx_.sfx) ctx_.sfx->level_clear();
-        return;
     }
 
     // ── powerups fall / collect ──
@@ -1360,12 +1570,17 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
                     [](const PowerUp& p) { return !p.alive; }), powerups_.end());
 
     // ── enemy bullets → player / bunkers ──
-    bool safe = player_->invincible > 0 || shield_ > 0;
+    const bool safe = player_->invincible > 0 || shield_ > 0;
     auto process_enemy_bullets = [&](std::vector<Bullet>& bs) {
         for (auto& b : bs) {
             if (!b.alive) continue;
-            if (player_->alive && !safe && overlap(b.rect(), player_->rect())) {
-                b.alive = false; hit_player(); return true;
+            if (player_->alive && overlap(b.rect(), player_->rect())) {
+                if (safe) {  // the shield / spawn-guard visibly and audibly eats it
+                    b.alive = false;
+                    deflect(b.x, b.y, true);
+                    continue;
+                }
+                if (playing) { b.alive = false; hit_player(); return true; }
             }
             if (bunkers_->blast(b, std::min(12, 3 + wave_ / 3), particles_)) b.alive = false;
         }
@@ -1376,24 +1591,36 @@ void SpaceInvadersGame::update_play(float dt, const Input& in) {
     boss_bullets_.erase(std::remove_if(boss_bullets_.begin(), boss_bullets_.end(),
                         [](const Bullet& b) { return !b.alive; }), boss_bullets_.end());
 
-    // shield-on-touch: shield blocks one boss body contact too
-    if (boss_ && !boss_->dying && !boss_->faking && !boss_->entering && player_->alive && !safe &&
-        overlap(player_->rect(), boss_->rect())) { hit_player(); return; }
+    // boss body contact (a shield or spawn-guard shrugs it off)
+    if (playing && boss_ && !boss_->dying && !boss_->faking && !boss_->entering && player_->alive &&
+        !safe && overlap(player_->rect(), boss_->rect())) { hit_player(); return; }
 
-    // ── lose conditions ──
-    if (grid_) {
-        for (auto& inv : grid_->invaders)
-            if (inv.alive && inv.y + inv.h >= ctx_.H - 60) { state_ = St::GameOver; submit_scores(); return; }
-        if (!boss_ && grid_->alive_count() == 0) {  // boss waves end when the boss does
-            tele(J().add("ev", "wave_clear").add("wave", wave_).add("dt", (double)(game_t_ - wave_t0_))
-                    .add("kills", wave_kills_).add("shots", wave_shots_).add("pu", wave_pu_)
-                    .add("deaths", wave_deaths_).add("nukes_used", wave_nukes_)
-                    .add("load", loadout()).add("lives", player_->lives).add("bunkers", bunkers_left()));
-            if (ctx_.sfx) ctx_.sfx->stop_ufo();
-            add_flash("WAVE CLEARED!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 1.6f, true);
-            state_ = St::Win; win_t_ = 2.0f;
-            if (ctx_.sfx) ctx_.sfx->level_clear();
+    // ── the swarm reaches cover / the ship / the ground ──
+    if (grid_ && (playing || dead) && !invaded_) {
+        float bottom = grid_->bottom();
+        if (bottom >= bunkers_->top_y) {  // invaders grind through bunkers, not past them
+            int crushed = 0;
+            for (auto& inv : grid_->invaders)
+                if (inv.alive && inv.y + inv.h >= bunkers_->top_y)
+                    crushed += bunkers_->crush(inv.rect(), particles_);
+            if (crushed > 0 && ctx_.sfx) ctx_.sfx->bunker_hit();
         }
+        if (bottom >= ctx_.H - 60) { invasion(); return; }
+        if (playing && player_->alive && !safe && bottom >= player_->y)
+            for (auto& inv : grid_->invaders)
+                if (inv.alive && overlap(inv.rect(), player_->rect())) { hit_player(); return; }
+    }
+
+    // ── wave clear (boss waves end when the boss does) ──
+    if (playing && grid_ && !boss_ && grid_->alive_count() == 0) {
+        tele(J().add("ev", "wave_clear").add("wave", wave_).add("dt", (double)(game_t_ - wave_t0_))
+                .add("kills", wave_kills_).add("shots", wave_shots_).add("pu", wave_pu_)
+                .add("deaths", wave_deaths_).add("nukes_used", wave_nukes_)
+                .add("load", loadout()).add("lives", player_->lives).add("bunkers", bunkers_left()));
+        add_flash("WAVE CLEARED!", ctx_.W / 2, ctx_.H / 2 + 20, YELLOW, 1.6f, true);
+        clear_enemy_fire();
+        state_ = St::Win; win_t_ = 1.5f;
+        if (ctx_.sfx) ctx_.sfx->level_clear();
     }
 }
 
@@ -1444,21 +1671,30 @@ void SpaceInvadersGame::draw(Surface& s) {
     if (boss_) {
         auto [pcx, pcy] = player_->center();
         boss_->draw(s, pcx, pcy);
-        for (auto& b : boss_bullets_) b.draw(s);
     }
+    // boss fire AND mini-boss UFO fire live here — always drawn, boss or not
+    for (auto& b : boss_bullets_) b.draw(s);
     bunkers_->draw(s);
     ufo_->draw(s);
     for (auto& p : powerups_) p.draw(s, *ctx_.fonts.small);
     player_->draw(s);
     for (auto& b : p_bullets_) b.draw(s);
 
-    // shield bubble
-    if (shield_ > 0 && player_->alive) {
+    // shield bubble: pulses, flares when it eats a shot, blinks before it drops
+    if (player_->alive) {
         auto [cx, cy] = player_->center();
-        float pulse = 0.6f + 0.4f * std::sin(star_t_ * 20 + shield_ * 4);
         int rr = player_->w;
-        draw::circle(s, Color(80, 220, 255, int(90 * pulse)), cx, cy, rr, 2);
-        draw::circle(s, Color(80, 220, 255, int(30 * pulse)), cx, cy, rr - 2, 1);
+        float hit = std::max(0.0f, deflect_fx_ / 0.25f);
+        if (shield_ > 0) {
+            bool blink_off = shield_ < 1.5f && std::fmod(shield_, 0.25f) < 0.1f;
+            if (!blink_off) {
+                float pulse = 0.6f + 0.4f * std::sin(anim_t_ * 9 + shield_ * 4);
+                draw::circle(s, Color(80, 220, 255, int(90 * pulse + 150 * hit)), cx, cy, rr, 2);
+                draw::circle(s, Color(80, 220, 255, int(30 * pulse + 60 * hit)), cx, cy, rr - 2, 1);
+            }
+        } else if (hit > 0) {  // spawn-guard has no bubble of its own: flash one on impact
+            draw::circle(s, Color(255, 255, 255, int(170 * hit)), cx, cy, rr, 2);
+        }
     }
 
     draw_hud(s);
@@ -1468,79 +1704,99 @@ void SpaceInvadersGame::draw(Surface& s) {
     draw_banner(s);
 
     if (state_ == St::GameOver) {
-        draw_text_centered(s, *ctx_.fonts.big, "GAME  OVER", ctx_.W / 2, ctx_.H / 2 - 50, RED);
-        draw_text_centered(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), ctx_.W / 2, ctx_.H / 2 + 10, WHITE);
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS SPACE TO RETRY", ctx_.W / 2, ctx_.H / 2 + 60, DIM);
+        ui::game_over(s, ctx_.fonts, ctx_.W, ctx_.H, game_over_t_, score_, new_hi_, pad_,
+                      "REACHED WAVE " + std::to_string(wave_));
         if (initials_.active()) initials_.draw(s);
     }
     pause_.draw(s);
 }
 
 void SpaceInvadersGame::draw_banner(Surface& s) {
-    if (state_ == St::Intro) {
-        float a = std::min(1.0f, intro_t_ * 1.5f);
-        // Always just "WAVE N" — boss waves keep the stomp-in a surprise.
-        draw_text_centered(s, *ctx_.fonts.big, "WAVE " + std::to_string(wave_), ctx_.W / 2, ctx_.H / 2 - 20,
-                           Color(int(80 + 175 * a), 255, int(80 + 60 * a)));
-        // Branching banner: announce the variant so the player knows what's coming.
-        if (wave_kind_ == WaveKind::Elite)
-            draw_text_centered(s, *ctx_.fonts.med, "ELITE  —  ARMORED FLEET", ctx_.W / 2, ctx_.H / 2 + 28, STEEL);
-        else if (wave_kind_ == WaveKind::Swarm)
-            draw_text_centered(s, *ctx_.fonts.med, "SWARM  —  THEY'RE EVERYWHERE", ctx_.W / 2, ctx_.H / 2 + 28, ORANGE);
-        else
-            draw_text_centered(s, *ctx_.fonts.small, "GET READY", ctx_.W / 2, ctx_.H / 2 + 30, DIM);
-    } else if (state_ == St::Win) {
-        // celebratory text lives in the flash list; nothing extra needed here.
+    if (state_ != St::Intro) return;  // win text lives in the flash list
+    // fade in, hold, fade out — no pop
+    float a = std::clamp(std::min((INTRO_T - intro_t_) / 0.25f, intro_t_ / 0.4f), 0.0f, 1.0f);
+    int al = int(255 * a);
+    int cy = ctx_.H / 2 + 40;   // below the swarm's resting block, above the bunkers
+    // Always just "WAVE N" — boss waves keep the stomp-in a surprise.
+    draw_text_centered(s, *ctx_.fonts.big, "WAVE " + std::to_string(wave_), ctx_.W / 2, cy,
+                       Color(200, 255, 140, al));
+    // Branching banner: announce the variant so the player knows what's coming.
+    if (wave_kind_ == WaveKind::Elite)
+        draw_text_centered(s, *ctx_.fonts.med, "ELITE  —  ARMORED FLEET", ctx_.W / 2, cy + 52,
+                           Color(STEEL.r, STEEL.g, STEEL.b, al));
+    else if (wave_kind_ == WaveKind::Swarm)
+        draw_text_centered(s, *ctx_.fonts.med, "SWARM  —  THEY'RE EVERYWHERE", ctx_.W / 2, cy + 52,
+                           Color(ORANGE.r, ORANGE.g, ORANGE.b, al));
+    else
+        draw_text_centered(s, *ctx_.fonts.small, "GET READY", ctx_.W / 2, cy + 54,
+                           Color(ui::HINT.r, ui::HINT.g, ui::HINT.b, al));
+    if (wave_ == 1 && !bot_) {  // the only controls the game needs, shown once
+        std::string hint = pad_ ? std::string("STICK  MOVE      ") + ui::fire_key(pad_) + "  FIRE"
+                                : std::string("← →  MOVE      ") + ui::fire_key(pad_) + "  FIRE";
+        draw_text_centered(s, *ctx_.fonts.small, hint, ctx_.W / 2, cy + 82,
+                           Color(ui::HINT.r, ui::HINT.g, ui::HINT.b, al));
     }
 }
 
 void SpaceInvadersGame::draw_hud(Surface& s) {
-    draw_text(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
-    draw_text_centered(s, *ctx_.fonts.med, "HI  " + zpad(high_score_, 6), ctx_.W / 2, 8, YELLOW);
-    draw_text_right(s, *ctx_.fonts.med, "WAVE  " + std::to_string(wave_), ctx_.W - 16, 8, CYAN);
-    if (ctx_.combo && ctx_.combo->active() && state_ == St::Play) {
+    Font& med = *ctx_.fonts.med;
+    Font& small = *ctx_.fonts.small;
+    // ── top row: score / hi / wave ──
+    draw_text(s, med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
+    draw_text_centered(s, med, "HI  " + zpad(std::max(high_score_, score_), 6), ctx_.W / 2, 8, YELLOW);
+    draw_text_right(s, med, "WAVE  " + std::to_string(wave_), ctx_.W - 16, 8, CYAN);
+
+    // ── second row, left: combo (kept out of the centre, which the boss bar owns) ──
+    if (ctx_.combo && ctx_.combo->active() && state_ != St::GameOver) {
         int m = ctx_.combo->mult();
         Color cc = m >= 6 ? RED : m >= 4 ? ORANGE : YELLOW;
-        draw_text_centered(s, *ctx_.fonts.med, "x" + std::to_string(m) + " COMBO", ctx_.W / 2, 34, cc);
-        int bw = 120, bx = ctx_.W / 2 - bw / 2;
-        draw::rect(s, Color(40, 40, 40), {bx, 58, bw, 4});
-        draw::rect(s, cc, {bx, 58, int(bw * ctx_.combo->ratio()), 4});
+        draw_text(s, small, "x" + std::to_string(m) + " COMBO", 16, 38, cc);
+        draw::rect(s, Color(40, 40, 40), {16, 58, 100, 3});
+        draw::rect(s, cc, {16, 58, int(100 * ctx_.combo->ratio()), 3});
     }
 
-    // boss HP bar
+    // ── second row, centre: boss name, then its HP bar on a row of its own ──
     if (boss_ && !boss_->dying && !boss_->entering) {
-        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 40;
-        draw_text_centered(s, *ctx_.fonts.small, boss_->name, ctx_.W / 2, by - 16, boss_->color);
-        draw::rect(s, Color(20, 20, 30), {bx, by, bw, 12}, 0, 4);
+        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 58;
+        draw_text_centered(s, small, boss_->name, ctx_.W / 2, 38, boss_->color);
+        draw::rect(s, Color(20, 20, 30), {bx, by, bw, 10}, 0, 4);
         int fillw = int(bw * boss_->hp_ratio());
         Color hc = boss_->hp_ratio() > 0.5f ? GREEN : boss_->hp_ratio() > 0.25f ? YELLOW : RED;
-        draw::rect(s, hc, {bx, by, fillw, 12}, 0, 4);
-        draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
+        draw::rect(s, hc, {bx, by, fillw, 10}, 0, 4);
+        draw::rect(s, boss_->color, {bx, by, bw, 10}, 1, 4);
     }
 
-    // weapon loadout (bottom-left)
-    int hx = 16, hy = ctx_.H - 46;
-    draw_text(s, *ctx_.fonts.small, "PWR", hx, hy, DIM);
-    auto pip = [&](int n, Color c, int slot) {
-        for (int i = 0; i < 5; ++i)
-            draw::rect(s, i < n ? c : Color(30, 40, 30), {hx + 44 + slot * 16, hy + 11 - i * 3, 12, 2});
+    // ── bottom-left: weapon levels (one pip per real level) and lives ──
+    const int row_a = ctx_.H - 39, row_b = ctx_.H - 21;
+    draw_text(s, small, "PWR", 16, row_a, ui::LABEL);
+    auto pips = [&](int n, int cap, Color c, int slot) {
+        for (int i = 0; i < cap; ++i)
+            draw::rect(s, i < n ? c : Color(50, 62, 56), {60 + slot * 18, row_a + 12 - i * 4, 13, 3});
     };
-    pip(w_rapid_, YELLOW, 0); pip(w_spread_, ORANGE, 1); pip(w_side_, CYAN, 2); pip(w_pierce_, Color(200, 100, 255), 3);
+    pips(w_rapid_, CAP_RAPID, YELLOW, 0);
+    pips(w_spread_, CAP_SPREAD, ORANGE, 1);
+    pips(w_side_, CAP_SIDE, CYAN, 2);
 
-    // lives
-    draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 28, DIM);
-    for (int i = 0; i < player_->lives; ++i)
-        draw::polygon(s, CYAN, {{80 + i * 22, ctx_.H - 16}, {80 + i * 22 + 7, ctx_.H - 26}, {80 + i * 22 + 14, ctx_.H - 16}});
+    draw_text(s, small, "LIVES", 16, row_b, ui::LABEL);
+    int shown = std::min(player_->lives, 6);
+    for (int i = 0; i < shown; ++i)
+        draw::polygon(s, CYAN, {{80 + i * 22, row_b + 14}, {80 + i * 22 + 7, row_b + 4}, {80 + i * 22 + 14, row_b + 14}});
+    if (player_->lives > shown)
+        draw_text(s, small, "+" + std::to_string(player_->lives - shown), 80 + shown * 22, row_b, CYAN);
 
-    // nukes + shield (bottom-right)
+    // ── bottom-right: timed buffs on one row, nuke + pause hint on the other ──
+    auto seg = [&](int& x, int y, const std::string& t, Color c) {
+        draw_text_right(s, small, t, x, y, c);
+        x -= small.text_width(t) + 18;
+    };
+    int xa = ctx_.W - 12, xb = ctx_.W - 12;
+    seg(xb, row_b, std::string(ui::pause_key(pad_)) + " PAUSE", ui::LABEL);
     if (nukes_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "☢ NUKE x" + std::to_string(nukes_) + "  [↑/B]", ctx_.W - 12, ctx_.H - 44, RED);
+        seg(xb, row_b, "☢ NUKE x" + std::to_string(nukes_) + "  [" + ui::nuke_key(pad_) + "]", RED);
     if (shield_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 28, Color(80, 220, 255));
+        seg(xa, row_a, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s", Color(80, 220, 255));
     if (pierce_t_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "PIERCE " + std::to_string(int(pierce_t_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 12, Color(200, 100, 255));
-    else
-        draw_text_right(s, *ctx_.fonts.small, "P PAUSE", ctx_.W - 12, ctx_.H - 28, Color(30, 60, 30));
+        seg(xa, row_a, "PIERCE " + std::to_string(int(pierce_t_ + 0.99f)) + "s", Color(200, 100, 255));
 }
 
 void SpaceInvadersGame::draw_flash(Surface& s) {
@@ -1549,7 +1805,10 @@ void SpaceInvadersGame::draw_flash(Surface& s) {
         float a = std::max(0.0f, std::min(1.0f, f.life / std::max(0.1f, f.max_life)));
         c.a = uint8_t(255 * a);
         Font& font = f.big ? *ctx_.fonts.med : *ctx_.fonts.small;
-        draw_text_centered(s, font, f.text, int(f.x), int(f.y), c);
+        // keep the whole string on screen even when its anchor hugs a wall
+        int half = font.text_width(f.text) / 2 + 6;
+        int x = half * 2 >= ctx_.W ? ctx_.W / 2 : std::clamp(int(f.x), half, ctx_.W - half);
+        draw_text_centered(s, font, f.text, x, int(f.y), c);
     }
 }
 }  // namespace

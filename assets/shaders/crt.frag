@@ -2,7 +2,8 @@
 
 uniform sampler2D screen_texture;
 uniform float time;
-uniform vec2 resolution;
+uniform vec2 resolution;      // game surface size in texels (900x720)
+uniform vec2 out_resolution;  // size this pass renders at (the on-screen viewport)
 
 // Big-hit shockwave: an expanding ring of screen-space displacement.
 uniform float shock;          // 0 = idle, else envelope 0..1 (fades as ring expands)
@@ -35,11 +36,22 @@ vec2 crt_curve(vec2 uv) {
     return uv;
 }
 
+// Sharp-bilinear: when the image is magnified, keep each game texel a crisp
+// block and only blend across a one-output-pixel band at texel edges. Plain
+// nearest would shimmer under the barrel warp; plain bilinear would smear.
+vec2 sharp_uv(vec2 uv) {
+    vec2 scale = max(out_resolution / resolution, vec2(1.0));
+    vec2 t = uv * resolution;
+    vec2 i = floor(t);
+    vec2 f = clamp((t - i - 0.5) * scale + 0.5, 0.0, 1.0);
+    return (i + f) / resolution;
+}
+
 vec3 sample_chroma(sampler2D tex, vec2 uv, float strength) {
     vec2 offset = (uv - 0.5) * strength;
-    float r = texture(tex, uv + offset * 1.0).r;
-    float g = texture(tex, uv            ).g;
-    float b = texture(tex, uv - offset * 1.0).b;
+    float r = texture(tex, sharp_uv(uv + offset)).r;
+    float g = texture(tex, sharp_uv(uv)).g;
+    float b = texture(tex, sharp_uv(uv - offset)).b;
     return vec3(r, g, b);
 }
 
@@ -101,8 +113,11 @@ void main() {
     scanline = pow(scanline, 0.6);
     color *= mix(1.0 - scan_strength, 1.0, scanline);
 
+    // Vertical aperture grille: only when there are enough output pixels per
+    // texel to resolve it; below that it just aliases into moire bands.
     float grid_x = sin(curved_uv.x * resolution.x * 3.14159) * 0.5 + 0.5;
-    color *= mix(0.96, 1.0, grid_x);
+    float grid_amt = 0.04 * smoothstep(1.5, 2.5, out_resolution.x / resolution.x);
+    color *= mix(1.0 - grid_amt, 1.0, grid_x);
 
     vec2 vig_uv = curved_uv * (1.0 - curved_uv.yx);
     float vignette = pow(vig_uv.x * vig_uv.y * 24.0, 0.30);

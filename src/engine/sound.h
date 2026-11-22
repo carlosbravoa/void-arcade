@@ -1,6 +1,6 @@
-// sound.h — procedural retro sound synthesis, ported from shared/sound.py.
-// All sounds are generated as numpy-style float waveforms, converted to int16
-// PCM and wrapped as SDL_mixer chunks. No audio files. Low-latency 512-sample
+// sound.h — procedural retro sound synthesis. Every effect and every music
+// track is generated at runtime as a float waveform, converted to int16 PCM
+// and wrapped as an SDL_mixer chunk. No audio files. Low-latency 512-sample
 // buffer to keep action->sound tight (a key "feels native" factor).
 #pragma once
 
@@ -55,6 +55,21 @@ public:
     void stop_charge();
     void charged_blast(float charge = 1.0f);  // charged-shot release; scales with charge 0..1
 
+    // ── cues shared by every game ──
+    void boss_alarm();          // boss arrival warning (NOT the player-death sound)
+    void one_up();              // extra life
+    void game_over();           // game-over sting
+    void armor_tink();          // shot deflected / armour chipped, no kill
+    void ui_move();             // menu cursor
+    void ui_select();           // menu confirm
+    void start_thrust();        // looping engine rumble (void_drift)
+    void stop_thrust();
+    // ── music: one procedural looping track per game ──
+    // 0 invaders, 1 squadrons, 2 raid, 3 breaker, 4 drift, 5 gunner, 6 storm, 7 menu
+    void start_music(int track);
+    void stop_music();
+    void set_music_volume(int v);       // 0..128, independent of master
+
     // ── ambient bed (per-game looping drone) ──
     void start_ambient(int variant);   // 0 deep-space, 1 rift, 2 calm
     void stop_ambient();
@@ -71,56 +86,56 @@ public:
     void stop_all();
 
 private:
-    void play(Mix_Chunk* c, int loops = 0, int channel = -1);
+    // One logical sound = up to 3 pre-rendered variants (slightly different
+    // pitch/level) rotated at random so repeats don't machine-gun, plus the
+    // time it last played so per-frame callers can't retrigger it every frame.
+    struct Voice {
+        Mix_Chunk* v[3] = {};
+        int    n = 0;
+        int    last_var = -1;
+        Uint32 last_ms = 0;
+        bool   played = false;
+    };
+    void play_voice(int id);
+    void start_loop(int channel, Mix_Chunk* c, int fade_ms);
+    void stop_loop(int channel, int fade_ms);
+    void apply_volumes();
+    int  sfx_volume() const;
+    int  music_channel_volume() const;
 
     bool ready_ = false;
     bool muted_ = false;
     int  march_idx_ = 0;
     int  master_vol_ = 100;     // 0..128 (MIX_MAX_VOLUME)
+    int  music_vol_ = 45;       // 0..128, multiplied by master
+    int  music_track_ = -1;     // track currently requested (-1 = none)
     float pending_pan_ = -1.0f; // >=0 means apply to next one-shot
+    // apply_volumes() runs every frame (main sets the master volume each frame)
+    // so it only touches the mixer when a value changed or a fade is settling.
+    int    applied_sfx_ = -1, applied_music_ = -1;
+    Uint32 resync_until_ = 0;
 
     // Reserved looping-channel slots (one-shots are kept off these via
     // Mix_ReserveChannels so they can never steal a loop).
     static constexpr int kUfoChannel = 0;
     static constexpr int kTractorChannel = 1;
     static constexpr int kAmbientChannel = 2;
-    static constexpr int kChargeChannel = 3;
-    static constexpr int kReserved = 4;
+    static constexpr int kChargeChannel = 3;    // rising one-shot of the charge
+    static constexpr int kCharge2Channel = 4;   // sustained top-of-charge loop
+    static constexpr int kThrustChannel = 5;
+    static constexpr int kMusicChannel = 6;
+    static constexpr int kReserved = 7;
     static constexpr int kChannels = 32;   // plenty of headroom for overlap
     static constexpr int kSfxGroup = 1;    // non-reserved one-shot channels
+    static constexpr int kMusicTracks = 8;
+    static constexpr int kVoices = 64;
 
-    Mix_Chunk* shoot_ = nullptr;
-    Mix_Chunk* inv_hit_ = nullptr;
-    Mix_Chunk* death_ = nullptr;
-    Mix_Chunk* bunker_ = nullptr;
+    Voice voices_[kVoices];
     Mix_Chunk* ufo_ = nullptr;
-    Mix_Chunk* march_[4] = {};
-    Mix_Chunk* wall_ = nullptr;
-    Mix_Chunk* paddle_ = nullptr;
-    Mix_Chunk* brick_hit_ = nullptr;
-    Mix_Chunk* brick_break_ = nullptr;
-    Mix_Chunk* life_lost_ = nullptr;
-    Mix_Chunk* level_clear_ = nullptr;
-    Mix_Chunk* laser_ = nullptr;
-    Mix_Chunk* powerup_ = nullptr;
-    Mix_Chunk* dive_ = nullptr;
     Mix_Chunk* tractor_ = nullptr;
-    Mix_Chunk* capture_ = nullptr;
-    Mix_Chunk* rescue_ = nullptr;
-    Mix_Chunk* boss_expl_ = nullptr;
-    Mix_Chunk* low_energy_ = nullptr;
-    Mix_Chunk* spawn_ = nullptr;
-    Mix_Chunk* ambient_[3] = {};
-    // newer-game / spectacular bank
-    Mix_Chunk* enemy_shot_ = nullptr;
-    Mix_Chunk* zap_ = nullptr;
-    Mix_Chunk* big_expl_ = nullptr;
-    Mix_Chunk* shield_ = nullptr;
-    Mix_Chunk* chirp_[3] = {};
-    Mix_Chunk* warp_ = nullptr;
-    Mix_Chunk* lock_ = nullptr;
-    Mix_Chunk* refill_ = nullptr;
-    Mix_Chunk* beam_ = nullptr;
+    Mix_Chunk* thrust_ = nullptr;
+    Mix_Chunk* charge_rise_ = nullptr;
     Mix_Chunk* charge_loop_ = nullptr;
-    Mix_Chunk* charged_[3] = {};   // charged-blast tiers: small / mid / full
+    Mix_Chunk* ambient_[3] = {};
+    Mix_Chunk* music_[kMusicTracks] = {};   // rendered lazily on first use
 };

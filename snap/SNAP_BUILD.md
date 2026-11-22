@@ -29,7 +29,7 @@ From the `native/` directory (the one containing `snap/`):
 
 ```bash
 cd native
-snapcraft            # builds in an LXD container; produces void-arcade_2.0.0_amd64.snap
+snapcraft            # builds in an LXD container; produces void-arcade_2.1.0_amd64.snap
 ```
 
 Tips:
@@ -40,7 +40,7 @@ Tips:
 ## Install locally (unsigned) and run
 
 ```bash
-sudo snap install void-arcade_2.0.0_amd64.snap --dangerous
+sudo snap install void-arcade_2.1.0_amd64.snap --dangerous
 void-arcade
 ```
 
@@ -68,7 +68,7 @@ $HOME/snap/void-arcade/common/settings.json
 ```bash
 snapcraft login
 snapcraft register void-arcade        # one-time name registration
-snapcraft upload void-arcade_2.0.0_amd64.snap --release=edge
+snapcraft upload void-arcade_2.1.0_amd64.snap --release=edge
 # promote when happy:
 snapcraft release void-arcade <revision> stable
 ```

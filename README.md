@@ -2,7 +2,8 @@
 
 Seven original retro arcade games in one neon **CRT cabinet** — native
 C++17 / SDL2 / OpenGL, with a hand-written phosphor post-processing shader and
-fully procedural sound (no audio files; every sound is synthesised at runtime).
+fully procedural sound and music (no audio files; every effect and every
+chiptune track is synthesised at runtime).
 
 > Threats come from the void. Every game is "Void ___".
 
@@ -27,12 +28,15 @@ bosses, gamepad support, an in-game **Options** screen, and a self-playing
 ## Why it feels native
 
 - **No interpreter** — a single ELF binary: instant startup, no GC stutter.
-- **Vsync-locked** frame pacing from the high-res performance counter.
+- **Vsync-locked** frame pacing from the high-res performance counter, with a
+  250 fps cap as a fallback when vsync is unavailable. Game logic and the
+  afterglow are time-based, so 60, 144 and 240 Hz displays play the same.
 - **Low-latency audio** — SDL2_mixer at 44.1 kHz / 512-sample buffer (~11 ms),
   with a 32-channel mixer (reserved loop channels + steal-oldest) so nothing drops.
 - **Real GL pipeline** — SDL2 makes an OpenGL 3.3 core context and runs the
   `crt.vert`/`crt.frag` shader: barrel warp, chromatic aberration, multi-pass
-  bloom, scanlines, vignette, and phosphor-persistence afterglow.
+  bloom, scanlines, vignette, and phosphor-persistence afterglow — rendered at
+  the window's resolution, so it stays crisp in fullscreen.
 
 ## Build from source
 
@@ -60,6 +64,8 @@ void-arcade
 ```
 
 Saves live in `~/snap/void-arcade/common/`. See `snap/SNAP_BUILD.md` for details.
+(Outside the snap: next to the binary for dev builds, or
+`~/.local/share/void-arcade/` when the install directory is read-only.)
 
 ### Gamepad on the snap
 
@@ -88,22 +94,27 @@ connecting. Keyboard play needs none of this.
 |---|---|
 | Move / Aim / Select | **Arrows** or **A/D** (+ **W/S** in Void Gunner) |
 | Fire / Launch / Confirm | **SPACE** (hold to autofire; hold to charge in Void Storm) |
-| Pause / Mute | **P** / **M** |
+| Pause / Mute | **P** or **ESC** / **M** |
 | Options (at the menu) / Fullscreen | **O** / **F11** |
-| Volume / Back to launcher | **−** **=** / **ESC** |
+| Volume | **−** **=** |
+| Back to launcher | **ESC** → *Quit to menu* (or **ESC** on the game-over screen) |
 
-Per-game extras: **B** (keyboard) detonates a NUKE in Invaders/Squadrons,
-**Q/E** throttle in Void Raid, **DOWN** is hyperspace in Void Drift,
-**SHIFT** charges the paddle SMASH in Void Breaker.
+Per-game extras: **B** detonates a NUKE in Invaders/Squadrons/Raid and launches a
+missile in Void Gunner, **Q/E** throttle and **SHIFT** (hold) Overdrive in Void
+Raid, **DOWN** or **B** is hyperspace in Void Drift, **SHIFT** charges the paddle
+SMASH in Void Breaker. On-screen prompts name the right key for the device in use.
 
-**Gamepad** (SDL_GameController, hot-pluggable): stick / d-pad move, **A/X** fire,
-**Start** pause, shoulders throttle (Void Raid). Rumble on hits/deaths.
+**Gamepad** (SDL_GameController, hot-pluggable): stick / d-pad move and navigate
+menus, **A/X** or right trigger fire, **Y** nuke / missile / hyperspace, **B**
+(hold) Overdrive / SMASH / thrust, **Start** pause (and *menu* on the game-over
+screen), **Back** opens Options from the launcher, shoulders throttle (Void Raid).
+Rumble on hits/deaths.
 
 ## Options screen
 
 Press **O** at the menu for live, persisted sliders: **glow** (bloom intensity),
 **afterglow** (phosphor persistence / motion trails), **scanlines**, **volume**,
-plus a fullscreen toggle. Changes preview in real time and save to `settings.json`.
+**music**, plus a fullscreen toggle. Changes preview in real time and save to `settings.json`.
 
 ## Layout
 
@@ -111,7 +122,8 @@ plus a fullscreen toggle. Changes preview in real time and save to `settings.jso
 src/
   engine/   surface + draw, font (stb_truetype), sprite+glow, crt_renderer,
             sound (procedural, SDL2_mixer), particles, juice, combo, pause,
-            scores/settings (json), boss_art, input, rng
+            scores/settings (json, atomic saves via paths), ui (shared prompts
+            + game-over panel), boss_art, input, rng
   games/    space_invaders, galaga, void_raid, arkanoid,
             void_drift, void_gunner, void_storm  (+ registry)
   launcher.*  carousel game-select with live previews + attract demo
@@ -129,6 +141,8 @@ snap/       snapcraft.yaml + desktop entry + icon
 - `VOID_SHOT=out.png` (+ `VOID_SHOT_AT=<frame>`) — render one frame, dump the
   post-CRT framebuffer (and `out.png.raw.png` pre-shader), then exit.
 - `VOID_BOT=1` — self-play bot (used for balancing / the attract demo).
+- `VOID_SEED=<n>` — pin the random seed (it is otherwise fresh every launch).
+- `VOID_WIN=1920x1080` — initial window size (handy with `VOID_SHOT`).
 - Quick-jump hooks: `VOID_WAVE` / `VOID_STAGE` / `VOID_LEVEL`, `VOID_BOSS` /
   `VOID_GBOSS`, `VOID_WEAPON`, `VOID_DEMO_S` / `VOID_DEMO_GAME`.
 

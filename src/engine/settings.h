@@ -8,6 +8,7 @@ struct Settings {
     float persistence = 0.58f; // CRT phosphor afterglow (motion trails)
     float scanline = 0.18f;    // CRT scanline depth
     int   volume = 100;        // master volume 0..128
+    int   music = 48;          // music volume 0..128 (scaled by master)
     bool  fullscreen = false;
 
     void load();

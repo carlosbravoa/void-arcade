@@ -6,6 +6,9 @@
 #include "input.h"
 #include "surface.h"
 #include "text.h"
+#include "ui.h"
+
+#include <SDL.h>
 
 namespace {
 const Color YELLOW(255, 220, 40), GREEN(80, 255, 80), CYAN(80, 200, 255);
@@ -22,11 +25,15 @@ void InitialsEntry::begin(const std::string& title, int score, int rank) {
     rank_ = rank;
     title_ = title;
     t_ = 0;
+    last_ticks_ = SDL_GetTicks();
 }
 
 bool InitialsEntry::update(const Input& in) {
     if (!active_) return false;
-    t_ += 0.016f;
+    Uint32 now = SDL_GetTicks();
+    t_ += std::min(0.1f, (now - last_ticks_) / 1000.0f);  // real time, any refresh rate
+    last_ticks_ = now;
+    pad_ = in.pad_connected;
     for (auto k : in.pressed) {
         if (k >= SDLK_a && k <= SDLK_z) {
             chars_[cursor_] = char('A' + (k - SDLK_a));
@@ -51,7 +58,7 @@ void InitialsEntry::draw(Surface& s) {
     if (!active_) return;
     int cx = W_ / 2, cy = H_ / 2;
     draw::rect(s, Color(0, 0, 0, 200), {0, 0, W_, H_});
-    int pw = 360, ph = 220, px = cx - pw / 2, py = cy - ph / 2;
+    int pw = 400, ph = 220, px = cx - pw / 2, py = cy - ph / 2;
     draw::rect(s, Color(6, 16, 8, 235), {px, py, pw, ph});
     draw::rect(s, GREEN, {px, py, pw, ph}, 1, 4);
 
@@ -72,5 +79,6 @@ void InitialsEntry::draw(Surface& s) {
             draw::rect(s, YELLOW, {x - 18, py + 150, 36, 4});
     }
     draw_text_centered(s, *f_.small,
-                       "TYPE / ↑↓ LETTER  ◀▶ MOVE  SPACE OK", cx, py + ph - 24, DIM);
+                       pad_ ? "↑↓ LETTER   ◀▶ MOVE   A OK" : "TYPE / ↑↓ LETTER   ◀▶ MOVE   SPACE OK",
+                       cx, py + ph - 24, ui::HINT);
 }

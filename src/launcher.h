@@ -49,6 +49,7 @@ private:
     float  idle_t_ = 0.0f;     // seconds since last input
     float  attract_t_ = 0.0f;  // time on current attract page
     bool   attract_ = false;
+    bool   pad_ = false;       // a gamepad is connected → show pad prompts
     int    attract_game_ = 0;
     std::vector<float> card_anim_;
     std::vector<Star>  stars_;

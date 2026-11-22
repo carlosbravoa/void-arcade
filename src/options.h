@@ -26,4 +26,9 @@ private:
     Settings& settings_;
     int sel_ = 0;
     float t_ = 0.0f;
+    bool  pad_ = false;
+    // Sub-integer accumulator for the volume sliders (an int can't creep by
+    // 90*dt per frame at high refresh rates); vol_row_ says which row owns it.
+    float vol_f_ = 0.0f;
+    int   vol_row_ = -1;
 };

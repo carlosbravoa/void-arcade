@@ -1,7 +1,7 @@
 name: void-arcade
 title: The Void Arcade
 base: core24
-version: '2.0.0'
+version: '2.1.0'
 summary: The Void Arcade — seven retro CRT arcade games in one cabinet
 description: |
   The Void Arcade is a bundle of seven original retro arcade games sharing one
@@ -16,15 +16,17 @@ description: |
     * Void Gunner     — first-person rail shooter with a radar and laser energy
     * Void Storm      — R-Type-style side-scroller with a chargeable beam
 
-  Native C++/SDL2/OpenGL with a hand-written CRT shader, gamepad support, an
-  in-game Options screen (tune glow / afterglow / scanlines / volume), and a
-  self-playing attract demo.
+  Native C++/SDL2/OpenGL with a hand-written CRT shader rendered at your
+  display's resolution, a procedural chiptune soundtrack, full gamepad support,
+  an in-game Options screen (glow / afterglow / scanlines / volume / music),
+  and a self-playing attract demo.
 
   Controls:
     Arrows / A,D    Move / Aim / Select
     SPACE           Fire / Launch / Confirm
     P  Pause    M  Mute    O  Options    F11  Fullscreen
     ESC             Back to launcher
+    Gamepad: stick / d-pad, A fire, Y bomb, B special, Start pause, Back options
 
   Gamepad: keyboard works out of the box. For controller support, connect the
   joystick interface once after installing:
@@ -42,6 +44,7 @@ confinement: strict
 
 platforms:
   amd64:
+  arm64:
 
 apps:
   void-arcade:

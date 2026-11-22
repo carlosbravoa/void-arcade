@@ -15,6 +15,7 @@ struct Input {
     const Uint8* state = nullptr;        // SDL_GetKeyboardState, by scancode
     std::vector<SDL_Keycode> pressed;    // KEYDOWN / button-down this frame
     bool pad[PadCount] = {};             // held gamepad state for this frame
+    bool pad_connected = false;          // a gamepad is open → show pad prompts
 
     bool down(SDL_Keycode k) const {
         if (state && state[SDL_GetScancodeFromKey(k)]) return true;

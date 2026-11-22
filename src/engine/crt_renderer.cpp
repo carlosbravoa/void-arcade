@@ -1,5 +1,7 @@
 #include "crt_renderer.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -43,6 +45,21 @@ in vec2 uv;
 out vec4 fragColor;
 void main() { fragColor = vec4(texture(tex, uv).rgb, 1.0); }
 )";
+
+// Fallback when the CRT shader is unavailable: show the raw game surface
+// (Y-flipped: the surface is top-left origin) so the game is still playable.
+const char* kPlainVert = R"(#version 330 core
+layout(location = 0) in vec2 in_pos;
+layout(location = 1) in vec2 in_uv;
+out vec2 uv;
+void main() { uv = in_uv; gl_Position = vec4(in_pos, 0.0, 1.0); }
+)";
+const char* kPlainFrag = R"(#version 330 core
+uniform sampler2D tex;
+in vec2 uv;
+out vec4 fragColor;
+void main() { fragColor = vec4(texture(tex, vec2(uv.x, 1.0 - uv.y)).rgb, 1.0); }
+)";
 }  // namespace
 
 CRTRenderer::CRTRenderer(int w, int h, const std::string& shader_dir)
@@ -52,6 +69,7 @@ CRTRenderer::CRTRenderer(int w, int h, const std::string& shader_dir)
         std::printf("[CRT] GL CRT shader + phosphor persistence active.\n");
     } else {
         std::printf("[CRT] Shader init failed — running without CRT shader.\n");
+        build_plain();
     }
 }
 
@@ -94,11 +112,11 @@ GLuint CRTRenderer::link(const std::string& vsrc, const std::string& fsrc,
     return prog;
 }
 
-GLuint CRTRenderer::make_tex(bool nearest) {
+GLuint CRTRenderer::make_tex(bool nearest, int w, int h) {
     GLuint t;
     glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
                  GL_UNSIGNED_BYTE, nullptr);
     GLint f = nearest ? GL_NEAREST : GL_LINEAR;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
@@ -121,18 +139,8 @@ GLuint CRTRenderer::make_fbo(GLuint tex) {
     return fbo;
 }
 
-bool CRTRenderer::build(const std::string& shader_dir) {
-    std::string vsrc = read_file(shader_dir + "/crt.vert");
-    std::string fsrc = read_file(shader_dir + "/crt.frag");
-    if (vsrc.empty() || fsrc.empty()) {
-        std::fprintf(stderr, "[CRT] missing shader files in %s\n", shader_dir.c_str());
-        return false;
-    }
-    prog_crt_ = link(vsrc, fsrc, "crt");
-    prog_combine_ = link(vsrc, kCombineFrag, "combine");
-    prog_present_ = link(vsrc, kPresentFrag, "present");
-    if (!prog_crt_ || !prog_combine_ || !prog_present_) return false;
-
+void CRTRenderer::make_quad() {
+    if (vao_) return;
     glGenVertexArrays(1, &vao_);
     glBindVertexArray(vao_);
     glGenBuffers(1, &vbo_);
@@ -144,17 +152,44 @@ bool CRTRenderer::build(const std::string& shader_dir) {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
                           (void*)(2 * sizeof(float)));
     glBindVertexArray(0);
+}
 
-    tex_src_ = make_tex(true);  // game upload, nearest like the original
-    tex_scene_ = make_tex(false);
-    tex_accum_[0] = make_tex(false);
-    tex_accum_[1] = make_tex(false);
+void CRTRenderer::build_plain() {
+    prog_plain_ = link(kPlainVert, kPlainFrag, "plain");
+    if (!prog_plain_) return;
+    make_quad();
+    if (!tex_src_) tex_src_ = make_tex(false, w_, h_);
+    u_plain_tex_ = glGetUniformLocation(prog_plain_, "tex");
+}
+
+bool CRTRenderer::build(const std::string& shader_dir) {
+    std::string vsrc = read_file(shader_dir + "/crt.vert");
+    std::string fsrc = read_file(shader_dir + "/crt.frag");
+    if (vsrc.empty() || fsrc.empty()) {
+        std::fprintf(stderr, "[CRT] missing shader files in %s\n", shader_dir.c_str());
+        return false;
+    }
+    prog_crt_ = link(vsrc, fsrc, "crt");
+    prog_combine_ = link(vsrc, kCombineFrag, "combine");
+    prog_present_ = link(vsrc, kPresentFrag, "present");
+    if (!prog_crt_ || !prog_combine_ || !prog_present_) return false;
+    out_w_ = w_; out_h_ = h_;
+
+    make_quad();
+
+    // The game surface is sampled with a sharp-bilinear kernel in the shader
+    // (crisp texels, smooth edges), which needs LINEAR filtering here.
+    tex_src_ = make_tex(false, w_, h_);
+    tex_scene_ = make_tex(false, out_w_, out_h_);
+    tex_accum_[0] = make_tex(false, out_w_, out_h_);
+    tex_accum_[1] = make_tex(false, out_w_, out_h_);
     fbo_scene_ = make_fbo(tex_scene_);
     fbo_accum_[0] = make_fbo(tex_accum_[0]);
     fbo_accum_[1] = make_fbo(tex_accum_[1]);
 
     u_crt_time_ = glGetUniformLocation(prog_crt_, "time");
     u_crt_res_  = glGetUniformLocation(prog_crt_, "resolution");
+    u_crt_out_  = glGetUniformLocation(prog_crt_, "out_resolution");
     u_crt_tex_  = glGetUniformLocation(prog_crt_, "screen_texture");
     u_crt_hue_     = glGetUniformLocation(prog_crt_, "hue");
     u_crt_shock_   = glGetUniformLocation(prog_crt_, "shock");
@@ -172,11 +207,38 @@ bool CRTRenderer::build(const std::string& shader_dir) {
 void CRTRenderer::present(const Surface& surf, float dt, int win_w, int win_h,
                           int vx, int vy, int vw, int vh) {
     time_ += dt;
+    if (time_ > 3600.0f) time_ -= 3600.0f;  // keep float precision for the flicker
     if (!enabled_) {
         glViewport(0, 0, win_w, win_h);
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
+        if (!prog_plain_) return;
+        glDisable(GL_BLEND);
+        glBindVertexArray(vao_);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_src_);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w_, h_, GL_RGBA, GL_UNSIGNED_BYTE,
+                        surf.data());
+        glViewport(vx, vy, vw, vh);
+        glUseProgram(prog_plain_);
+        glUniform1i(u_plain_tex_, 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(0);
         return;
+    }
+
+    // Run the CRT passes at the size the image is actually shown at, so
+    // scanlines, curvature and bloom stay crisp in a big window or fullscreen
+    // instead of being a 900x720 image stretched afterwards.
+    int ow = std::clamp(vw, 16, 8192), oh = std::clamp(vh, 16, 8192);
+    if (ow != out_w_ || oh != out_h_) {
+        out_w_ = ow; out_h_ = oh;
+        for (GLuint t : {tex_scene_, tex_accum_[0], tex_accum_[1]}) {
+            glBindTexture(GL_TEXTURE_2D, t);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, out_w_, out_h_, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
+        }
+        accum_primed_ = false;  // old trails are the wrong size — start clean
     }
 
     glDisable(GL_BLEND);
@@ -189,13 +251,14 @@ void CRTRenderer::present(const Surface& surf, float dt, int win_w, int win_h,
 
     // Pass 1 — CRT effects into the scene FBO.
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
-    glViewport(0, 0, w_, h_);
+    glViewport(0, 0, out_w_, out_h_);
     glUseProgram(prog_crt_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_src_);
     glUniform1i(u_crt_tex_, 0);
     glUniform1f(u_crt_time_, time_);
     glUniform2f(u_crt_res_, float(w_), float(h_));
+    glUniform2f(u_crt_out_, float(out_w_), float(out_h_));
     glUniform1f(u_crt_hue_, hue_);
     glUniform1f(u_crt_glow_, glow_);
     glUniform1f(u_crt_scan_, scanline_);
@@ -222,7 +285,7 @@ void CRTRenderer::present(const Surface& surf, float dt, int win_w, int win_h,
 
     // Pass 2 — accumulate persistence: accum = max(scene, prev*persistence).
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_accum_[cur]);
-    glViewport(0, 0, w_, h_);
+    glViewport(0, 0, out_w_, out_h_);
     glUseProgram(prog_combine_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_scene_);
@@ -230,7 +293,10 @@ void CRTRenderer::present(const Surface& surf, float dt, int win_w, int win_h,
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_accum_[prev]);
     glUniform1i(u_comb_prev_, 1);
-    glUniform1f(u_comb_persist_, accum_primed_ ? persistence_ : 0.0f);
+    // `persistence_` is the fraction of light kept per 1/60 s; convert to this
+    // frame's dt so trails are the same length at 60, 144 or 240 Hz.
+    float keep = persistence_ > 0.0f ? std::pow(persistence_, dt * 60.0f) : 0.0f;
+    glUniform1f(u_comb_persist_, accum_primed_ ? keep : 0.0f);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     accum_primed_ = true;
 
@@ -261,4 +327,5 @@ CRTRenderer::~CRTRenderer() {
     if (prog_crt_) glDeleteProgram(prog_crt_);
     if (prog_combine_) glDeleteProgram(prog_combine_);
     if (prog_present_) glDeleteProgram(prog_present_);
+    if (prog_plain_) glDeleteProgram(prog_plain_);
 }

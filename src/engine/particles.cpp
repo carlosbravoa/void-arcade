@@ -9,35 +9,56 @@
 namespace {
 constexpr float TAU = 6.28318530717958647692f;
 
-// Additive pixel: particles emit light, so they accumulate rather than alpha
-// over — this makes explosions blow out and bloom hard through the CRT shader.
-void add_at(Surface& s, int x, int y, Color c) {
+// Additive filled rect: particles emit light, so they accumulate rather than
+// alpha over — this makes explosions blow out and bloom hard through the CRT
+// shader. The rect is clipped ONCE and then written straight into the pixel
+// rows (no per-pixel bounds checks).
+void add_rect(Surface& s, int x0, int y0, int w, int h, Color c) {
     if (c.a == 0) return;
-    Color d = s.get_at(x, y);
-    float a = c.a / 255.0f;
-    s.set_at(x, y, Color(std::min(255, d.r + int(c.r * a)),
-                         std::min(255, d.g + int(c.g * a)),
-                         std::min(255, d.b + int(c.b * a)), 255));
+    int x1 = std::min(s.width(), x0 + w), y1 = std::min(s.height(), y0 + h);
+    x0 = std::max(0, x0); y0 = std::max(0, y0);
+    if (x0 >= x1 || y0 >= y1) return;
+    int ar = c.r * c.a / 255, ag = c.g * c.a / 255, ab = c.b * c.a / 255;
+    uint8_t* base = s.data();
+    int stride = s.width() * 4;
+    for (int y = y0; y < y1; ++y) {
+        uint8_t* p = base + size_t(y) * stride + size_t(x0) * 4;
+        for (int x = x0; x < x1; ++x, p += 4) {
+            p[0] = uint8_t(std::min(255, p[0] + ar));
+            p[1] = uint8_t(std::min(255, p[1] + ag));
+            p[2] = uint8_t(std::min(255, p[2] + ab));
+            p[3] = 255;
+        }
+    }
 }
 
 void blit_pixel(Surface& s, Color color, int x, int y, int sz, bool pixel) {
     if (sz <= 0) return;
     if (pixel) {
-        int x0 = x - sz / 2, y0 = y - sz / 2;
-        for (int yy = 0; yy < sz; ++yy)
-            for (int xx = 0; xx < sz; ++xx) add_at(s, x0 + xx, y0 + yy, color);
+        add_rect(s, x - sz / 2, y - sz / 2, sz, sz, color);
     } else {
-        for (int dy = -sz; dy <= sz; ++dy)
-            for (int dx = -sz; dx <= sz; ++dx)
-                if (dx * dx + dy * dy <= sz * sz) add_at(s, x + dx, y + dy, color);
+        // disc: one clipped span per row
+        for (int dy = -sz; dy <= sz; ++dy) {
+            int half = int(std::sqrt(float(sz * sz - dy * dy)));
+            add_rect(s, x - half, y + dy, 2 * half + 1, 1, color);
+        }
     }
 }
 }  // namespace
 
 void Particle::update(float dt) {
     if (trail_len > 0) {
-        trail.emplace_back(x, y);
-        if ((int)trail.size() > trail_len) trail.erase(trail.begin());
+        trail_t += dt;
+        int cap = std::min(trail_len, kTrailMax);
+        // at most one sample per update: a long frame must not smear the trail
+        if (trail_t >= kTrailStep) {
+            trail_t = std::fmod(trail_t, kTrailStep);
+            if (trail_n >= cap) {
+                for (int i = 1; i < trail_n; ++i) trail[i - 1] = trail[i];
+                trail_n = cap - 1;
+            }
+            trail[trail_n++] = {x, y};
+        }
     }
     x += vx * dt;
     y += vy * dt;
@@ -48,19 +69,24 @@ void Particle::update(float dt) {
 void Particle::draw(Surface& s) const {
     if (!alive()) return;
     Color base = lerp_color(color, end_color, std::min(t(), 1.0f));
-    int alpha = int(255 * std::max(0.0f, life / max_life));
+    int alpha = int(255 * std::clamp(life / max_life, 0.0f, 1.0f));
     int sz = std::max(1, int(size * (1.0f - t() * 0.6f)));
-    if (trail_len > 0 && !trail.empty()) {
-        for (size_t i = 0; i < trail.size(); ++i) {
-            float trail_t = float(i) / std::max<size_t>(1, trail.size());
-            int trail_a = int(alpha * trail_t * 0.4f);
-            int trail_sz = std::max(1, int(sz * trail_t));
-            Color tc = lerp_color(color, end_color, trail_t);
+    // whole particle (head + trail) off-screen? skip it in one test
+    const float m = float(sz) + 2.0f;
+    bool head_on = x > -m && y > -m && x < s.width() + m && y < s.height() + m;
+    if (trail_n > 0) {
+        for (int i = 0; i < trail_n; ++i) {
+            float trail_t01 = float(i) / trail_n;
+            int trail_a = int(alpha * trail_t01 * 0.4f);
+            if (trail_a <= 0) continue;
+            int trail_sz = std::max(1, int(sz * trail_t01));
+            Color tc = lerp_color(color, end_color, trail_t01);
             tc.a = uint8_t(trail_a);
             blit_pixel(s, tc, int(trail[i].first), int(trail[i].second),
                        trail_sz, pixel);
         }
     }
+    if (!head_on) return;
     Color c = base;
     c.a = uint8_t(alpha);
     blit_pixel(s, c, int(x), int(y), sz, pixel);
@@ -71,11 +97,18 @@ void ParticleSystem::update(float dt) {
         std::remove_if(particles_.begin(), particles_.end(),
                        [](const Particle& p) { return !p.alive(); }),
         particles_.end());
+    recycle_ = 0;   // after compaction the oldest survivors are at the front again
     for (auto& p : particles_) p.update(dt);
 }
 
 void ParticleSystem::draw(Surface& s) const {
     for (auto& p : particles_) p.draw(s);
+}
+
+void ParticleSystem::add(const Particle& p) {
+    if (particles_.size() < kMaxParticles) { particles_.push_back(p); return; }
+    particles_[recycle_] = p;                    // full: replace the oldest
+    recycle_ = (recycle_ + 1) % kMaxParticles;
 }
 
 static Particle mk(float x, float y, float vx, float vy, float life, Color c,
@@ -86,7 +119,7 @@ static Particle mk(float x, float y, float vx, float vy, float life, Color c,
     p.life = p.max_life = life;
     p.color = c; p.end_color = end;
     p.size = size; p.gravity = gravity; p.pixel = pixel;
-    p.trail_len = trail_len;
+    p.trail_len = std::clamp(trail_len, 0, Particle::kTrailMax);
     return p;
 }
 

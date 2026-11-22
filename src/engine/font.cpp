@@ -90,7 +90,9 @@ std::shared_ptr<Surface> Font::render(const std::string& text, Color color) {
                 if (!cov) continue;
                 int px = pen + g.xoff + xx;
                 int py = baseline_ + g.yoff + yy;
-                surf->set_at(px, py, Color(color.r, color.g, color.b, cov));
+                // Honour the colour's own alpha so callers can fade text.
+                int a = color.a == 255 ? cov : cov * color.a / 255;
+                surf->set_at(px, py, Color(color.r, color.g, color.b, a));
             }
         }
         pen += g.advance;

@@ -34,11 +34,12 @@
 #include "engine/surface.h"
 #include "engine/telemetry.h"
 #include "engine/text.h"
+#include "engine/ui.h"
 
 namespace {
 const Color BLACK(0, 0, 0), WHITE(255, 255, 255), GREEN(80, 255, 80);
 const Color CYAN(80, 220, 255), RED(255, 60, 60), YELLOW(255, 220, 40);
-const Color DIM(40, 80, 40), ORANGE(255, 140, 40), GOLD(255, 200, 60);
+const Color ORANGE(255, 140, 40), GOLD(255, 200, 60);
 const Color PURPLE(190, 110, 255), ROCK(150, 235, 180);
 constexpr float PI = 3.14159265358979323846f;
 constexpr float TAU = 6.28318530717958647692f;
@@ -148,9 +149,11 @@ struct Bullet {
     bool alive = true;
     bool enemy = false;
     int power = 1;          // 1 = normal; 2..4 = charged shot (bigger + more damage)
+    float sdx = 0, sdy = 0; // last movement step (pre-wrap) — lets hits be swept
     void update(float dt, int sw, int sh) {
-        x = wrapf(x + vx * dt, (float)sw);
-        y = wrapf(y + vy * dt, (float)sh);
+        sdx = vx * dt; sdy = vy * dt;
+        x = wrapf(x + sdx, (float)sw);
+        y = wrapf(y + sdy, (float)sh);
         life -= dt;
         if (life <= 0) alive = false;
     }
@@ -205,9 +208,25 @@ struct Rock {
         }
         return p;
     }
-    void draw(Surface& s) const {
+    // Drawn again on the far side when it straddles a screen edge, so the part
+    // that wraps (and collides) is always visible.
+    void draw(Surface& s, int sw, int sh) const {
         if (!alive) return;
-        draw_wire(s, poly(), color, size == 3 ? 6 : size == 2 ? 5 : 4);
+        auto p = poly();
+        int glow = size == 3 ? 6 : size == 2 ? 5 : 4;
+        float m = radius + 8;
+        int ox[2] = {0, x < m ? sw : x > sw - m ? -sw : 0};
+        int oy[2] = {0, y < m ? sh : y > sh - m ? -sh : 0};
+        for (int i = 0; i < 2; ++i) {
+            if (i == 1 && ox[1] == 0) continue;
+            for (int j = 0; j < 2; ++j) {
+                if (j == 1 && oy[1] == 0) continue;
+                if (ox[i] == 0 && oy[j] == 0) { draw_wire(s, p, color, glow); continue; }
+                auto q = p;
+                for (auto& v : q) { v.first += ox[i]; v.second += oy[j]; }
+                draw_wire(s, q, color, glow);
+            }
+        }
     }
 };
 
@@ -261,9 +280,20 @@ struct Ship {
         };
         return {pt(16, 0), pt(-11, -10), pt(-6, 0), pt(-11, 10)};
     }
-    void draw(Surface& s) const {
+    // Draw, plus a second copy across the seam when the hull straddles an edge.
+    void draw(Surface& s, int sw, int sh) const {
         if (!alive) return;
         if (invincible > 0 && int(invincible * 10) % 2 == 0) return;
+        draw_one(s);
+        const float m = 30.0f;
+        float ox = x < m ? (float)sw : x > sw - m ? -(float)sw : 0.0f;
+        float oy = y < m ? (float)sh : y > sh - m ? -(float)sh : 0.0f;
+        auto ghost = [&](float dx, float dy) { Ship c = *this; c.x += dx; c.y += dy; c.draw_one(s); };
+        if (ox != 0) ghost(ox, 0);
+        if (oy != 0) ghost(0, oy);
+        if (ox != 0 && oy != 0) ghost(ox, oy);
+    }
+    void draw_one(Surface& s) const {
         // flame first (under the hull)
         if (flame > 0.05f) {
             float c = std::cos(ang), s_ = std::sin(ang);
@@ -308,7 +338,7 @@ struct Saucer {
                 dir = rnd01() < 0.5f ? 1 : -1;
                 small = wave >= 3 && rnd01() < std::min(0.55f, 0.2f + wave * 0.04f);
                 radius = small ? 13 : 20;
-                max_hp = hp = 4 + wave;   // 5 on wave 1, one more each wave
+                max_hp = hp = std::min(12, 4 + wave);   // 5 on wave 1, +1 per wave, capped
                 x = dir == 1 ? -radius : sw + radius;
                 y = rnd_uniform(60, sh - 120);
                 vx = dir * (small ? 130.0f : 95.0f);
@@ -323,7 +353,7 @@ struct Saucer {
         x += vx * dt;
         y += vy * dt;
         // occasional vertical jink to feel alive
-        if (rnd01() < 0.012f) vy = rnd_uniform(-60, 60);
+        if (rnd01() < 0.72f * dt) vy = rnd_uniform(-60, 60);   // ~0.7 jinks/s at any fps
         y = std::clamp(y, 40.0f, sh - 80.0f);
         fire_t -= dt;
         if (fire_t <= 0) {
@@ -343,7 +373,8 @@ struct Saucer {
         if (x < -radius * 2 || x > sw + radius * 2) { reset_idle(); }
         return false;
     }
-    int points() const { return small ? 200 : 100; }
+    // tougher (later-wave) saucers pay more, so the armour is worth chewing through
+    int points() const { return (small ? 200 : 100) + 25 * std::max(0, max_hp - 5); }
     void draw(Surface& s) const {
         if (!active) return;
         const SaucerSprite& sp = saucer_sprite(small);
@@ -410,6 +441,7 @@ struct VoidBoss {
     float die_t = 0, enter_t = 1.8f, atk_t = 0, telegraph = 0, sub_t = 0, spin = 0;
     int phase = 1, cur_attack = -1, pending = -1;
     static constexpr float DEATH_DUR = 1.6f;
+    static constexpr float PARK_Y = 112.0f;   // rests BELOW the HUD rows (score / name / HP bar)
 
     VoidBoss(int wave, int sw) {
         int tier = wave / 5;            // 1,2,3,...
@@ -453,13 +485,13 @@ struct VoidBoss {
         if (hit_flash > 0) hit_flash -= dt * 6;
         if (entering) {
             enter_t -= dt;
-            y += 70 * dt;
-            if (enter_t <= 0 && y >= 30) { y = 30; entering = false; }
+            y += 115 * dt;
+            if (y >= PARK_Y) { y = PARK_Y; entering = false; }
             return;
         }
         if (dying) {
             die_t += dt;
-            if (rnd01() < 0.6f)
+            if (!finished && rnd01() < 36.0f * dt)
                 parts.ufo_explode(x + rnd_uniform(0, w), y + rnd_uniform(0, h), 10);
             if (die_t >= DEATH_DUR) finished = true;
             return;
@@ -535,9 +567,9 @@ enum class PU { Spread, Rapid, Shield, Life };
 struct PUInfo { const char* label; Color color; };
 PUInfo pu_info(PU k) {
     switch (k) {
-        case PU::Spread: return {"3", ORANGE};
-        case PU::Rapid:  return {"R", YELLOW};
-        case PU::Shield: return {"O", CYAN};
+        case PU::Spread: return {"x3", ORANGE};
+        case PU::Rapid:  return {"RF", YELLOW};
+        case PU::Shield: return {"SH", CYAN};
         default:         return {"+1", WHITE};
     }
 }
@@ -573,7 +605,11 @@ bool overlap(Rect a, Rect b) {
     return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
+
 enum class St { Intro, Play, Dead, Win, GameOver };
+
+// A short-lived exhaust spark thrown out behind the ship while thrusting.
+struct Spark { float x, y, vx, vy, life, max_life; };
 
 // ── Game ─────────────────────────────────────────────────────────────────────
 class VoidDriftGame : public Scene {
@@ -588,13 +624,13 @@ public:
     void draw(Surface& s) override;
     void on_exit() override {
         submit_scores();
-        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->stop_ambient(); ctx_.sfx->stop_charge(); }
-        charge_snd_ = false;
+        silence_loops();
+        if (ctx_.sfx) ctx_.sfx->stop_ambient();
     }
 
 private:
     static constexpr float AMBIENT_STAR_T = 0.18f;
-    static constexpr int MAX_BULLETS = 5;
+    static constexpr int MAX_VOLLEYS = 5;          // shots on screen, counted per volley
     PauseMenu pause_;
     InitialsEntry initials_;
     bool entry_started_ = false;
@@ -610,20 +646,26 @@ private:
     std::unique_ptr<Saucer> saucer_;
     std::unique_ptr<VoidBoss> boss_;
     std::vector<PowerUp> powerups_;
+    std::vector<Spark> sparks_;
     St state_ = St::Intro;
-    float dead_t_ = 0, win_t_ = 0, intro_t_ = 0;
+    float dead_t_ = 0, win_t_ = 0, intro_t_ = 0, go_t_ = 0;
     bool boss_wave_ = false;
     std::vector<Flash> flash_;
-    bool submitted_ = false;
+    bool submitted_ = false, new_hi_ = false;
+    bool pad_ = false;              // a gamepad is connected → show pad prompts
 
     // weapon state (persists the run; reset on death like space_invaders)
     int w_spread_ = 0, w_rapid_ = 0;
     float shield_ = 0;
     float hyper_cd_ = 0;
-    // charge-shot state (hold fire to build a 2x–4x shot; rising hum like Storm)
-    float fire_hold_t_ = 0, charge_ = 0;
-    bool charging_ = false, charge_snd_ = false;
-    static constexpr float CHARGE_DELAY = 0.15f;   // hold this long before charging starts
+    static constexpr float HYPER_CD = 1.2f;
+    // Fire: a press shoots at once; HOLDING past CHARGE_DELAY builds a 2x–4x shot
+    // released when you let go (rising hum like Storm).
+    float fire_hold_t_ = 0, charge_ = 0, fire_buf_ = 0, exhaust_acc_ = 0;
+    bool charging_ = false, charge_snd_ = false, fire_prev_ = false;
+    bool ufo_on_ = false, thrust_on_ = false;       // looping-sound state
+    static constexpr float CHARGE_DELAY = 0.35f;    // hold this long before charging starts
+    static constexpr float CHARGE_MIN = 0.15f;      // below this a release just cancels
 
     bool bot_ = false;
     float game_t_ = 0;
@@ -631,14 +673,34 @@ private:
     void tele(const J& j) { if (ctx_.tele) ctx_.tele->event(j); }
     void bot_decide(float& turn, bool& thrust, bool& fire, bool& hyper);
 
+    void reset_charge() {
+        fire_hold_t_ = 0; charge_ = 0; charging_ = false;
+        if (charge_snd_ && ctx_.sfx) ctx_.sfx->stop_charge();
+        charge_snd_ = false;
+    }
+    // Stop every looping sound this game owns (pause, death screen, exit).
+    void silence_loops() {
+        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->stop_charge(); ctx_.sfx->stop_thrust(); }
+        ufo_on_ = charge_snd_ = thrust_on_ = false;
+    }
+
     void new_game() {
         score_ = 0; wave_ = 0;
-        entry_started_ = false; submitted_ = false;
+        entry_started_ = false; submitted_ = false; new_hi_ = false; go_t_ = 0;
         w_spread_ = w_rapid_ = 0; shield_ = 0; hyper_cd_ = 0;
+        fire_buf_ = 0; fire_prev_ = false; exhaust_acc_ = 0;
+        silence_loops();
+        reset_charge();
         ship_ = std::make_unique<Ship>(ctx_.W / 2, ctx_.H / 2);
+        saucer_ = std::make_unique<Saucer>(1);
+        boss_.reset();
+        rocks_.clear(); rock_spawn_.clear();
+        bullets_.clear(); enemy_bullets_.clear(); powerups_.clear(); sparks_.clear();
         particles_.clear();
         flash_.clear();
+        if (ctx_.combo) ctx_.combo->reset();
         bot_ = std::getenv("VOID_BOT") != nullptr || ctx_.demo;
+        if (ctx_.sfx && !ctx_.demo) ctx_.sfx->start_music(4);
         int start = 1;
         if (const char* e = std::getenv("VOID_WAVE")) start = std::max(1, atoi(e));
         start_wave(start);
@@ -646,24 +708,32 @@ private:
 
     void spawn_wave_rocks(int n, float speed_scale) {
         for (int i = 0; i < n; ++i) {
-            // spawn on edges, away from the ship's centre
-            float px, py;
-            if (rnd01() < 0.5f) { px = rnd01() < 0.5f ? 0 : (float)ctx_.W; py = rnd_uniform(0, ctx_.H); }
-            else { px = rnd_uniform(0, ctx_.W); py = rnd01() < 0.5f ? 0 : (float)ctx_.H; }
+            // Spawn on the edges, but never near the ship — it may be anywhere now
+            // that you keep flying between waves.
+            float px = 0, py = 0;
+            for (int tries = 0; tries < 24; ++tries) {
+                if (rnd01() < 0.5f) { px = rnd01() < 0.5f ? 0 : (float)ctx_.W; py = rnd_uniform(0, ctx_.H); }
+                else { px = rnd_uniform(0, ctx_.W); py = rnd01() < 0.5f ? 0 : (float)ctx_.H; }
+                float d = std::hypot(wrap_delta(ship_->x, px, (float)ctx_.W),
+                                     wrap_delta(ship_->y, py, (float)ctx_.H));
+                if (d >= 240.0f) break;
+            }
             rocks_.emplace_back(px, py, 3, speed_scale);
         }
     }
 
+    // The field is never wiped here: your shots, loose power-ups and the saucer
+    // carry over, and you keep flying while the banner shows.
     void start_wave(int w) {
         wave_ = w;
         boss_wave_ = (w % 5 == 0);
-        rocks_.clear();
-        bullets_.clear(); enemy_bullets_.clear(); powerups_.clear();
-        saucer_ = std::make_unique<Saucer>(w);
-        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->start_ambient(0); }
+        enemy_bullets_.clear();
+        saucer_->wave = w;
+        if (ctx_.sfx) ctx_.sfx->start_ambient(0);
         if (boss_wave_) {
             boss_ = std::make_unique<VoidBoss>(w, ctx_.W);
             spawn_wave_rocks(2 + w / 10, 0.9f);   // a few rocks to dodge while fighting
+            if (ctx_.sfx) ctx_.sfx->boss_alarm();
         } else {
             boss_.reset();
             float speed_scale = 1.0f + (w - 1) * 0.08f;
@@ -675,6 +745,8 @@ private:
             ctx_.fx->palette_hue = 0.18f * std::sin(w * 0.5f) + (boss_wave_ ? -0.12f : 0.0f);
         state_ = St::Intro;
         intro_t_ = 1.8f;
+        // brief grace while the new rocks drift in
+        if (ship_->alive) ship_->invincible = std::max(ship_->invincible, intro_t_ + 0.8f);
         tele(J().add("ev", "wave_start").add("wave", wave_).add("boss", boss_wave_ ? 1 : 0)
                 .add("t", (double)game_t_).add("lives", ship_->lives));
     }
@@ -690,17 +762,31 @@ private:
         tele(J().add("ev", "game_over").add("wave", wave_).add("score", score_)
                 .add("t", (double)game_t_));
         if (ctx_.scores) {
-            bool hi = ctx_.scores->submit_void_drift(score_, wave_);
-            if (hi) add_flash("NEW HI-SCORE!", ctx_.W / 2, ctx_.H / 2 - 40, YELLOW, 2.5f);
+            new_hi_ = ctx_.scores->submit_void_drift(score_, wave_);
             high_score_ = ctx_.scores->high_score("void_drift");
         }
     }
+    void enter_game_over() {
+        state_ = St::GameOver; go_t_ = 0;
+        silence_loops();
+        reset_charge();
+        bullets_.clear(); enemy_bullets_.clear();
+        submit_scores();
+        if (ctx_.sfx && !bot_) ctx_.sfx->game_over();
+    }
 
-    void fire(int power = 1, float charge = 0.0f) {
-        if (!ship_->alive || ship_->fire_cd > 0) return;
-        if ((int)bullets_.size() >= MAX_BULLETS + w_spread_ * 2) return;
-        ship_->fire_cd = std::max(0.12f, 0.30f - w_rapid_ * 0.05f);
+    // A normal shot respects the cooldown and the on-screen cap (counted in
+    // volleys, so tri-shot never lowers your rate of fire). A charged shot
+    // always leaves the barrel — you paid for it by holding.
+    bool fire(int power = 1, float charge = 0.0f) {
+        if (!ship_->alive) return false;
         bool charged = power > 1;
+        if (!charged) {
+            if (ship_->fire_cd > 0) return false;
+            int volley = 1 + 2 * w_spread_;
+            if ((int)bullets_.size() + volley > MAX_VOLLEYS * volley) return false;
+        }
+        ship_->fire_cd = std::max(0.12f, 0.30f - w_rapid_ * 0.05f);
         auto h = ship_->hull();
         float tx = (float)h[0].first, ty = (float)h[0].second;
         Color col = charged ? Color(120, 225, 255) : GOLD;   // charged = hot cyan
@@ -722,28 +808,44 @@ private:
             else ctx_.sfx->shoot();
         }
         if (charged && ctx_.fx) ctx_.fx->shake(2 + int(3 * charge));
+        return true;
+    }
+
+    // Is (x,y) a safe place to rematerialise? Checks everything that can kill.
+    bool spot_clear(float x, float y) const {
+        float W = (float)ctx_.W, H = (float)ctx_.H;
+        auto dist = [&](float ox, float oy) {
+            return std::hypot(wrap_delta(x, ox, W), wrap_delta(y, oy, H));
+        };
+        for (auto& r : rocks_)
+            if (r.alive && dist(r.x, r.y) < r.radius + ship_->radius + 30) return false;
+        for (auto& r : rock_spawn_)
+            if (dist(r.x, r.y) < r.radius + ship_->radius + 30) return false;
+        for (auto& b : enemy_bullets_)
+            if (b.alive && dist(b.x, b.y) < 60) return false;
+        if (saucer_->active && dist(saucer_->x, saucer_->y) < saucer_->radius + 70) return false;
+        if (boss_ && !boss_->dying) {
+            const float m = 50;
+            if (x > boss_->x - m && x < boss_->x + boss_->w + m &&
+                y > boss_->y - m && y < boss_->y + boss_->h + m) return false;
+        }
+        return true;
     }
 
     void hyperspace() {
         if (!ship_->alive || hyper_cd_ > 0) return;
-        hyper_cd_ = 1.2f;
-        auto [cx, cy] = std::pair<int, int>{int(ship_->x), int(ship_->y)};
-        particles_.ufo_explode((float)cx, (float)cy, 14);
-        // Rematerialise somewhere CLEAR — re-roll a few times to avoid landing in a
-        // rock. (No more classic self-destruct: hyperspace must never auto-kill you.)
-        for (int tries = 0; tries < 10; ++tries) {
+        hyper_cd_ = HYPER_CD;
+        particles_.ufo_explode(ship_->x, ship_->y, 14);
+        // Rematerialise somewhere CLEAR of rocks, shots, the saucer and the boss —
+        // re-roll until one is found. (No classic self-destruct: hyperspace must
+        // never auto-kill you.)
+        for (int tries = 0; tries < 30; ++tries) {
             ship_->x = rnd_uniform(60, ctx_.W - 60);
             ship_->y = rnd_uniform(60, ctx_.H - 60);
-            bool clear = true;
-            for (auto& r : rocks_) {
-                float d = std::hypot(wrap_delta(ship_->x, r.x, (float)ctx_.W),
-                                     wrap_delta(ship_->y, r.y, (float)ctx_.H));
-                if (d < r.radius + ship_->radius + 24) { clear = false; break; }
-            }
-            if (clear) break;
+            if (spot_clear(ship_->x, ship_->y)) break;
         }
         ship_->vx = ship_->vy = 0;
-        ship_->invincible = std::max(ship_->invincible, 0.6f);   // brief grace on arrival
+        ship_->invincible = std::max(ship_->invincible, 0.8f);   // brief grace on arrival
         particles_.ufo_explode(ship_->x, ship_->y, 14);
         if (ctx_.sfx) { ctx_.sfx->pan_next(ship_->x / float(ctx_.W)); ctx_.sfx->warp(); }
         if (ctx_.fx) ctx_.fx->shake(5);
@@ -769,6 +871,16 @@ private:
         if (ctx_.sfx) { ctx_.sfx->pan_next(r.x / float(ctx_.W)); ctx_.sfx->invader_hit(); }
         if (ctx_.fx) ctx_.fx->shake(r.size == 3 ? 5.0f : 3.0f);
     }
+    // Fold freshly split rocks into the field and drop dead ones. Only call this
+    // OUTSIDE any loop over rocks_.
+    void merge_rocks() {
+        if (!rock_spawn_.empty()) {
+            rocks_.insert(rocks_.end(), rock_spawn_.begin(), rock_spawn_.end());
+            rock_spawn_.clear();
+        }
+        rocks_.erase(std::remove_if(rocks_.begin(), rocks_.end(),
+                     [](const Rock& r) { return !r.alive; }), rocks_.end());
+    }
 
     void maybe_drop(float x, float y, float chance) {
         if (rnd01() >= chance) return;
@@ -788,7 +900,10 @@ private:
             case PU::Life:   ship_->lives++; msg = "EXTRA LIFE!"; break;
         }
         add_flash(msg, ship_->x, ship_->y - 30, YELLOW, 1.2f);
-        if (ctx_.sfx) ctx_.sfx->powerup_collect();
+        if (ctx_.sfx) {
+            if (k == PU::Life) ctx_.sfx->one_up();
+            else ctx_.sfx->powerup_collect();
+        }
         if (ctx_.fx) ctx_.fx->rumble_pickup();
     }
 
@@ -803,13 +918,18 @@ private:
         ship_->kill();
         state_ = St::Dead; dead_t_ = 2.0f;
         enemy_bullets_.clear();
-        if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->player_death(); }
+        reset_charge();                 // never leave the charge hum looping over a death
+        fire_buf_ = 0;
+        if (thrust_on_ && ctx_.sfx) ctx_.sfx->stop_thrust();
+        thrust_on_ = false;
+        if (ctx_.sfx) ctx_.sfx->player_death();
         if (ctx_.fx) { ctx_.fx->shake(16); ctx_.fx->hitstop(0.09f); ctx_.fx->rumble_death(); }
         tele(J().add("ev", "death").add("wave", wave_).add("t", (double)game_t_)
                 .add("lives_left", ship_->lives));
     }
 
-    void update_play(float dt, const Input& in);
+    void update_world(float dt, const Input& in);
+    void update_game_over(float dt, const Input& in);
     void draw_hud(Surface& s);
     void draw_flash(Surface& s);
     void draw_banner(Surface& s);
@@ -817,17 +937,17 @@ private:
 };
 
 void VoidDriftGame::update(float dt, const Input& in) {
-    for (auto k : in.pressed)
-        if (k == SDLK_p && state_ == St::Play) {
-            pause_.toggle();
-            if (ctx_.sfx && pause_.active()) { ctx_.sfx->stop_ufo(); ctx_.sfx->stop_charge(); charge_snd_ = false; }
-        }
+    pad_ = in.pad_connected;
+    // Pause works everywhere except the game-over screen (where START/P = menu).
+    // ESC opens the pause menu too (quit lives there) instead of dropping the run.
+    if ((in.just(SDLK_p) || (in.just(SDLK_ESCAPE) && !pause_.active())) && state_ != St::GameOver) {
+        pause_.toggle();
+        if (pause_.active()) silence_loops();   // loops restart themselves on resume
+    }
     if (pause_.active()) {
         if (pause_.update(in) == PauseResult::QuitToMenu) quit_to_menu = true;
         return;
     }
-    for (auto k : in.pressed)
-        if (k == SDLK_ESCAPE) { quit_to_menu = true; return; }
 
     game_t_ += dt;
     star_t_ += dt;
@@ -836,129 +956,171 @@ void VoidDriftGame::update(float dt, const Input& in) {
     for (auto& f : flash_) f.life -= dt;
     flash_.erase(std::remove_if(flash_.begin(), flash_.end(),
                  [](const Flash& f) { return f.life <= 0; }), flash_.end());
+    for (auto& sp : sparks_) { sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.life -= dt; }
+    sparks_.erase(std::remove_if(sparks_.begin(), sparks_.end(),
+                  [](const Spark& sp) { return sp.life <= 0; }), sparks_.end());
+
+    if (state_ == St::GameOver) { update_game_over(dt, in); return; }
+
+    // The world never stops: rocks, saucer, boss, shots and pickups keep running
+    // through the wave banner, a death and the wave-clear beat. Only what the
+    // PLAYER can do (and be hit by) changes with the state.
+    update_world(dt, in);
 
     if (state_ == St::Intro) {
         intro_t_ -= dt;
-        // let the ship drift gently during the intro
-        ship_->update(dt, 0, false, ctx_.W, ctx_.H);
-        for (auto& r : rocks_) r.update(dt, ctx_.W, ctx_.H);
         if (intro_t_ <= 0) state_ = St::Play;
-    } else if (state_ == St::Play) {
-        update_play(dt, in);
     } else if (state_ == St::Dead) {
         dead_t_ -= dt;
-        // Tick the (dead) ship so its respawn timer actually counts down — without
-        // this, respawn() below no-ops forever and the game softlocks on a death.
-        ship_->update(dt, 0, false, ctx_.W, ctx_.H);
-        for (auto& r : rocks_) r.update(dt, ctx_.W, ctx_.H);
         if (dead_t_ <= 0) {
             if (ship_->lives > 0) {
                 ship_->respawn(ctx_.W, ctx_.H);
                 if (ctx_.sfx) ctx_.sfx->spawn_chime();
                 state_ = St::Play;
             } else {
-                state_ = St::GameOver; submit_scores();
+                enter_game_over();
             }
         }
     } else if (state_ == St::Win) {
         win_t_ -= dt;
-        for (auto& r : rocks_) r.update(dt, ctx_.W, ctx_.H);
         if (win_t_ <= 0) start_wave(wave_ + 1);
-    } else if (state_ == St::GameOver) {
-        if (bot_) { new_game(); return; }
-        if (ctx_.scores) {
-            const std::string gid = "void_drift";
-            if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
-                entry_started_ = true;
-                int rank = 1;
-                for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
-                initials_.begin("VOID DRIFT", score_, rank);
-            }
-            if (initials_.active()) {
-                if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
-                return;
-            }
-        }
-        for (auto k : in.pressed)
-            if (k == SDLK_RETURN || k == SDLK_SPACE) new_game();
     }
 }
 
-void VoidDriftGame::update_play(float dt, const Input& in) {
-    float turn = 0; bool thrust = false, want_fire = false, want_hyper = false;
+void VoidDriftGame::update_game_over(float dt, const Input& in) {
+    go_t_ += dt;
+    // keep the backdrop alive behind the panel
+    for (auto& r : rocks_) r.update(dt, ctx_.W, ctx_.H);
+    if (boss_) boss_->bob += dt;
+    if (saucer_->active) saucer_->anim_t += dt;
+
+    if (bot_) { new_game(); return; }
+    if (ctx_.scores) {
+        const std::string gid = "void_drift";
+        if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
+            entry_started_ = true;
+            int rank = 1;
+            for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
+            initials_.begin("VOID DRIFT", score_, rank);
+        }
+        if (initials_.active()) {
+            if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
+            return;
+        }
+    }
+    if (ui::game_over_retry(in, go_t_)) new_game();
+    else if (ui::game_over_menu(in, go_t_)) quit_to_menu = true;
+}
+
+void VoidDriftGame::update_world(float dt, const Input& in) {
+    const float W = (float)ctx_.W, H = (float)ctx_.H;
+    float turn = 0; bool thrust = false, fire_down = false, fire_edge = false, want_hyper = false;
     if (bot_) {
-        bot_decide(turn, thrust, want_fire, want_hyper);
+        bot_decide(turn, thrust, fire_down, want_hyper);
     } else {
+        auto kbd = [&](SDL_Keycode k) { return in.state && in.state[SDL_GetScancodeFromKey(k)]; };
         turn = (in.down(SDLK_RIGHT) || in.down(SDLK_d)) - (in.down(SDLK_LEFT) || in.down(SDLK_a));
         // thrust: UP/W, or the gamepad B button (A shoots, so accel sits on B — Xbox layout)
         thrust = in.down(SDLK_UP) || in.down(SDLK_w) || in.pad[PadBtnB];
-        want_fire = in.down(SDLK_SPACE);
-        for (auto k : in.pressed) if (k == SDLK_DOWN || k == SDLK_s) want_hyper = true;
+        fire_down = in.down(SDLK_SPACE);
+        fire_edge = in.just(SDLK_SPACE) || (fire_down && !fire_prev_);
+        // hyperspace: DOWN/S on the keyboard, Y on the pad (-> SDLK_b). "Down" on
+        // the d-pad/stick is deliberately NOT hyperspace: too easy to brush while
+        // steering.
+        want_hyper = in.just(SDLK_b) || (in.just(SDLK_DOWN) && kbd(SDLK_DOWN)) ||
+                     (in.just(SDLK_s) && kbd(SDLK_s));
     }
+    fire_prev_ = fire_down;
+    if (!ship_->alive) { turn = 0; thrust = false; want_hyper = false; }
 
     if (hyper_cd_ > 0) hyper_cd_ -= dt;
     if (shield_ > 0) shield_ -= dt;
+    if (fire_buf_ > 0) fire_buf_ -= dt;
     if (want_hyper) hyperspace();
     ship_->update(dt, turn, thrust, ctx_.W, ctx_.H);
-    if (!ship_->alive) {
-        if (charge_snd_ && ctx_.sfx) { ctx_.sfx->stop_charge(); }
-        charge_snd_ = charging_ = false; fire_hold_t_ = charge_ = 0;
-        return;
+
+    // ── engine: looping rumble + a spray of exhaust sparks while thrusting ──
+    bool burning = ship_->alive && thrust;
+    if (burning != thrust_on_) {
+        if (ctx_.sfx) { if (burning) ctx_.sfx->start_thrust(); else ctx_.sfx->stop_thrust(); }
+        thrust_on_ = burning;
+    }
+    if (burning) {
+        exhaust_acc_ += dt * 70.0f;
+        float c = std::cos(ship_->ang), s = std::sin(ship_->ang);
+        while (exhaust_acc_ >= 1.0f) {
+            exhaust_acc_ -= 1.0f;
+            float back = rnd_uniform(120, 240), side = rnd_uniform(-45, 45);
+            float life = rnd_uniform(0.18f, 0.42f);
+            sparks_.push_back({ship_->x - c * 9, ship_->y - s * 9,
+                               ship_->vx - c * back - s * side,
+                               ship_->vy - s * back + c * side, life, life});
+        }
     }
 
-    // ── firing: bot taps; human taps for normal shots but HOLDING charges a
-    //    2x–4x shot (same rising hum + timing as Void Storm's charge beam). ──
-    if (bot_) {
-        if (want_fire) fire();
-    } else if (want_fire) {
-        fire_hold_t_ += dt;
-        if (fire_hold_t_ >= CHARGE_DELAY) {
-            charging_ = true;
-            charge_ = std::min(1.0f, charge_ + dt * 0.9f);   // matches Storm's charge rate
-            if (!charge_snd_ && ctx_.sfx) { ctx_.sfx->start_charge(); charge_snd_ = true; }
-        }
+    // ── firing: a PRESS shoots immediately (buffered briefly through the
+    //    cooldown); HOLDING on past CHARGE_DELAY builds a 2x–4x shot that fires
+    //    when you let go. The bot just taps. ──
+    if (!ship_->alive) {
+        // charge state is cleared in kill_ship(); nothing to do while dead
+    } else if (bot_) {
+        if (fire_down) fire();
     } else {
-        if (charging_) {
-            int power = 2 + int(2.0f * charge_ + 0.5f);   // 2..4 by charge
-            fire(std::min(4, power), charge_);
-        } else if (fire_hold_t_ > 0) {
-            fire();                                        // quick tap -> normal shot
+        if (fire_edge) fire_buf_ = 0.14f;
+        if (fire_buf_ > 0 && fire()) fire_buf_ = 0;
+        if (fire_down) {
+            fire_hold_t_ += dt;
+            if (fire_hold_t_ >= CHARGE_DELAY) {
+                charging_ = true;
+                charge_ = std::min(1.0f, charge_ + dt * 0.9f);   // matches Storm's charge rate
+                if (!charge_snd_ && ctx_.sfx) { ctx_.sfx->start_charge(); charge_snd_ = true; }
+                if (ctx_.fx) ctx_.fx->rumble_charge(charge_);
+            }
+        } else {
+            if (charging_ && charge_ >= CHARGE_MIN) {
+                int power = 2 + int(2.0f * charge_ + 0.5f);   // 2..4 by charge
+                fire(std::min(4, power), charge_);
+            }
+            reset_charge();
         }
-        fire_hold_t_ = 0; charge_ = 0; charging_ = false;
-        if (charge_snd_ && ctx_.sfx) { ctx_.sfx->stop_charge(); charge_snd_ = false; }
     }
 
     for (auto& b : bullets_) {
         b.update(dt, ctx_.W, ctx_.H);
-        if (rnd01() < 0.4f) particles_.bullet_trail(b.x, b.y, b.color, true);
+        if (rnd01() < 24.0f * dt) particles_.bullet_trail(b.x, b.y, b.color, true);
     }
 
     for (auto& r : rocks_) r.update(dt, ctx_.W, ctx_.H);
 
-    // saucer
-    bool saucer_was = saucer_->active;
+    // ── saucer ──
     size_t saucer_eb_before = enemy_bullets_.size();
     bool spawned = saucer_->update(dt, ship_->x, ship_->y, ctx_.W, ctx_.H, enemy_bullets_);
-    if (spawned) add_flash("⚠ VOID SAUCER ⚠", ctx_.W / 2, 56, PURPLE, 1.6f, true);
-    if (ctx_.sfx) {
-        if (saucer_->active && !saucer_was) {
-            ctx_.sfx->start_ufo();
+    if (spawned) {
+        // top-centre normally; bottom-centre when the boss owns the top of the screen
+        add_flash("⚠ VOID SAUCER ⚠", W / 2, boss_ ? H - 96 : 66, PURPLE, 1.6f, true);
+        if (ctx_.sfx) {
             // a little vocalisation on arrival, panned by where it slides in.
-            ctx_.sfx->pan_next(saucer_->x / float(ctx_.W));
+            ctx_.sfx->pan_next(saucer_->x / W);
             ctx_.sfx->alien_chirp(saucer_->small ? 2 : 0);
-        } else if (!saucer_->active && saucer_was) {
-            ctx_.sfx->stop_ufo();
         }
-        if (saucer_->active) ctx_.sfx->set_ufo_pan(saucer_->x / float(ctx_.W));
+    }
+    if (ctx_.sfx) {
+        // The hum follows the saucer's state (not its spawn edge), so it comes
+        // back after a pause or a death.
+        if (saucer_->active != ufo_on_) {
+            if (saucer_->active) ctx_.sfx->start_ufo(); else ctx_.sfx->stop_ufo();
+            ufo_on_ = saucer_->active;
+        }
+        if (saucer_->active) ctx_.sfx->set_ufo_pan(saucer_->x / W);
         // the saucer just fired at the player — distinct from our own shot.
         if (saucer_->active && enemy_bullets_.size() > saucer_eb_before) {
-            ctx_.sfx->pan_next(saucer_->x / float(ctx_.W));
+            ctx_.sfx->pan_next(saucer_->x / W);
             ctx_.sfx->enemy_shot();
         }
     }
 
-    // boss
-    if (boss_) {
+    // ── boss ──
+    if (boss_ && !boss_->finished) {
         std::vector<std::pair<float, float>> new_rocks;
         size_t eb_before = enemy_bullets_.size();
         boss_->update(dt, ship_->x, ship_->y, ctx_.W, ctx_.H, enemy_bullets_, new_rocks, particles_);
@@ -968,7 +1130,7 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
             rocks_.push_back(rk);
         }
         if (enemy_bullets_.size() > eb_before && ctx_.sfx) {
-            ctx_.sfx->pan_next((boss_->x + boss_->w / 2) / float(ctx_.W));
+            ctx_.sfx->pan_next((boss_->x + boss_->w / 2) / W);
             ctx_.sfx->enemy_shot();
         }
     }
@@ -978,11 +1140,16 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
     // ── player bullets → rocks / saucer / boss ──
     for (auto& b : bullets_) {
         if (!b.alive) continue;
+        // Swept test: the bullet covered the segment (x-sdx,y-sdy)→(x,y) this
+        // frame, so a fast shot can't skip over a small rock at a low frame rate.
+        float sx0 = b.x - b.sdx, sy0 = b.y - b.sdy;
+        float seg2 = b.sdx * b.sdx + b.sdy * b.sdy;
         for (auto& r : rocks_) {
             if (!r.alive) continue;
-            float d = std::hypot(wrap_delta(b.x, r.x, (float)ctx_.W),
-                                 wrap_delta(b.y, r.y, (float)ctx_.H));
-            if (d <= r.radius) {
+            float ax = wrap_delta(sx0, r.x, W), ay = wrap_delta(sy0, r.y, H);
+            float t = seg2 > 1e-6f ? std::clamp((ax * b.sdx + ay * b.sdy) / seg2, 0.0f, 1.0f) : 1.0f;
+            float d = std::hypot(ax - b.sdx * t, ay - b.sdy * t);
+            if (d <= r.radius * 0.92f + b.rad()) {
                 r.alive = false; b.alive = false;
                 int pts = r.points() * (ctx_.combo ? ctx_.combo->hit() : 1);
                 score_ += pts;
@@ -1004,7 +1171,9 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
                 particles_.explode_invader(sx, sy, Color(200, 210, 235), 5);
                 saucer_->x += (b.vx >= 0 ? 1.0f : -1.0f) * (10.0f + 2.0f * b.power);
                 saucer_->y += (b.vy >= 0 ? 1.0f : -1.0f) * 5.0f;
-                if (ctx_.sfx) { ctx_.sfx->pan_next(sx / float(ctx_.W)); ctx_.sfx->shield_hit(); }
+                // a shove must never push it off the edge and despawn it unrewarded
+                saucer_->x = std::clamp(saucer_->x, -saucer_->radius, W + saucer_->radius);
+                if (ctx_.sfx) { ctx_.sfx->pan_next(sx / W); ctx_.sfx->shield_hit(); }
                 if (ctx_.fx) ctx_.fx->shake(2);
             } else {
                 int pts = saucer_->points() * (ctx_.combo ? ctx_.combo->hit() : 1);
@@ -1013,33 +1182,32 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
                 add_flash("+" + std::to_string(pts) + "!", (float)sx, sy - 20, PURPLE);
                 maybe_drop((float)sx, (float)sy, 0.6f);
                 saucer_->reset_idle();
-                if (ctx_.sfx) { ctx_.sfx->stop_ufo(); ctx_.sfx->boss_explosion(); }
+                if (ctx_.sfx) ctx_.sfx->boss_explosion();
                 if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->hitstop(0.04f); }
             }
             continue;
         }
-        if (boss_ && boss_->damageable() && overlap(b.rect(), boss_->rect())) {
+        if (boss_ && !boss_->dying && overlap(b.rect(), boss_->rect())) {
             b.alive = false;
-            boss_->take_damage(b.power);
-            score_ += 5;
-            particles_.explode_invader(b.x, b.y, boss_->color, 6);
-            if (ctx_.sfx) ctx_.sfx->invader_hit();
-            if (ctx_.fx) ctx_.fx->shake(2);
+            if (boss_->damageable()) {
+                boss_->take_damage(b.power);
+                score_ += 5;
+                particles_.explode_invader(b.x, b.y, boss_->color, 6);
+                if (ctx_.sfx) ctx_.sfx->invader_hit();
+                if (ctx_.fx) ctx_.fx->shake(2);
+            } else {
+                // still arriving: shots spark off its hide instead of passing through
+                particles_.explode_invader(b.x, b.y, Color(200, 210, 235), 4);
+                if (ctx_.sfx) { ctx_.sfx->pan_next(b.x / W); ctx_.sfx->armor_tink(); }
+            }
         }
     }
-    // Merge any rocks split off this frame now that the rocks_ loop has finished
-    // (mutating rocks_ mid-loop would invalidate the iterators above).
-    if (!rock_spawn_.empty()) {
-        rocks_.insert(rocks_.end(), rock_spawn_.begin(), rock_spawn_.end());
-        rock_spawn_.clear();
-    }
+    merge_rocks();
     bullets_.erase(std::remove_if(bullets_.begin(), bullets_.end(),
                    [](const Bullet& b) { return !b.alive; }), bullets_.end());
-    rocks_.erase(std::remove_if(rocks_.begin(), rocks_.end(),
-                 [](const Rock& r) { return !r.alive; }), rocks_.end());
 
-    // ── boss death → win + power-up rain ──
-    if (boss_ && boss_->finished) {
+    // ── boss death → win + power-up rain (waits out a death animation of yours) ──
+    if (boss_ && boss_->finished && (state_ == St::Play || state_ == St::Intro)) {
         score_ += 1000 * (wave_ / 5);
         float bx = boss_->x + boss_->w / 2, by = boss_->y + boss_->h / 2;
         for (int i = 0; i < 4; ++i) {
@@ -1048,27 +1216,29 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
             p.kind = rnd_choice<PU>({PU::Spread, PU::Rapid, PU::Shield, PU::Life});
             powerups_.push_back(p);
         }
-        add_flash(boss_->name + " DESTROYED!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 2.2f, true);
+        // its death blast vaporises whatever rocks and shots are left
+        for (auto& r : rocks_)
+            if (r.alive) particles_.explode_invader(r.x, r.y, r.color, 14);
+        rocks_.clear(); rock_spawn_.clear(); enemy_bullets_.clear();
+        add_flash(boss_->name + " DESTROYED!", W / 2, H / 2 - 20, YELLOW, 2.2f, true);
         if (ctx_.fx) {
             ctx_.fx->shake(30); ctx_.fx->hitstop(0.10f);
             ctx_.fx->rumble_explosion();
-            ctx_.fx->shockwave((boss_->x + boss_->w / 2) / float(ctx_.W),
-                               (boss_->y + boss_->h / 2) / float(ctx_.H));
+            ctx_.fx->shockwave(bx / W, by / H);
         }
         if (ctx_.sfx) {
-            ctx_.sfx->stop_ufo();
-            ctx_.sfx->pan_next(bx / float(ctx_.W));
+            ctx_.sfx->pan_next(bx / W);
             ctx_.sfx->big_explosion();   // boss death — bigger than boss_explosion
             ctx_.sfx->level_clear();
         }
         tele(J().add("ev", "boss_clear").add("wave", wave_).add("name", boss_->name)
                 .add("lives", ship_->lives));
         boss_.reset();
-        state_ = St::Win; win_t_ = 2.6f;
-        return;
+        state_ = St::Win; win_t_ = 2.6f;   // long enough to sweep up the drops
+        ship_->invincible = std::max(ship_->invincible, win_t_);
     }
 
-    // ── power-ups ──
+    // ── power-ups (collectable in every state the ship is alive in) ──
     for (auto& p : powerups_) {
         p.update(dt, ctx_.W, ctx_.H);
         if (p.alive && ship_->alive && overlap(p.rect(), ship_->rect())) {
@@ -1077,41 +1247,47 @@ void VoidDriftGame::update_play(float dt, const Input& in) {
     }
     powerups_.erase(std::remove_if(powerups_.begin(), powerups_.end(),
                     [](const PowerUp& p) { return !p.alive; }), powerups_.end());
+
     // ── threats → ship ──
-    bool safe = ship_->invincible > 0 || shield_ > 0;
     if (ship_->alive) {
-        // rocks
+        bool safe = ship_->invincible > 0 || shield_ > 0;
+        bool hit = false;
+        // Rocks: the hit circle sits inside the jagged outline (verts are 0.66–1.0
+        // of the radius) so you only die to rock you can actually see touching.
         for (auto& r : rocks_) {
             if (!r.alive) continue;
-            float d = std::hypot(wrap_delta(ship_->x, r.x, (float)ctx_.W),
-                                 wrap_delta(ship_->y, r.y, (float)ctx_.H));
-            if (d < r.radius + ship_->radius - 3) {
-                if (safe) {  // shield smashes the rock instead of dying
-                    if (shield_ > 0) { score_ += r.points(); split_rock(r); r.alive = false; }
-                    break;
-                }
-                kill_ship(); return;
+            float d = std::hypot(wrap_delta(ship_->x, r.x, W), wrap_delta(ship_->y, r.y, H));
+            if (d >= r.radius * 0.86f + ship_->radius - 3) continue;
+            if (shield_ > 0) {          // the shield smashes the rock instead
+                score_ += r.points(); r.alive = false; split_rock(r);
+            } else if (!safe) { hit = true; break; }
+        }
+        merge_rocks();   // shield splits join the field NOW, before the wave-clear test
+        if (!hit && !safe && saucer_->active) {
+            float d = std::hypot(ship_->x - saucer_->x, ship_->y - saucer_->y);
+            if (d < saucer_->radius + ship_->radius - 2) hit = true;
+        }
+        if (!hit && !safe) {
+            for (auto& b : enemy_bullets_) {
+                if (!b.alive) continue;
+                if (overlap(b.rect(), ship_->rect())) { b.alive = false; hit = true; break; }
             }
         }
+        if (!hit && !safe && boss_ && boss_->damageable() &&
+            overlap(ship_->rect(), boss_->rect())) hit = true;
+        if (hit) kill_ship();
     }
-    if (ship_->alive && !safe) {
-        for (auto& b : enemy_bullets_) {
-            if (!b.alive) continue;
-            if (overlap(b.rect(), ship_->rect())) { b.alive = false; kill_ship(); return; }
-        }
-    }
-    if (ship_->alive && boss_ && boss_->damageable() && !safe &&
-        overlap(ship_->rect(), boss_->rect())) { kill_ship(); return; }
-
     enemy_bullets_.erase(std::remove_if(enemy_bullets_.begin(), enemy_bullets_.end(),
                          [](const Bullet& b) { return !b.alive; }), enemy_bullets_.end());
+
     // ── wave clear (non-boss): field emptied ──
-    if (!boss_ && rocks_alive() == 0) {
+    if ((state_ == St::Play || state_ == St::Intro) && !boss_ && rocks_alive() == 0) {
         tele(J().add("ev", "wave_clear").add("wave", wave_).add("t", (double)game_t_)
                 .add("lives", ship_->lives));
-        add_flash("WAVE CLEARED!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 1.6f, true);
+        add_flash("WAVE CLEARED!", W / 2, 250, YELLOW, 1.4f, true);
         if (ctx_.sfx) { ctx_.sfx->big_explosion(); ctx_.sfx->level_clear(); }
-        state_ = St::Win; win_t_ = 1.8f;
+        state_ = St::Win; win_t_ = 1.4f;
+        ship_->invincible = std::max(ship_->invincible, win_t_);
     }
 }
 
@@ -1185,19 +1361,38 @@ void VoidDriftGame::draw(Surface& s) {
     for (int y = 0; y < ctx_.H; y += 60) draw::line(s, Color(8, 14, 22), 0, y, ctx_.W, y, 1);
 
     particles_.draw(s);
-    for (auto& r : rocks_) r.draw(s);
+    // engine exhaust: hot gold cooling to a dim ember
+    for (auto& sp : sparks_) {
+        float k = std::clamp(sp.life / sp.max_life, 0.0f, 1.0f);
+        Color c = lerp_color(Color(200, 60, 20), Color(255, 225, 130), k);
+        c.a = uint8_t(60 + 195 * k);
+        int sz = k > 0.5f ? 3 : 2;
+        draw::rect(s, c, {int(sp.x) - sz / 2, int(sp.y) - sz / 2, sz, sz});
+    }
+    for (auto& r : rocks_) r.draw(s, ctx_.W, ctx_.H);
     for (auto& p : powerups_) p.draw(s, *ctx_.fonts.small);
     saucer_->draw(s);
     if (boss_) boss_->draw(s, ship_->x, ship_->y);
     for (auto& b : enemy_bullets_) b.draw(s);
     for (auto& b : bullets_) b.draw(s);
-    ship_->draw(s);
+    ship_->draw(s, ctx_.W, ctx_.H);
 
-    // shield bubble
-    if (shield_ > 0 && ship_->alive) {
-        float pulse = 0.6f + 0.4f * std::sin(game_t_ * 20 + shield_ * 4);
-        draw::circle(s, Color(80, 220, 255, int(90 * pulse)), int(ship_->x), int(ship_->y), 22, 2);
-        draw::circle(s, Color(80, 220, 255, int(30 * pulse)), int(ship_->x), int(ship_->y), 19, 1);
+    if (ship_->alive) {
+        // shield bubble
+        if (shield_ > 0) {
+            float pulse = 0.6f + 0.4f * std::sin(game_t_ * 20 + shield_ * 4);
+            draw::circle(s, Color(80, 220, 255, int(90 * pulse)), int(ship_->x), int(ship_->y), 22, 2);
+            draw::circle(s, Color(80, 220, 255, int(30 * pulse)), int(ship_->x), int(ship_->y), 19, 1);
+        }
+        // charge build-up: a growing hot point on the nose, so the hold reads
+        if (charging_) {
+            auto h = ship_->hull();
+            int r = 3 + int(8 * charge_);
+            float pulse = 0.7f + 0.3f * std::sin(game_t_ * 30);
+            draw::circle(s, Color(120, 225, 255, int(110 * pulse)), h[0].first, h[0].second, r + 3);
+            draw::circle(s, charge_ >= CHARGE_MIN ? Color(200, 245, 255) : Color(90, 150, 180),
+                         h[0].first, h[0].second, std::max(2, r / 2));
+        }
     }
 
     draw_hud(s);
@@ -1205,66 +1400,101 @@ void VoidDriftGame::draw(Surface& s) {
     draw_banner(s);
 
     if (state_ == St::GameOver) {
-        draw_text_centered(s, *ctx_.fonts.big, "GAME  OVER", ctx_.W / 2, ctx_.H / 2 - 50, RED);
-        draw_text_centered(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), ctx_.W / 2,
-                           ctx_.H / 2 + 10, WHITE);
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS SPACE TO RETRY", ctx_.W / 2,
-                           ctx_.H / 2 + 60, DIM);
-        if (initials_.active()) initials_.draw(s);
+        if (initials_.active()) {
+            // initials entry owns the screen: just the dim plate behind it, so the
+            // game-over text doesn't show through the entry box
+            draw::rect(s, Color(0, 0, 0, 165), {0, 0, ctx_.W, ctx_.H});
+            initials_.draw(s);
+        } else {
+            ui::game_over(s, ctx_.fonts, ctx_.W, ctx_.H, go_t_, score_, new_hi_, pad_,
+                          "WAVE " + std::to_string(wave_));
+        }
     }
     pause_.draw(s);
 }
 
+// The wave banner sits above the centre so it never covers a ship that is
+// still flying around under it.
 void VoidDriftGame::draw_banner(Surface& s) {
-    if (state_ == St::Intro) {
-        float a = std::min(1.0f, intro_t_ * 1.5f);
-        draw_text_centered(s, *ctx_.fonts.big, "WAVE " + std::to_string(wave_), ctx_.W / 2,
-                           ctx_.H / 2 - 20, Color(int(80 + 175 * a), 255, int(120 + 60 * a)));
-        if (boss_wave_)
-            draw_text_centered(s, *ctx_.fonts.med, "SOMETHING STIRS IN THE VOID", ctx_.W / 2,
-                               ctx_.H / 2 + 28, RED);
-        else
-            draw_text_centered(s, *ctx_.fonts.small,
-                               "↑ THRUST   ← → TURN   SPACE FIRE   ↓ HYPERSPACE",
-                               ctx_.W / 2, ctx_.H / 2 + 30, DIM);
+    if (state_ != St::Intro) return;
+    float a = std::min(1.0f, intro_t_ * 1.5f);
+    int y = 236;
+    draw_text_centered(s, *ctx_.fonts.big, "WAVE " + std::to_string(wave_), ctx_.W / 2, y,
+                       Color(int(80 + 175 * a), 255, int(120 + 60 * a), int(255 * a)));
+    if (boss_wave_) {
+        draw_text_centered(s, *ctx_.fonts.med, "SOMETHING STIRS IN THE VOID", ctx_.W / 2,
+                           y + 54, Color(RED.r, RED.g, RED.b, int(255 * a)));
+    } else if (wave_ <= 3 && !ctx_.demo) {
+        // controls, named for the device in your hands (first few waves only)
+        std::string l1, l2;
+        if (pad_) {
+            l1 = "STICK TURN    B THRUST    A FIRE";
+            l2 = "HOLD A: CHARGE SHOT    Y HYPERSPACE";
+        } else {
+            l1 = "← → TURN    ↑ THRUST    SPACE FIRE";
+            l2 = "HOLD SPACE: CHARGE SHOT    ↓ HYPERSPACE";
+        }
+        Color hc(ui::HINT.r, ui::HINT.g, ui::HINT.b, int(255 * a));
+        draw_text_centered(s, *ctx_.fonts.small, l1, ctx_.W / 2, y + 54, hc);
+        draw_text_centered(s, *ctx_.fonts.small, l2, ctx_.W / 2, y + 76, hc);
     }
 }
 
+// HUD rows (top): 8 score/hi/wave · 36 combo · [boss: 40 name, 62 HP bar — the
+// boss itself parks below, at VoidBoss::PARK_Y, and the combo moves left].
 void VoidDriftGame::draw_hud(Surface& s) {
     draw_text(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
     draw_text_centered(s, *ctx_.fonts.med, "HI  " + zpad(high_score_, 6), ctx_.W / 2, 8, YELLOW);
     draw_text_right(s, *ctx_.fonts.med, "WAVE  " + std::to_string(wave_), ctx_.W - 16, 8, CYAN);
 
-    if (ctx_.combo && ctx_.combo->active() && state_ == St::Play) {
+    if (ctx_.combo && ctx_.combo->active() && state_ != St::GameOver) {
         int m = ctx_.combo->mult();
         Color cc = m >= 6 ? RED : m >= 4 ? ORANGE : YELLOW;
-        draw_text_centered(s, *ctx_.fonts.med, "x" + std::to_string(m) + " COMBO", ctx_.W / 2, 34, cc);
-        int bw = 120, bx = ctx_.W / 2 - bw / 2;
-        draw::rect(s, Color(40, 40, 40), {bx, 58, bw, 4});
-        draw::rect(s, cc, {bx, 58, int(bw * ctx_.combo->ratio()), 4});
+        std::string txt = "x" + std::to_string(m) + " COMBO";
+        int bw = 120;
+        if (boss_) {   // top-centre belongs to the boss bar → tuck the combo under SCORE
+            draw_text(s, *ctx_.fonts.med, txt, 16, 36, cc);
+            draw::rect(s, Color(40, 40, 40), {16, 62, bw, 4});
+            draw::rect(s, cc, {16, 62, int(bw * ctx_.combo->ratio()), 4});
+        } else {
+            int bx = ctx_.W / 2 - bw / 2;
+            draw_text_centered(s, *ctx_.fonts.med, txt, ctx_.W / 2, 36, cc);
+            draw::rect(s, Color(40, 40, 40), {bx, 62, bw, 4});
+            draw::rect(s, cc, {bx, 62, int(bw * ctx_.combo->ratio()), 4});
+        }
     }
 
     // boss HP bar
-    if (boss_ && !boss_->dying && !boss_->entering) {
-        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 76;
-        draw_text_centered(s, *ctx_.fonts.small, boss_->name, ctx_.W / 2, by - 16, boss_->color);
+    if (boss_ && !boss_->dying) {
+        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 62;
+        draw_text_centered(s, *ctx_.fonts.small, boss_->name, ctx_.W / 2, by - 22, boss_->color);
         draw::rect(s, Color(20, 20, 30), {bx, by, bw, 12}, 0, 4);
         Color hc = boss_->hp_ratio() > 0.5f ? GREEN : boss_->hp_ratio() > 0.25f ? YELLOW : RED;
         draw::rect(s, hc, {bx, by, int(bw * boss_->hp_ratio()), 12}, 0, 4);
         draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
     }
 
+    // hyperspace readiness (bottom-left, above the weapon pips)
+    {
+        int hx = 16, hy = ctx_.H - 66, bw = 44;
+        bool ready = hyper_cd_ <= 0;
+        draw_text(s, *ctx_.fonts.small, "HYP", hx, hy, ui::LABEL);
+        float k = ready ? 1.0f : std::clamp(1.0f - hyper_cd_ / HYPER_CD, 0.0f, 1.0f);
+        draw::rect(s, Color(30, 40, 50), {hx + 44, hy + 7, bw, 5});
+        draw::rect(s, ready ? CYAN : Color(70, 110, 130), {hx + 44, hy + 7, int(bw * k), 5});
+    }
+
     // weapon pips (bottom-left)
     int hx = 16, hy = ctx_.H - 46;
-    draw_text(s, *ctx_.fonts.small, "PWR", hx, hy, DIM);
+    draw_text(s, *ctx_.fonts.small, "PWR", hx, hy, ui::LABEL);
     auto pip = [&](int n, Color c, int slot) {
         for (int i = 0; i < 3; ++i)
-            draw::rect(s, i < n ? c : Color(30, 40, 30), {hx + 44 + slot * 16, hy + 11 - i * 4, 12, 3});
+            draw::rect(s, i < n ? c : Color(45, 60, 50), {hx + 44 + slot * 16, hy + 11 - i * 4, 12, 3});
     };
     pip(w_spread_, ORANGE, 0); pip(w_rapid_, YELLOW, 1);
 
     // lives as little ships
-    draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 28, DIM);
+    draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 28, ui::LABEL);
     for (int i = 0; i < ship_->lives; ++i) {
         int lx = 80 + i * 22, ly = ctx_.H - 18;
         draw::polygon(s, CYAN, {{lx + 8, ly - 8}, {lx, ly + 6}, {lx + 4, ly + 2}, {lx + 8, ly + 6}});
@@ -1273,9 +1503,9 @@ void VoidDriftGame::draw_hud(Surface& s) {
     if (shield_ > 0)
         draw_text_right(s, *ctx_.fonts.small, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s",
                         ctx_.W - 12, ctx_.H - 28, CYAN);
-    else
-        draw_text_right(s, *ctx_.fonts.small, "P PAUSE", ctx_.W - 12, ctx_.H - 28,
-                        Color(30, 60, 30));
+    else if (state_ != St::GameOver)
+        draw_text_right(s, *ctx_.fonts.small, std::string(ui::pause_key(pad_)) + "  PAUSE",
+                        ctx_.W - 12, ctx_.H - 28, ui::LABEL);
 }
 
 void VoidDriftGame::draw_flash(Surface& s) {

@@ -9,7 +9,9 @@
 #include "engine/rng.h"
 #include "engine/scores.h"
 #include "engine/surface.h"
+#include "engine/sound.h"
 #include "engine/text.h"
+#include "engine/ui.h"
 
 namespace {
 constexpr float TAU = 6.28318530717958647692f;
@@ -48,6 +50,13 @@ Color scale(Color c, float f) {
     return Color(int(c.r * f), int(c.g * f), int(c.b * f));
 }
 void px2(Surface& s, Color c, int x, int y) { draw::rect(s, c, {x, y, 2, 2}); }
+// Shortest signed distance from carousel position `from` to card `i` on a ring
+// of NGAMES cards, so the roster wraps and the focused card always has a
+// neighbour on both sides.
+float ring_off(float i, float from) {
+    float d = pmod(i - from + NGAMES / 2.0f, float(NGAMES)) - NGAMES / 2.0f;
+    return d;
+}
 }  // namespace
 
 // ── Star ─────────────────────────────────────────────────────────────────────
@@ -132,7 +141,7 @@ static void preview_galaga(Surface& s, Rect r, float t) {
     const int dbody[][2] = {{-3,-2},{-2,-3},{0,-3},{2,-3},{3,-2},{-4,-1},{4,-1},
         {-4,0},{4,0},{-3,1},{3,1},{-2,2},{2,2}};
     for (auto& p : dbody) px2(s, dc, dive_x + p[0], dive_y + p[1]);
-    if (std::sin(t * 1.5f) > 0.7f) {
+    if (std::sin(t * 1.5f) > 0.7f && dive_y + 38 < y0 + h) {
         int beam_a = int(60 * (std::sin(t * 1.5f) - 0.7f) / 0.3f);
         draw::polygon(s, Color(120, 80, 255, beam_a),
                       {{dive_x, dive_y + 8}, {dive_x - 9, dive_y + 38},
@@ -270,9 +279,14 @@ static void preview_void_storm(Surface& s, Rect r, float t) {
     int x0 = r.x, y0 = r.y, w = r.w, h = r.h;
     for (int i = 0; i < 10; ++i) {  // scrolling ground + ceiling strata
         int gx = x0 + int(pmod(i * 22 - t * 60, float(w + 20))) - 10;
-        draw::rect(s, Color(60, 30, 20), {gx, y0 + h - 10, 16, 10});
-        draw::rect(s, Color(255, 140, 60), {gx, y0 + h - 10, 16, 2});
-        draw::rect(s, Color(60, 30, 20), {gx + 8, y0, 16, 8});
+        // Clip each slab to the preview window so strata never spill onto the card.
+        auto slab = [&](Color c, int x, int y, int ww, int hh) {
+            int xa = std::max(x, x0), xb = std::min(x + ww, x0 + w);
+            if (xb > xa) draw::rect(s, c, {xa, y, xb - xa, hh});
+        };
+        slab(Color(60, 30, 20), gx, y0 + h - 10, 16, 10);
+        slab(Color(255, 140, 60), gx, y0 + h - 10, 16, 2);
+        slab(Color(60, 30, 20), gx + 8, y0, 16, 8);
     }
     int px = x0 + 18, py = y0 + h / 2 + int(std::sin(t * 2) * h * 0.2f);  // player ship
     draw::polygon(s, Color(120, 200, 255), {{px - 8, py - 5}, {px + 10, py}, {px - 8, py + 5}});
@@ -297,8 +311,10 @@ Launcher::Launcher(const Context& ctx) : Scene(ctx) {
         s.z = rnd_uniform(0.05f, 1.0f);
     }
     title_ = "THE  VOID  ARCADE";
+    // A travelling wave along the title (not random per-letter phases, which
+    // read as jumbled baselines).
     for (size_t i = 0; i < title_.size(); ++i)
-        char_phase_.push_back(rnd_uniform(0, TAU));
+        char_phase_.push_back(i * 0.42f);
 }
 
 std::string Launcher::current_id() const { return GAMES[selected_].id; }
@@ -318,8 +334,11 @@ void Launcher::update(float dt, const Input& in) {
         float target = (i == selected_) ? 1.0f : 0.0f;
         card_anim_[i] += (target - card_anim_[i]) * dt * 9;
     }
-    scroll_ += (selected_ - scroll_) * std::min(1.0f, dt * 12);  // glide the carousel
+    // Glide the carousel the short way round the ring.
+    scroll_ = pmod(scroll_ + ring_off(float(selected_), scroll_) * std::min(1.0f, dt * 12),
+                   float(NGAMES));
     if (!in.pressed.empty()) idle_t_ = 0.0f; else idle_t_ += dt;
+    pad_ = in.pad_connected;
 
     // Attract mode: after a spell of idleness, cycle a high-score marquee.
     if (attract_) {
@@ -331,10 +350,19 @@ void Launcher::update(float dt, const Input& in) {
     if (idle_t_ > kAttractIdle) { attract_ = true; attract_t_ = 0; attract_game_ = 0; return; }
 
     for (auto k : in.pressed) {
-        if (k == SDLK_LEFT || k == SDLK_a) selected_ = std::max(0, selected_ - 1);
-        else if (k == SDLK_RIGHT || k == SDLK_d) selected_ = std::min(NGAMES - 1, selected_ + 1);
-        else if (k == SDLK_RETURN || k == SDLK_SPACE) selection_id = GAMES[selected_].id;
-        else if (k == SDLK_o) options_requested = true;
+        if (k == SDLK_LEFT || k == SDLK_a) {
+            selected_ = (selected_ + NGAMES - 1) % NGAMES;
+            if (ctx_.sfx) ctx_.sfx->ui_move();
+        } else if (k == SDLK_RIGHT || k == SDLK_d) {
+            selected_ = (selected_ + 1) % NGAMES;
+            if (ctx_.sfx) ctx_.sfx->ui_move();
+        } else if (k == SDLK_RETURN || k == SDLK_SPACE) {
+            selection_id = GAMES[selected_].id;
+            if (ctx_.sfx) ctx_.sfx->ui_select();
+        } else if (k == SDLK_o) {
+            options_requested = true;
+            if (ctx_.sfx) ctx_.sfx->ui_select();
+        }
         else if (k == SDLK_ESCAPE) quit_requested = true;
     }
 }
@@ -347,15 +375,17 @@ void Launcher::draw(Surface& s) {
     for (int y = 0; y < ctx_.H; y += 60) draw::line(s, Color(3, 8, 3), 0, y, ctx_.W, y, 1);
     draw_title(s);
     draw_cards(s);
-    draw_text_centered(s, *ctx_.fonts.small, "◀  A/D or ARROW KEYS  ▶  |  ESC to quit",
-                       ctx_.W / 2, ctx_.H - 38, Color(95, 170, 95));
-    draw_text_centered(s, *ctx_.fonts.small, "O  OPTIONS   |   F11  FULLSCREEN", ctx_.W / 2,
-                       ctx_.H - 20, Color(80, 150, 80));
+    draw_text_centered(s, *ctx_.fonts.small,
+                       pad_ ? "◀  STICK / D-PAD  ▶     A  PLAY     BACK  OPTIONS"
+                            : "◀  ARROWS / A D  ▶     SPACE  PLAY     O  OPTIONS",
+                       ctx_.W / 2, ctx_.H - 40, ui::HINT);
+    draw_text_centered(s, *ctx_.fonts.small, "F11  FULLSCREEN     M  MUTE     ESC  QUIT",
+                       ctx_.W / 2, ctx_.H - 21, ui::LABEL);
     // Gamepad is plugged in but the snap's joystick interface isn't connected.
     if (ctx_.pad_blocked)
         draw_text_centered(s, *ctx_.fonts.small,
                            "CONTROLLER BLOCKED  -  RUN:  snap connect void-arcade:joystick",
-                           ctx_.W / 2, ctx_.H - 58, Color(190, 130, 30));
+                           ctx_.W / 2, ctx_.H - 62, Color(255, 180, 60));
     for (int y = 0; y < ctx_.H; y += 4) draw::rect(s, Color(0, 0, 0, 12), {0, y, ctx_.W, 2});
 }
 
@@ -385,10 +415,10 @@ void Launcher::draw_attract(Surface& s) {
     int y = 230, cx = ctx_.W / 2;
     if (board.empty()) {
         draw_text_centered(s, *ctx_.fonts.med, "NO SCORES YET", cx, 330, Color(100, 180, 100));
-        draw_text_centered(s, *ctx_.fonts.small, "BE THE FIRST", cx, 366, Color(85, 155, 85));
+        draw_text_centered(s, *ctx_.fonts.small, "BE THE FIRST", cx, 366, ui::LABEL);
     } else {
         for (size_t i = 0; i < board.size(); ++i) {
-            Color rc = i == 0 ? YELLOW : (i < 3 ? Color(200, 240, 200) : Color(90, 150, 90));
+            Color rc = i == 0 ? YELLOW : (i < 3 ? Color(200, 240, 200) : ui::LABEL);
             int lx = cx - 150;
             draw_text(s, *ctx_.fonts.med, std::to_string(i + 1) + ".", lx, y, rc);
             draw_text(s, *ctx_.fonts.med, board[i].name, lx + 50, y, rc);
@@ -398,8 +428,8 @@ void Launcher::draw_attract(Surface& s) {
     }
 
     if (int(t_ * 2) % 2 == 0)
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS ANY KEY", cx, ctx_.H - 56, Color(120, 210, 120));
-    draw_text_centered(s, *ctx_.fonts.small, "INSERT COIN  //  THE VOID ARCADE", cx, ctx_.H - 32, Color(90, 160, 90));
+        draw_text_centered(s, *ctx_.fonts.small, "PRESS ANY KEY", cx, ctx_.H - 56, ui::HINT);
+    draw_text_centered(s, *ctx_.fonts.small, "INSERT COIN  //  THE VOID ARCADE", cx, ctx_.H - 32, ui::LABEL);
     for (int yy = 0; yy < ctx_.H; yy += 4) draw::rect(s, Color(0, 0, 0, 12), {0, yy, ctx_.W, 2});
 }
 
@@ -417,33 +447,33 @@ void Launcher::draw_title(Surface& s) {
     for (auto& c : chars) total_w += c->width();
     int x = ctx_.W / 2 - total_w / 2;
     for (size_t i = 0; i < chars.size(); ++i) {
-        float bob = std::sin(t_ * 2.5f + char_phase_[i]) * 5;
-        s.blit(*chars[i], x, int(28 + bob));
+        float bob = std::sin(t_ * 2.5f - char_phase_[i]) * 3;
+        s.blit(*chars[i], x, int(26 + bob));
         x += chars[i]->width();
     }
-    draw_text_centered(s, *ctx_.fonts.small, "SELECT YOUR GAME", ctx_.W / 2, 80, Color(95, 185, 95));
+    draw_text_centered(s, *ctx_.fonts.small, "SELECT YOUR GAME", ctx_.W / 2, 82, ui::LABEL);
 }
 
 void Launcher::draw_cards(Surface& s) {
     // Carousel: the selected game sits centered and full-size; neighbours peek
     // from the sides, scaled down and dimmed. Scales to any number of games.
-    const int cw = 210, ch = 300;
-    const float spacing = 250.0f;
+    const int cw = 270, ch = 400;
+    const float spacing = 300.0f;
     int cxc = ctx_.W / 2;
-    int cyc = ctx_.H / 2 - ch / 2 + 18;
+    int cyc = ctx_.H / 2 - ch / 2 + 22;
 
     // Draw far cards first so the focused one overlaps its neighbours.
     std::vector<int> order;
     for (int i = 0; i < NGAMES; ++i) order.push_back(i);
     std::sort(order.begin(), order.end(), [&](int a, int b) {
-        return std::fabs(a - scroll_) > std::fabs(b - scroll_);
+        return std::fabs(ring_off(float(a), scroll_)) > std::fabs(ring_off(float(b), scroll_));
     });
     for (int i : order) {
-        float off = i - scroll_;
-        if (std::fabs(off) > 2.4f) continue;  // cull off-screen cards
+        float off = ring_off(float(i), scroll_);
+        if (std::fabs(off) > 2.0f) continue;  // cull off-screen cards
         float dist = std::fabs(off);
-        float sc = std::max(0.5f, 1.0f - dist * 0.24f);
-        float dim = std::max(0.4f, 1.0f - dist * 0.38f);
+        float sc = std::max(0.5f, 1.0f - dist * 0.28f);
+        float dim = std::max(0.35f, 1.0f - dist * 0.45f);
         int w = int(cw * sc), h = int(ch * sc);
         int cx = cxc + int(off * spacing) - w / 2;
         int cy = cyc + (ch - h) / 2;  // keep cards vertically centred
@@ -451,7 +481,7 @@ void Launcher::draw_cards(Surface& s) {
     }
 
     // Page dots.
-    int dy = cyc + ch + 16, dx0 = ctx_.W / 2 - (NGAMES - 1) * 9;
+    int dy = cyc + ch + 22, dx0 = ctx_.W / 2 - (NGAMES - 1) * 9;
     for (int i = 0; i < NGAMES; ++i) {
         Color c = (i == selected_) ? GAMES[i].color : Color(40, 60, 50);
         draw::circle(s, c, dx0 + i * 18, dy, i == selected_ ? 4 : 3);
@@ -462,7 +492,7 @@ void Launcher::draw_card(Surface& s, int gi, int cx, int cy, int cw, int ch,
                          bool focus, float dim) {
     const GameDef& game = GAMES[gi];
     Color color = game.color, accent = game.accent;
-    bool full = focus && cw >= 200;  // full content only once near full size
+    bool full = focus && cw >= 250;  // full content only once near full size
     auto dc = [&](Color c) { return scale(c, dim); };
 
     draw::rect(s, Color(0, 0, 0, int(90 * dim)), {cx + 5, cy + 8, cw + 10, ch + 10});
@@ -492,11 +522,25 @@ void Launcher::draw_card(Surface& s, int gi, int cx, int cy, int cw, int ch,
     Font& tf = full ? *ctx_.fonts.med : *ctx_.fonts.small;
     draw_text_centered(s, tf, game.title, cx + cw / 2, ty, dc(color));
     if (full) {
-        draw_text_centered(s, *ctx_.fonts.small, game.subtitle, cx + cw / 2, ty + 26, accent);
+        draw_text_centered(s, *ctx_.fonts.small, game.subtitle, cx + cw / 2, ty + 28, accent);
         draw_stats(s, gi, cx, cy + int(ch * 0.60f), cw, 1.0f);
         if (int(t_ * 3) % 2 == 0)
-            draw_text_centered(s, *ctx_.fonts.small, "▶  PRESS SPACE  ◀", cx + cw / 2,
-                               cy + ch - 22, YELLOW);
+            draw_text_centered(s, *ctx_.fonts.small,
+                               pad_ ? "▶  PRESS A  ◀" : "▶  PRESS SPACE  ◀",
+                               cx + cw / 2, cy + ch - 28, YELLOW);
+    } else {
+        // Neighbour cards: a dimmed teaser so the lower half isn't an empty slab.
+        draw_text_centered(s, *ctx_.fonts.small, game.subtitle, cx + cw / 2, ty + 24,
+                           dc(accent));
+        if (ctx_.scores) {
+            int hi = ctx_.scores->high_score(game.id);
+            draw::line(s, Color(color.r, color.g, color.b, int(60 * dim)), cx + 14,
+                       cy + int(ch * 0.62f), cx + cw - 14, cy + int(ch * 0.62f), 1);
+            draw_text_centered(s, *ctx_.fonts.small, "HI-SCORE", cx + cw / 2,
+                               cy + int(ch * 0.62f) + 14, dc(ui::LABEL));
+            draw_text_centered(s, *ctx_.fonts.small, std::to_string(hi), cx + cw / 2,
+                               cy + int(ch * 0.62f) + 34, dc(YELLOW));
+        }
     }
 }
 
@@ -504,9 +548,8 @@ void Launcher::draw_stats(Surface& s, int gi, int cx, int y, int cw, float anim)
     if (!ctx_.scores) return;
     const GameDef& game = GAMES[gi];
     Color color = game.color;
-    Color dim = scale(color, 0.4f);
     draw::line(s, Color(color.r, color.g, color.b, int(70 * anim)), cx + 16, y, cx + cw - 16, y, 1);
-    y += 9;
+    y += 12;
     std::string gid = game.id;
     int hi = ctx_.scores->high_score(gid);
     int plays = ctx_.scores->total_plays(gid);
@@ -523,7 +566,7 @@ void Launcher::draw_stats(Surface& s, int gi, int cx, int y, int cw, float anim)
     std::vector<Row> rows;
     auto row3 = [&](const char* label, int val) {
         rows = {{"HI-SCORE", commas(hi), YELLOW}, {label, std::to_string(val), color},
-                {"GAMES", std::to_string(plays), dim}};
+                {"GAMES", std::to_string(plays), scale(color, 0.7f)}};
     };
     if (gid == "space_invaders")   row3("BEST WAVE",  ctx_.scores->best_wave());
     else if (gid == "galaga")      row3("BEST STAGE", ctx_.scores->best_stage());
@@ -534,8 +577,8 @@ void Launcher::draw_stats(Surface& s, int gi, int cx, int y, int cw, float anim)
     else                           row3("BEST LEVEL", ctx_.scores->best_level());  // arkanoid
     float fa = std::min(1.0f, anim * 1.5f);
     for (auto& row : rows) {
-        draw_text(s, *ctx_.fonts.small, row.label, cx + 16, y, scale(Color(100, 100, 100), fa));
-        draw_text_right(s, *ctx_.fonts.small, row.value, cx + cw - 16, y, scale(row.col, fa));
-        y += 18;
+        draw_text(s, *ctx_.fonts.small, row.label, cx + 18, y, scale(ui::LABEL, fa));
+        draw_text_right(s, *ctx_.fonts.small, row.value, cx + cw - 18, y, scale(row.col, fa));
+        y += 22;
     }
 }

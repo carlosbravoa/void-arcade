@@ -25,4 +25,6 @@ private:
     int   selected_ = 0;
     float t_ = 0.0f;
     float alpha_ = 0.0f;
+    bool  pad_ = false;
+    unsigned last_ticks_ = 0;
 };

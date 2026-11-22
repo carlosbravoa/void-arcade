@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/boss_art.h"
@@ -23,13 +24,14 @@
 #include "engine/surface.h"
 #include "engine/telemetry.h"
 #include "engine/text.h"
+#include "engine/ui.h"
 
 namespace {
 
 // ── colours (game.py) ─────────────────────────────────────────────────────────
 const Color BLACK(0, 0, 0), WHITE(255, 255, 255), CYAN(80, 200, 255);
 const Color YELLOW(255, 220, 40), RED(255, 60, 60), GREEN(80, 255, 80);
-const Color PURPLE(200, 80, 255), DIM(40, 60, 80);
+const Color PURPLE(200, 80, 255);
 
 constexpr float PI = 3.14159265358979323846f;
 
@@ -92,10 +94,27 @@ std::string powerup_label(const std::string& k) {
     return "???";
 }
 
+// Full name shown when a pill is caught (the 3-letter pill codes are cryptic).
+std::string powerup_name(const std::string& k) {
+    if (k == "expand") return "WIDE PADDLE";
+    if (k == "shrink") return "SHRUNK!";
+    if (k == "laser")  return "LASERS";
+    if (k == "multi")  return "MULTIBALL";
+    if (k == "slow")   return "SLOW BALL";
+    if (k == "fast")   return "FAST BALL!";
+    if (k == "life")   return "EXTRA LIFE";
+    if (k == "catch")  return "CATCH";
+    if (k == "fire")   return "FIREBALL";
+    return "???";
+}
+// Pills that hurt: drawn hollow so they read as "avoid" at a glance.
+bool powerup_bad(const std::string& k) { return k == "shrink" || k == "fast"; }
+
 // ── paddle/ball constants (entities.py) ───────────────────────────────────────
 constexpr int PADDLE_W_NORMAL = 96, PADDLE_W_BIG = 140, PADDLE_W_SMALL = 56;
 constexpr int PADDLE_H = 12, PADDLE_Y_OFF = 50;
 constexpr int BALL_R = 6;
+constexpr int MAX_BALLS = 9;   // multiball cap (each MULTI used to triple every ball)
 
 // ── brick layout constants (game.py) ──────────────────────────────────────────
 constexpr int BRICK_W = 56, BRICK_H = 20, BRICK_GAP = 2, BRICK_COLS = 13, BRICK_TOP = 60;
@@ -134,20 +153,21 @@ const std::vector<Layout> LEVELS = {
         {0, 0, 0, 0, 0, 3, 3, 3, 0, 0, 0, 0, 0},
         {0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0},
     },
-    // Level 3 – silver fortress
+    // Level 3 – silver fortress. The wall has GATES (bottom, top and both
+    // flanks) so the ball can get inside; a fully closed ring was unwinnable.
     {
-        {9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9},
+        {9, 9, 9, 9, 9, 0, 0, 0, 9, 9, 9, 9, 9},
         {9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9},
         {9, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 9},
         {9, 0, 3, 4, 4, 4, 4, 4, 4, 4, 3, 0, 9},
         {9, 0, 3, 4, 5, 5, 5, 5, 5, 4, 3, 0, 9},
-        {9, 0, 3, 4, 5, 0, 0, 0, 5, 4, 3, 0, 9},
-        {9, 0, 3, 4, 5, 0, 0, 0, 5, 4, 3, 0, 9},
+        {0, 0, 3, 4, 5, 0, 0, 0, 5, 4, 3, 0, 0},
+        {0, 0, 3, 4, 5, 0, 0, 0, 5, 4, 3, 0, 0},
         {9, 0, 3, 4, 5, 5, 5, 5, 5, 4, 3, 0, 9},
         {9, 0, 3, 4, 4, 4, 4, 4, 4, 4, 3, 0, 9},
         {9, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 9},
         {9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9},
-        {9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9},
+        {9, 9, 9, 9, 0, 0, 0, 0, 0, 9, 9, 9, 9},
     },
     // Level 4 – checkerboard chaos
     {
@@ -178,11 +198,13 @@ const std::vector<Layout> LEVELS = {
         {6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6},
         {6, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 6},
         {6, 5, 4, 3, 3, 3, 3, 3, 3, 3, 4, 5, 6},
-        {6, 5, 4, 3, 9, 9, 9, 9, 9, 3, 4, 5, 6},
+        // the silver vault keeps its four corner towers but has a door in the
+        // middle of each side (a closed ring sealed the core in for good).
+        {6, 5, 4, 3, 9, 9, 3, 9, 9, 3, 4, 5, 6},
         {6, 5, 4, 3, 9, 2, 2, 2, 9, 3, 4, 5, 6},
-        {6, 5, 4, 3, 9, 2, 1, 2, 9, 3, 4, 5, 6},
+        {6, 5, 4, 3, 3, 2, 1, 2, 3, 3, 4, 5, 6},
         {6, 5, 4, 3, 9, 2, 2, 2, 9, 3, 4, 5, 6},
-        {6, 5, 4, 3, 9, 9, 9, 9, 9, 3, 4, 5, 6},
+        {6, 5, 4, 3, 9, 9, 3, 9, 9, 3, 4, 5, 6},
         {6, 5, 4, 3, 3, 3, 3, 3, 3, 3, 4, 5, 6},
         {6, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 6},
         {6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6},
@@ -199,7 +221,6 @@ std::string zpad(int v, int width) {
     if ((int)s.size() < width) s = std::string(width - s.size(), '0') + s;
     return s;
 }
-int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
 
 // random.choices(POWERUP_KINDS, POWERUP_WEIGHTS)[0]
 std::string weighted_powerup() {
@@ -254,23 +275,66 @@ struct PowerUp {
         : x(cx - W / 2.0f), y(cy), kind(k), label(powerup_label(k)),
           color(powerup_color(k)) {}
     Rect rect() const { return {int(x), int(y), W, H}; }
-    void update(float dt, int screen_h) {
-        y += SPEED * dt;
+    void update(float dt, int screen_h, float speed_k = 1.0f) {
+        y += SPEED * speed_k * dt;
         t += dt;
         if (y > screen_h) alive = false;
     }
+    // label surface is rendered once, not every frame
+    mutable std::shared_ptr<Surface> txt_;
     void draw(Surface& s, Font& font) const {
         if (!alive) return;
         Rect r = rect();
-        float pulse = 0.7f + 0.3f * std::sin(t * 6);
+        bool bad = powerup_bad(kind);
+        float pulse = 0.7f + 0.3f * std::sin(t * (bad ? 12 : 6));
         Color c(int(color.r * pulse), int(color.g * pulse), int(color.b * pulse));
-        glow_rect(s, r, c, 6, 90);
-        draw::rect(s, c, r, 0, 3);
-        auto txt = font.render(label, Color(0, 0, 0));
-        s.blit(*txt, r.x + r.w / 2 - txt->width() / 2,
-               r.y + r.h / 2 - txt->height() / 2);
+        glow_rect(s, r, c, 4, 80);
+        if (bad) {   // hollow, flickering: a pill to dodge
+            draw::rect(s, Color(20, 6, 6), r, 0, 3);
+            draw::rect(s, c, r, 2, 3);
+        } else {
+            draw::rect(s, c, r, 0, 3);
+        }
+        if (!txt_) txt_ = font.render(label, bad ? color : Color(0, 0, 0));
+        s.blit(*txt_, r.x + r.w / 2 - txt_->width() / 2,
+               r.y + r.h / 2 - txt_->height() / 2);
     }
 };
+
+// ── Brick sprites ─────────────────────────────────────────────────────────────
+// A brick's glow + body used to be ~6 per-pixel rounded-rect passes per brick per
+// frame (up to 169 bricks). Each distinct colour is now baked once into a small
+// sprite and blitted. The halo is baked as coverage so it composites exactly like
+// the old direct draw did.
+constexpr int BRICK_PAD = 3;
+const Surface& brick_sprite(Color color, bool silver) {
+    static std::unordered_map<uint32_t, std::unique_ptr<Surface>> cache;
+    uint32_t key = (uint32_t(color.r) << 16) | (uint32_t(color.g) << 8) |
+                   uint32_t(color.b) | (silver ? 1u << 24 : 0u);
+    auto it = cache.find(key);
+    if (it != cache.end()) return *it->second;
+    const int P = BRICK_PAD, W = BRICK_W + 2 * P, H = BRICK_H + 2 * P;
+    Rect r{P, P, BRICK_W, BRICK_H};
+    Surface cov(W, H, false);                       // halo coverage, white on black
+    glow_rect(cov, r, Color(255, 255, 255), 3, 35);
+    auto sp = std::make_unique<Surface>(W, H, true);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x)
+            sp->set_at(x, y, Color(color.r, color.g, color.b, cov.get_at(x, y).r));
+    draw::rect(*sp, color, r, 0, 2);
+    draw::rect(*sp, Color(std::min(255, color.r + 60), std::min(255, color.g + 60),
+                          std::min(255, color.b + 60)),
+               {r.x + 2, r.y + 2, r.w - 4, 3}, 0, 1);
+    draw::rect(*sp, Color(color.r / 2, color.g / 2, color.b / 2), r, 1, 2);
+    if (silver) {   // riveted plate: reads as "can't be broken"
+        draw::line(*sp, Color(220, 220, 255), r.x + 4, r.y + 4,
+                   r.x + r.w - 4, r.y + r.h - 4, 1);
+        for (int rx : {r.x + 5, r.x + r.w - 6})
+            for (int ry : {r.y + 5, r.y + r.h - 6})
+                draw::rect(*sp, Color(90, 90, 110), {rx - 1, ry - 1, 2, 2});
+    }
+    return *cache.emplace(key, std::move(sp)).first->second;
+}
 
 // ── Brick ─────────────────────────────────────────────────────────────────────
 struct Brick {
@@ -281,11 +345,13 @@ struct Brick {
     // a high-precision x mirror (int x is rounded from it each frame).
     bool moving = false;
     float fx = 0.0f, mvx = 0.0f;
+    float flash = 0.0f;   // white pop when struck (chip or deflect)
     Brick(int c, int r, int px, int py, int h)
         : col(c), row(r), x(px), y(py), hp(h), max_hp(h), fx(float(px)) {}
     void make_moving(float speed) { moving = true; mvx = speed; fx = float(x); }
     // drift; bounce off the left/right walls (with a small margin so the glow fits).
     void move(float dt, int screen_w) {
+        if (flash > 0) flash -= dt * 5.0f;
         if (!moving || !alive) return;
         fx += mvx * dt;
         if (fx < 4) { fx = 4; mvx = std::fabs(mvx); }
@@ -297,15 +363,17 @@ struct Brick {
     // Genuine 1-shot bricks (max_hp==1) get a vibrant per-position colour;
     // multi-hit bricks keep the hp→colour mapping that telegraphs durability.
     Color color() const { return max_hp == 1 ? one_shot_brick_color(col, row) : brick_color(hp); }
+    // After a long stall the silver armour cracks so a level can always end.
+    void crack() { if (indestructible()) { hp = max_hp = 3; flash = 1.0f; } }
     bool hit() {
+        flash = 1.0f;
         if (indestructible()) return false;
         hp -= 1;
         if (hp <= 0) { alive = false; return true; }
         return false;
     }
-    void draw(Surface& s) const {
-        if (!alive) return;
-        Rect r = rect();
+    // the colour actually drawn (multi-hit bricks darken as they take damage)
+    Color shade() const {
         Color color = this->color();
         float dmg = max_hp > 1 ? 1.0f - float(hp) / max_hp : 0.0f;
         if (dmg > 0) {
@@ -313,15 +381,16 @@ struct Brick {
                           std::max(0, int(color.g * (1 - dmg * 0.5f))),
                           std::max(0, int(color.b * (1 - dmg * 0.5f))));
         }
-        glow_rect(s, r, color, 3, 35);
-        draw::rect(s, color, r, 0, 2);
-        draw::rect(s, Color(std::min(255, color.r + 60), std::min(255, color.g + 60),
-                            std::min(255, color.b + 60)),
-                   {r.x + 2, r.y + 2, r.w - 4, 3}, 0, 1);
-        draw::rect(s, Color(color.r / 2, color.g / 2, color.b / 2), r, 1, 2);
-        if (indestructible())
-            draw::line(s, Color(220, 220, 255), r.x + 4, r.y + 4,
-                       r.x + r.w - 4, r.y + r.h - 4, 1);
+        return color;
+    }
+    // yoff: vertical draw offset (level-intro drop-in); collision is unaffected.
+    void draw(Surface& s, int yoff = 0) const {
+        if (!alive) return;
+        Rect r = rect();
+        r.y += yoff;
+        s.blit(brick_sprite(shade(), indestructible()), r.x - BRICK_PAD, r.y - BRICK_PAD);
+        if (flash > 0)
+            draw::rect(s, Color(255, 255, 255, int(170 * std::min(1.0f, flash))), r, 0, 2);
         if (moving)  // little chevrons hint the brick is on the move
             draw::line(s, Color(255, 255, 255, 90),
                        r.x + r.w / 2 - 4, r.y + r.h / 2,
@@ -392,6 +461,9 @@ struct Paddle {
     static constexpr float SMASH_DRAIN = 1.6f;    // charge/sec lost when not held
     static constexpr float SMASH_MIN  = 0.5f;     // meter needed to trigger a smash
     static constexpr float SMASH_CD = 0.5f;       // brief re-arm after a smash
+    static constexpr float SMASH_HOLD = 0.7f;     // how long a FULL charge can be held
+    static constexpr float SMASH_FIZZLE_CD = 1.6f;  // lockout after overcharging
+    float full_t = 0;          // time spent held at full charge (overcharge clock)
     float smash_charge = 0;    // 0..SMASH_FULL, fills while held
     float smash_cd = 0;        // cooldown timer
     bool charging = false;
@@ -471,10 +543,15 @@ struct Ball {
     int brick_hits = 0;
     bool fire = false;   // mega/fire ball: smashes through bricks for a while
     float base_speed = BASE_SPEED;  // floor speed; raised by endless loops
+    float px = 0, py = 0;      // position before this step (side-aware reflection)
+    float smash_t = 0;         // SMASH: seconds of extra speed + pierce left
+    float smash_k = 0;         // SMASH strength 0..1 (how charged the hit was)
+    bool in_boss = false;      // piercing ball is inside the boss: one hit per pass
+    static constexpr float MIN_VY = 0.24f;   // |vy| floor as a fraction of speed
 
     // angle: NaN sentinel via has_angle flag.
-    Ball(float px, float py, bool has_angle = false, float angle = 0.0f)
-        : x(px), y(py) {
+    Ball(float bx, float by, bool has_angle = false, float angle = 0.0f)
+        : x(bx), y(by), px(bx), py(by) {
         if (!has_angle) {
             // wider, slightly randomized launch -> immediate side-to-side variance
             float offset = PI * (0.28f + rnd01() * 0.12f);  // ~50-72° off vertical
@@ -488,7 +565,24 @@ struct Ball {
     float current_target_speed() const {
         int tier = brick_hits / HITS_PER_TIER;
         float base = base_speed + tier * SPEED_STEP;
-        return std::min(MAX_SPEED, base * speed_mult);
+        float spd = std::min(MAX_SPEED, base * speed_mult);
+        // a SMASH really is faster for as long as it lasts (it used to be
+        // renormalised away on the very next frame)
+        if (smash_t > 0)
+            spd = std::max(spd, MAX_SPEED * (0.92f + 0.18f * smash_k));
+        return spd;
+    }
+    // Keep the ball from going (near) horizontal: a 2-degree ball crawls between
+    // the side walls for half a minute with nothing happening.
+    void enforce_min_vy() {
+        float s = speed();
+        if (s <= 0) return;
+        float floor_vy = s * MIN_VY;
+        if (std::fabs(vy) >= floor_vy) return;
+        float sy = vy > 0 ? 1.0f : -1.0f;
+        float sx = vx >= 0 ? 1.0f : -1.0f;
+        vy = sy * floor_vy;
+        vx = sx * std::sqrt(std::max(0.0f, s * s - vy * vy));
     }
     void set_speed(float spd) {
         float s = speed();
@@ -500,11 +594,15 @@ struct Ball {
     // returns 0=none, 1=wall, 2=lost
     int update(float dt, int screen_w, int screen_h, const Paddle& paddle) {
         if (attached) {
+            attach_offset = std::max(0.0f, std::min(float(paddle.w), attach_offset));
             x = paddle.x + attach_offset;
             y = paddle.y - r - 1;
+            px = x; py = y;
             return 0;
         }
         set_speed(current_target_speed());
+        enforce_min_vy();
+        px = x; py = y;
         x += vx * dt;
         y += vy * dt;
         if (x - r <= 0) { x = r; vx = std::abs(vx); return 1; }
@@ -531,6 +629,7 @@ struct Ball {
     void draw(Surface& s) const {
         if (!alive) return;
         Color core = fire ? Color(255, 120, 30) : color;
+        if (smash_t > 0) core = Color(255, 240, 200);
         int halo = fire ? r + 8 : r + 5;
         for (int rr = halo; rr > r; --rr) {
             float fr = float(rr - r) / (halo - r);
@@ -541,12 +640,6 @@ struct Ball {
         draw::circle(s, core, int(x), int(y), r);
         draw::circle(s, Color(255, 255, 255), int(x) - 2, int(y) - 2, std::max(1, r / 3));
     }
-};
-
-struct Flash {
-    std::string text;
-    float x, y, life;
-    Color color;
 };
 
 Color darker(Color c, float f) {
@@ -621,11 +714,14 @@ struct BossBullet {
 // paddle (gently — you're busy with the ball). The ball hurts it; pop it for a
 // power-up rain. A surprise spectacle, not a full boss fight.
 struct CameoInvader {
-    float x, y, vx, bob = 0, fire_t = 1.4f, crush_t = 0, die_t = 0;
+    float x, y, vx, bob = 0, fire_t = 1.4f, crush_t = 0, die_t = 0, burst_t = 0;
     int w = 132, h = 84, hp, max_hp, sprite_idx;
     Color col;
     bool alive = true, dying = false;
     static constexpr float DEATH = 0.9f;
+    static constexpr float MAX_Y = 250.0f;
+    float hit_flash = 0;
+    int crushed = 0;   // bricks crushed this update (read by the game)
     CameoInvader(int screen_w, int level) {
         sprite_idx = rnd_int(0, 3);
         const Color cs[4] = {Color(120, 255, 140), Color(200, 100, 255),
@@ -638,29 +734,37 @@ struct CameoInvader {
     Rect rect() const { return {int(x), int(y), w, h}; }
     bool take_hit(int dmg) {
         if (dying) return false;
-        hp -= dmg;
+        hp -= dmg; hit_flash = 0.16f;
         if (hp <= 0) { dying = true; die_t = 0; return true; }
         return false;
     }
     void update(float dt, int screen_w, float paddle_cx, std::vector<Brick>& bricks,
                 std::vector<BossBullet>& out, ParticleSystem& parts) {
         bob += dt;
+        crushed = 0;
+        if (hit_flash > 0) hit_flash -= dt;
         if (dying) {
             die_t += dt;
-            if (rnd01() < 0.6f) parts.explode_brick(x + rnd_uniform(0, w), y + rnd_uniform(0, h), col);
+            burst_t -= dt;   // timed, not per-frame, so it looks the same at any fps
+            if (burst_t <= 0) {
+                burst_t = 0.03f;
+                parts.explode_brick(x + rnd_uniform(0, w), y + rnd_uniform(0, h), col);
+            }
             if (die_t >= DEATH) alive = false;
             return;
         }
         x += vx * dt;
         if (x < 8) { x = 8; vx = std::fabs(vx); }
         if (x + w > screen_w - 8) { x = float(screen_w - 8 - w); vx = -std::fabs(vx); }
-        y += 7 * dt;  // creep downward
+        // creep downward, but never past mid-field: it used to sink forever,
+        // ending up on the paddle firing point-blank and then out of reach.
+        y = std::min(MAX_Y, y + 7 * dt);
         crush_t -= dt;
         if (crush_t <= 0) {  // crush bricks underfoot
             crush_t = 0.07f;
             for (auto& b : bricks)
                 if (b.alive && !b.indestructible() && overlap(rect(), b.rect())) {
-                    b.alive = false;
+                    b.alive = false; ++crushed;
                     parts.explode_brick(b.x + Brick::W / 2, b.y + Brick::H / 2, b.color());
                 }
         }
@@ -679,7 +783,8 @@ struct CameoInvader {
         int bx = int(x + (w - bw) / 2), by = int(y + (h - bh) / 2 + std::sin(bob * 2) * 3);
         if (bw < 4) return;
         draw::rect(s, Color(col.r, col.g, col.b, 70), {bx - 6, by - 6, bw + 12, bh + 12}, 0, 8);
-        draw_boss_alien(s, sprite_idx, int(bob * 4) % 2, bx, by, bw, bh, col);
+        draw_boss_alien(s, sprite_idx, int(bob * 4) % 2, bx, by, bw, bh,
+                        hit_flash > 0 ? lerp_color(col, WHITE, 0.6f) : col);
         int er = std::max(4, bh / 7), eyy = by + int(bh * 0.34f);
         for (int i = 0; i < 2; ++i) {
             int ex = bx + (i ? 2 * bw / 3 : bw / 3);
@@ -964,7 +1069,13 @@ struct Boss {
         Color body = hit_flash > 0 ? lerp_color(color, WHITE, 0.6f) : color;
         // enrage tints the body redder so the phase reads at a glance
         if (!dying && !faking && phase == 3) body = lerp_color(body, RED, 0.25f);
-        glow_rect(s, {bx, by, bw, bh}, body, 8, 60);
+        // soft outer glow: a few cheap translucent layers (8 full-size rounded
+        // fills per frame was the single most expensive draw in the game)
+        for (int gi = 3; gi >= 1; --gi) {
+            int pad = gi * 3;
+            draw::rect(s, Color(body.r, body.g, body.b, 20),
+                       {bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad}, 0, 8 + pad);
+        }
         // a GIANT INVADER built from bricks (shared pixel-alien art, brick texture)
         draw_boss_alien(s, (tier - 1) % 4, int(bob * 3) % 2, bx, by, bw, bh, body, true);
         if (invuln_ > 0) {  // spawn shield shimmer: not yet damageable
@@ -1015,7 +1126,16 @@ struct Boss {
 };
 
 // ── Game ──────────────────────────────────────────────────────────────────────
-enum class St { Ready, Play, Dead, Win, GameOver, Victory };
+enum class St { Ready, Play, Dead, Win, GameOver };
+
+// Floating text. `banner` popups are announcements: medium font, screen-centred,
+// on a dark plate so they stay readable over a wall of bricks.
+struct Popup {
+    std::string text;
+    float x, y, life, max_life;
+    Color color;
+    bool banner;
+};
 
 class ArkanoidGame : public Scene {
 public:
@@ -1033,19 +1153,27 @@ public:
 
 private:
     static constexpr float AMBIENT_STAR_T = 0.2f;
+    static constexpr float STALL_CRACK_T = 60.0f;   // no brick broken for this long → silver cracks
+    static constexpr int JUGGLE_MAX = 4;
     PauseMenu pause_;
     InitialsEntry initials_;
     bool entry_started_ = false;
+    bool exit_entry_ = false;     // initials entry opened by quitting mid-run
     ParticleSystem particles_;
     int high_score_ = 0;
     float star_t_ = 0;
-    std::vector<Flash> flash_;
+    std::vector<Popup> flash_;
     bool submitted_ = false;
+    bool new_hi_ = false;
+    bool pad_ = false;            // a gamepad is connected → pad prompts
+    float go_t_ = 0;              // seconds since game over began
 
-    int score_, lives_, level_idx_;
-    St state_;
-    float dead_t_ = 0, win_t_ = 0;
+    int score_ = 0, lives_ = 3, level_idx_ = 0;
+    St state_ = St::Ready;
+    float dead_t_ = 0, win_t_ = 0, win_total_ = 0;
     float ready_t_ = 0;   // brief "get ready" grace so a carried-over press doesn't auto-launch
+    float intro_t_ = 0;   // level-intro clock (bricks drop in)
+    float stall_t_ = 0;   // seconds since a brick last broke (stall rescue)
 
     std::unique_ptr<Paddle> paddle_;
     std::vector<Ball> balls_;
@@ -1053,8 +1181,10 @@ private:
     std::vector<Well> wells_;              // gravity/wind wells (later levels)
     std::vector<PowerUp> powerups_;
     std::vector<Laser> lasers_;
-    // power-up timers: insertion-ordered (kind, seconds remaining).
+    // power-up timers: insertion-ordered (kind, seconds remaining). The paddle /
+    // ball state is DERIVED from these (plus the stage event) in refresh_effects().
     std::vector<std::pair<std::string, float>> pw_timers_;
+    bool smash_need_release_ = false;      // after an overcharge: let go before recharging
 
     // ── progression + boss + juice + telemetry ──
     std::unique_ptr<Boss> boss_;
@@ -1072,25 +1202,36 @@ private:
     float game_t_ = 0, level_t0_ = 0;      // accumulating game clock
     int lvl_bricks_ = 0, lvl_balls_lost_ = 0, lvl_powerups_ = 0;  // per-level counters
     float white_flash_ = 0;                // full-screen pop on boss death / clear
+    bool bot_ = false;
 
     void tele(const J& j) { if (ctx_.tele) ctx_.tele->event(j); }
     // displayed level number (1-based). Boss every 5th level.
     int level_num() const { return level_idx_ + 1; }
     bool is_boss_level(int n) const { return n % 5 == 0; }
 
+    void add_score(int pts) {
+        score_ += pts;
+        high_score_ = std::max(high_score_, score_);
+    }
+
     void new_game() {
         score_ = 0;
         lives_ = 3;
         level_idx_ = 0;
         entry_started_ = false;
+        exit_entry_ = false;
         particles_.clear();
         flash_.clear();
         submitted_ = false;
+        new_hi_ = false;
+        go_t_ = 0;
         game_t_ = 0;
+        white_flash_ = 0;
         int start = 0;
         bot_ = std::getenv("VOID_BOT") != nullptr || ctx_.demo;
         if (const char* e = std::getenv("VOID_LEVEL")) start = std::max(0, atoi(e) - 1);
         level_idx_ = start;
+        if (ctx_.sfx && !ctx_.demo) ctx_.sfx->start_music(3);
         load_level();
     }
     void load_level() {
@@ -1121,10 +1262,14 @@ private:
         state_ = St::Ready;
         dead_t_ = 0;
         win_t_ = 0;
+        intro_t_ = 0;
+        stall_t_ = 0;
+        smash_need_release_ = false;
         ready_t_ = 0.9f;   // hold the ball on the paddle a beat (ignores the carried-over
                            // launcher-select press) and play a "get ready" tune
         if (ctx_.sfx) ctx_.sfx->spawn_chime();
         pw_timers_.clear();
+        event_ = Ev::COUNT; ev_score_mult_ = 1; ev_speed_mult_ = 1.0f;
 
         if (boss_level_) {
             boss_ = std::make_unique<Boss>(n, ctx_.W);
@@ -1139,7 +1284,6 @@ private:
 
         // Stage EVENT: most non-boss levels roll a fun modifier so each stage is a
         // surprise, not just another wall. Announced with a big banner.
-        event_ = Ev::COUNT; ev_score_mult_ = 1; ev_speed_mult_ = 1.0f;
         if (const char* e = std::getenv("VOID_EVENT")) {   // debug: force a stage event
             event_ = Ev(std::clamp(atoi(e), 0, int(Ev::COUNT) - 1));
             apply_event();
@@ -1152,8 +1296,8 @@ private:
         // frequent + earlier so the surprises land often.
         if (!boss_level_ && (std::getenv("VOID_FORCE_CAMEO") || (n >= 2 && rnd01() < 0.30f))) {
             cameo_ = std::make_unique<CameoInvader>(ctx_.W, n);
-            add_flash("⚠  INVADER INCURSION  ⚠", ctx_.W / 2, ctx_.H / 2 - 30, RED, 2.0f);
-            if (ctx_.sfx) ctx_.sfx->life_lost();
+            add_banner("INVADER INCURSION", ctx_.H / 2 - 36, RED, 2.2f);
+            if (ctx_.sfx) ctx_.sfx->boss_alarm();
             if (ctx_.fx) ctx_.fx->shake(8);
         }
 
@@ -1161,6 +1305,7 @@ private:
         if (ctx_.fx)
             ctx_.fx->palette_hue = 0.18f * std::sin(n * 0.5f) + (boss_level_ ? -0.12f : 0.0f);
 
+        refresh_effects();
         level_t0_ = game_t_;
         lvl_bricks_ = lvl_balls_lost_ = lvl_powerups_ = 0;
         tele(J().add("ev", "level_start").add("level", n)
@@ -1168,21 +1313,20 @@ private:
                 .add("lives", lives_).add("base_speed", (double)base_speed_));
     }
 
-    // Apply the rolled stage event: reuse the existing power-up machinery where we
-    // can. Effects last the level and reset on the next load_level (fresh paddle +
-    // balls), so no timers to babysit.
+    // Apply the rolled stage event. The effect itself lives in refresh_effects()
+    // (derived from event_), so it survives life losses and power-up expiries for
+    // the whole level — it used to be silently cancelled by either.
     void apply_event() {
         std::string name; Color col(255, 210, 60);
         switch (event_) {
             case Ev::GoldRush:   ev_score_mult_ = 2; name = "GOLD RUSH   x2 SCORE"; col = Color(255, 210, 60); break;
-            case Ev::LaserStorm: paddle_->laser_on = true; name = "LASER STORM"; col = Color(255, 120, 120); break;
-            case Ev::Multiball:  attach_ball(); attach_ball(); name = "MULTIBALL MADNESS"; col = Color(90, 220, 255); break;
+            case Ev::LaserStorm: name = "LASER STORM"; col = Color(255, 120, 120); break;
+            case Ev::Multiball:  spread_start_balls(); name = "MULTIBALL MADNESS"; col = Color(90, 220, 255); break;
             case Ev::Frenzy:     ev_speed_mult_ = 1.35f; name = "FRENZY"; col = Color(255, 150, 40); break;
             case Ev::Slowmo:     ev_speed_mult_ = 0.70f; name = "SLOW MOTION"; col = Color(120, 200, 255); break;
             default: return;
         }
-        for (auto& b : balls_) b.speed_mult = ev_speed_mult_;
-        add_flash(name, ctx_.W / 2, ctx_.H / 2 - 60, col, 2.4f);
+        add_banner(name, ctx_.H / 2 - 70, col, 2.4f);
         if (ctx_.sfx) ctx_.sfx->powerup_collect();
         tele(J().add("ev", "stage_event").add("level", level_num()).add("event", name));
     }
@@ -1201,6 +1345,8 @@ private:
     // SHIELD_UP attack: drop a band of real bricks just below the boss so the ball
     // has to chew through them before it can reach the boss again. Spawned inside
     // the boss's horizontal span; respects the screen brick grid for tidy alignment.
+    // Cells that already hold a brick (an earlier shield, the decor row) are
+    // skipped — repeated casts used to stack duplicates on the same spot.
     void spawn_boss_shield(int rows, int hp) {
         if (!boss_) return;
         int total_w = BRICK_COLS * (BRICK_W + BRICK_GAP) - BRICK_GAP;
@@ -1214,7 +1360,14 @@ private:
                 // can still find a route up (keeps it fair)
                 if (bxp + BRICK_W < boss_->x || bxp > boss_->x + boss_->w) continue;
                 if (ci % 4 == 2) continue;  // a periodic gap
+                Rect nr{bxp - BRICK_GAP, yy - BRICK_GAP, BRICK_W + 2 * BRICK_GAP,
+                        BRICK_H + 2 * BRICK_GAP};
+                bool taken = false;
+                for (auto& b : bricks_)
+                    if (b.alive && overlap(nr, b.rect())) { taken = true; break; }
+                if (taken) continue;
                 bricks_.emplace_back(ci, 20 + r, bxp, yy, hp);
+                bricks_.back().flash = 1.0f;
             }
         }
     }
@@ -1251,6 +1404,7 @@ private:
             for (int ci = 2; ci < BRICK_COLS - 2; ++ci)
                 bricks_.emplace_back(ci, rows / 2, start_x + ci * (BRICK_W + BRICK_GAP), y, 1);
         }
+        ensure_reachable(rows);
 
         // ── MOVING BRICKS: from the 2nd endless loop, a couple of lower rows drift
         // sideways so the layout breathes. Indestructibles stay put (anchors). ──
@@ -1283,6 +1437,50 @@ private:
             }
         }
     }
+    // Reachability: the ball can't squeeze through the 2px seams, so a destructible
+    // brick walled in by silver on all four sides can never be hit and the level
+    // could never end. Flood-fill from outside the grid through everything that
+    // isn't silver; wherever a pocket is sealed, downgrade the silver around it to
+    // a tough-but-breakable brick. Repeats until every cell is reachable.
+    void ensure_reachable(int rows) {
+        const int C = BRICK_COLS;
+        if (rows <= 0) return;
+        for (int guard = 0; guard < 64; ++guard) {
+            std::vector<Brick*> at(size_t(rows * C), nullptr);
+            for (auto& b : bricks_)
+                if (b.row >= 0 && b.row < rows && b.col >= 0 && b.col < C)
+                    at[size_t(b.row * C + b.col)] = &b;
+            auto silver = [&](int i) { return at[size_t(i)] && at[size_t(i)]->indestructible(); };
+            std::vector<char> seen(size_t(rows * C), 0);
+            std::vector<int> q;
+            auto push = [&](int r, int c) {
+                if (r < 0 || r >= rows || c < 0 || c >= C) return;
+                int i = r * C + c;
+                if (seen[size_t(i)] || silver(i)) return;
+                seen[size_t(i)] = 1; q.push_back(i);
+            };
+            for (int c = 0; c < C; ++c) { push(0, c); push(rows - 1, c); }
+            for (int r = 0; r < rows; ++r) { push(r, 0); push(r, C - 1); }
+            while (!q.empty()) {
+                int i = q.back(); q.pop_back();
+                int r = i / C, c = i % C;
+                push(r - 1, c); push(r + 1, c); push(r, c - 1); push(r, c + 1);
+            }
+            bool fixed = false;
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < C; ++c) {
+                    int i = r * C + c;
+                    if (seen[size_t(i)] || silver(i)) continue;   // reachable, or a wall
+                    const int nb[4][2] = {{r - 1, c}, {r + 1, c}, {r, c - 1}, {r, c + 1}};
+                    for (auto& n : nb) {
+                        if (n[0] < 0 || n[0] >= rows || n[1] < 0 || n[1] >= C) continue;
+                        int j = n[0] * C + n[1];
+                        if (silver(j)) { at[size_t(j)]->hp = at[size_t(j)]->max_hp = 3; fixed = true; }
+                    }
+                }
+            if (!fixed) return;   // nothing sealed (or nothing left to open)
+        }
+    }
     void build_bricks(const Layout& layout) {
         int total_w = BRICK_COLS * (BRICK_W + BRICK_GAP) - BRICK_GAP;
         int start_x = (ctx_.W - total_w) / 2;
@@ -1295,17 +1493,32 @@ private:
                 bricks_.emplace_back(ci, ri, x, y, hp);
             }
     }
-    void attach_ball() {
-        // Launch at ~30° off vertical (random side) so the ball immediately drifts
-        // sideways — a straight-up launch just bounces in place with no input.
+    // frac: where on the paddle the ball sits (0..1). side: -1 launch left, +1
+    // launch right, 0 random.
+    void attach_ball(float frac = 0.5f, int side = 0) {
+        // Launch at ~30° off vertical so the ball immediately drifts sideways — a
+        // straight-up launch just bounces in place with no input.
         float off = PI * (0.15f + rnd01() * 0.06f);   // ~27-38° from vertical
-        if (rnd01() < 0.5f) off = -off;
-        Ball b(paddle_->center_x(), paddle_->y - 8, true, -PI / 2 + off);
+        bool left = side == 0 ? rnd01() < 0.5f : side < 0;
+        if (left) off = -off;
+        Ball b(paddle_->x + paddle_->w * frac, paddle_->y - 8, true, -PI / 2 + off);
         b.attached = true;
-        b.attach_offset = paddle_->w / 2.0f;
+        b.attach_offset = paddle_->w * frac;
         b.base_speed = base_speed_;
         b.speed_mult = ev_speed_mult_;   // Frenzy/Slowmo events flavour the pace
         balls_.push_back(b);
+    }
+    // MULTIBALL MADNESS: three balls side by side, fanning out — they used to be
+    // stacked on the same pixel and read as a single ball.
+    void spread_start_balls() {
+        balls_.clear();
+        attach_ball(0.2f, -1);
+        attach_ball(0.5f, 0);
+        attach_ball(0.8f, +1);
+    }
+    void start_life_balls() {
+        if (event_ == Ev::Multiball) spread_start_balls();
+        else attach_ball();
     }
     int destructible_count() const {
         int n = 0;
@@ -1323,9 +1536,15 @@ private:
     int juggle_mult() const {
         return std::min(JUGGLE_MAX, std::max(1, active_ball_count()));
     }
-    static constexpr int JUGGLE_MAX = 4;
     void add_flash(const std::string& t, float x, float y, Color c, float life = 0.8f) {
-        flash_.push_back({t, x, y, life, c});
+        flash_.push_back({t, x, y, life, life, c, false});
+    }
+    void add_banner(const std::string& t, float y, Color c, float life = 2.0f) {
+        // one banner per row: a newer announcement replaces the one it would cover
+        flash_.erase(std::remove_if(flash_.begin(), flash_.end(),
+                     [&](const Popup& f) { return f.banner && std::fabs(f.y - y) < 30; }),
+                     flash_.end());
+        flash_.push_back({t, ctx_.W / 2.0f, y, life, life, c, true});
     }
     void submit_scores() {
         if (ctx_.demo) return;  // attract demo never touches the leaderboard
@@ -1334,11 +1553,27 @@ private:
         tele(J().add("ev", "game_over").add("level", level_num()).add("score", score_)
                 .add("t", (double)game_t_));
         if (ctx_.scores) {
-            bool new_hi = ctx_.scores->submit_arkanoid(score_, level_idx_ + 1);
-            if (new_hi)
-                add_flash("NEW HI-SCORE!", ctx_.W / 2, ctx_.H / 2 - 40, YELLOW, 2.5f);
+            new_hi_ = ctx_.scores->submit_arkanoid(score_, level_idx_ + 1);
             high_score_ = ctx_.scores->high_score("arkanoid");
         }
+    }
+    // Start the 3-letter entry if this run makes the board. Returns true if it opened.
+    bool begin_initials() {
+        if (!ctx_.scores || ctx_.demo || bot_ || entry_started_) return false;
+        const std::string gid = "arkanoid";
+        if (!ctx_.scores->qualifies(gid, score_)) return false;
+        entry_started_ = true;
+        int rank = 1;
+        for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
+        initials_.begin("VOID BREAKER", score_, rank);
+        return true;
+    }
+    // Leave for the menu. A run that makes the leaderboard gets its initials
+    // entered first instead of being dropped.
+    void request_exit() {
+        submit_scores();
+        if (state_ != St::GameOver && begin_initials()) { exit_entry_ = true; return; }
+        quit_to_menu = true;
     }
 
     float* pw_timer(const std::string& k) {
@@ -1355,15 +1590,20 @@ private:
                          pw_timers_.end());
     }
 
+    void refresh_effects();
     void update_ready(float dt, const Input& in);
     void update_play(float dt, const Input& in);
+    void update_win(float dt, const Input& in);
+    void update_smash(float dt, const Input& in);
+    void update_boss_events();
+    void collide_ball(Ball& ball);
+    void break_brick(Brick& brick, Color bc, bool by_ball);
+    void cameo_down();
+    void pop_projectiles();
     float paddle_dir(const Input& in);
-    bool bot_ = false;
-    void reflect_ball_off_brick(Ball& ball, Rect br);
+    void reflect_ball(Ball& ball, Rect br);
     void smash_ball(Ball& b, float charge);
     void collect_powerup(const PowerUp& pw);
-    void deactivate_powerup(const std::string& k);
-    void deactivate_all_powerups();
     void lose_life();
     void win_level();
 
@@ -1372,41 +1612,53 @@ private:
     void draw_flash(Surface& s);
 };
 
+// Derive paddle/ball state from the active power-up timers and the stage event.
+// One source of truth: a timer running out (or a life lost) can no longer leave
+// the paddle the wrong size, the ball at the wrong speed, or cancel a stage event.
+void ArkanoidGame::refresh_effects() {
+    int want = pw_timer("expand") ? PADDLE_W_BIG
+             : pw_timer("shrink") ? PADDLE_W_SMALL : PADDLE_W_NORMAL;
+    if (paddle_->w != want) paddle_->set_width(want);
+    paddle_->laser_on = pw_timer("laser") != nullptr || event_ == Ev::LaserStorm;
+    bool catch_now = pw_timer("catch") != nullptr;
+    if (paddle_->catch_on && !catch_now && state_ == St::Play)
+        for (auto& b : balls_) if (b.attached) b.release();   // CATCH ran out: let go
+    paddle_->catch_on = catch_now;
+    float k = ev_speed_mult_ * (pw_timer("slow") ? 0.6f : pw_timer("fast") ? 1.6f : 1.0f);
+    bool fire_all = pw_timer("fire") != nullptr;
+    for (auto& b : balls_) {
+        b.speed_mult = k;
+        b.fire = fire_all || b.smash_t > 0;
+    }
+}
+
 void ArkanoidGame::update(float dt, const Input& in) {
-    // pause handling
-    for (auto k : in.pressed)
-        if (k == SDLK_p && (state_ == St::Play || state_ == St::Ready))
-            pause_.toggle();
-    if (pause_.active()) {
-        if (pause_.update(in) == PauseResult::QuitToMenu) {
-            submit_scores();
-            quit_to_menu = true;
-        }
+    pad_ = in.pad_connected;
+
+    // quitting mid-run with a leaderboard score: initials first, then leave
+    if (exit_entry_) {
+        if (initials_.update(in) && ctx_.scores)
+            ctx_.scores->add_score("arkanoid", initials_.name(), score_);
+        if (!initials_.active() || in.just(SDLK_ESCAPE)) quit_to_menu = true;
         return;
     }
-    for (auto k : in.pressed)
-        if (k == SDLK_ESCAPE) { quit_to_menu = true; return; }
+
+    // pause works everywhere except the game-over screen (which has its own menu key)
+    // ESC opens the pause menu too (quit lives there) instead of dropping the run.
+    if ((in.just(SDLK_p) || (in.just(SDLK_ESCAPE) && !pause_.active())) && state_ != St::GameOver) pause_.toggle();
+    if (pause_.active()) {
+        if (pause_.update(in) == PauseResult::QuitToMenu) request_exit();
+        return;
+    }
 
     game_t_ += dt;
     if (white_flash_ > 0) white_flash_ -= dt * 2.0f;
     star_t_ += dt;
     if (star_t_ >= AMBIENT_STAR_T) { star_t_ = 0; particles_.ambient_star(ctx_.W, ctx_.H); }
     particles_.update(dt);
-    for (auto& f : flash_) f.life -= dt;
+    for (auto& f : flash_) { f.life -= dt; if (!f.banner) f.y -= 18.0f * dt; }
     flash_.erase(std::remove_if(flash_.begin(), flash_.end(),
-                 [](const Flash& f) { return f.life <= 0; }), flash_.end());
-
-    // tick power-up timers
-    for (size_t i = 0; i < pw_timers_.size();) {
-        pw_timers_[i].second -= dt;
-        if (pw_timers_[i].second <= 0) {
-            std::string k = pw_timers_[i].first;
-            deactivate_powerup(k);
-            pw_timers_.erase(pw_timers_.begin() + i);
-        } else {
-            ++i;
-        }
-    }
+                 [](const Popup& f) { return f.life <= 0; }), flash_.end());
 
     if (state_ == St::Ready) {
         update_ready(dt, in);
@@ -1414,64 +1666,318 @@ void ArkanoidGame::update(float dt, const Input& in) {
         update_play(dt, in);
     } else if (state_ == St::Dead) {
         dead_t_ -= dt;
+        intro_t_ += dt;
+        for (auto& b : bricks_) if (b.flash > 0) b.flash -= dt * 5.0f;
         if (dead_t_ <= 0) {
-            if (lives_ > 0) { attach_ball(); state_ = St::Ready; }
-            else { state_ = St::GameOver; submit_scores(); }
+            if (lives_ > 0) {
+                paddle_->x = float(ctx_.W / 2 - paddle_->w / 2);
+                start_life_balls();
+                state_ = St::Ready;
+                ready_t_ = 0.3f;
+                if (ctx_.sfx) ctx_.sfx->spawn_chime();
+            } else {
+                state_ = St::GameOver;
+                go_t_ = 0;
+                submit_scores();
+                if (ctx_.sfx && !bot_) ctx_.sfx->game_over();
+            }
         }
     } else if (state_ == St::Win) {
-        win_t_ -= dt;
-        if (win_t_ <= 0) {
-            level_idx_ += 1;     // endless: keep going past the hand-made levels
-            load_level();
+        update_win(dt, in);
+    } else if (state_ == St::GameOver) {
+        // self-play loops for data (VOID_HOLD_GAMEOVER: debug, stay on this screen)
+        if (bot_ && !std::getenv("VOID_HOLD_GAMEOVER")) { new_game(); return; }
+        go_t_ += dt;
+        if (!entry_started_) begin_initials();
+        if (initials_.active()) {
+            if (initials_.update(in) && ctx_.scores)
+                ctx_.scores->add_score("arkanoid", initials_.name(), score_);
+            go_t_ = 0;   // the retry lockout starts once the entry is done
+            return;      // block retry while entering initials
         }
-    } else if (state_ == St::GameOver || state_ == St::Victory) {
-        if (bot_) { new_game(); return; }  // self-play loops for data
-        if (ctx_.scores) {
-            const std::string gid = "arkanoid";
-            if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
-                entry_started_ = true;
-                int rank = 1;
-                for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
-                initials_.begin("VOID BREAKER", score_, rank);
-            }
-            if (initials_.active()) {
-                if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
-                return;   // block retry while entering initials
-            }
-        }
-        for (auto k : in.pressed)
-            if (k == SDLK_RETURN || k == SDLK_SPACE) new_game();
+        if (ui::game_over_retry(in, go_t_)) new_game();
+        else if (ui::game_over_menu(in, go_t_)) quit_to_menu = true;
     }
 }
 
 float ArkanoidGame::paddle_dir(const Input& in) {
     if (bot_) {
         float target = paddle_->center_x(), lowy = -1e9f;
-        for (auto& b : balls_) if (b.alive && b.y > lowy) { lowy = b.y; target = b.x; }
+        bool have_ball = false;
+        for (auto& b : balls_) if (b.alive && b.y > lowy) { lowy = b.y; target = b.x; have_ball = true; }
+        if (!have_ball)   // nothing to return: go and catch the falling pills
+            for (auto& p : powerups_) if (p.alive && p.y > lowy) { lowy = p.y; target = p.x + PowerUp::W / 2; }
         // hit the ball off-centre (oscillating) so it angles and spreads to clear
-        target += std::sin(game_t_ * 2.3f) * 26.0f;
+        if (have_ball) target += std::sin(game_t_ * 2.3f) * 26.0f;
         float cx = paddle_->center_x();
         return target > cx + 4 ? 1.0f : target < cx - 4 ? -1.0f : 0.0f;
     }
     return (in.down(SDLK_RIGHT) || in.down(SDLK_d)) - (in.down(SDLK_LEFT) || in.down(SDLK_a));
 }
 
+// Boss entrance / one-shot boss requests that the game turns into banners, bricks
+// and projectiles. Shared by Ready (the boss stomps in while you line up the
+// launch — the arena used to sit empty until the ball was in play) and Play.
+void ArkanoidGame::update_boss_events() {
+    if (!boss_) return;
+    if (boss_->just_stomped) {
+        boss_->just_stomped = false;
+        if (!boss_revealed_) {
+            boss_revealed_ = true;
+            add_banner("!!  " + boss_->name + "  !!", 300, RED, 2.0f);
+            if (ctx_.sfx) ctx_.sfx->boss_alarm();
+        }
+        for (int i = 0; i < 5; ++i)
+            particles_.bunker_hit(boss_->x + rnd_uniform(0, boss_->w), boss_->y + boss_->h);
+        if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->rumble_boss_step(); }
+    }
+    if (boss_->fake_started) {
+        boss_->fake_started = false;
+        add_banner("...JUST KIDDING!", 300, YELLOW, 1.6f);
+    }
+    // ── SHIELD_UP: materialise a band of real bricks in front of the boss ──
+    if (boss_->shield_req.pending) {
+        boss_->shield_req.pending = false;
+        spawn_boss_shield(boss_->shield_req.rows, boss_->shield_req.hp);
+        add_flash("SHIELDS UP!", boss_->x + boss_->w / 2, boss_->y + boss_->h + 6, CYAN, 1.2f);
+        if (ctx_.sfx) ctx_.sfx->shield_hit();
+    }
+    // ── SURPRISE: brick avalanche — a screen-wide curtain of bricks rains down ──
+    if (boss_->avalanche_pending) {
+        boss_->avalanche_pending = false;
+        int gap = rnd_int(2, BRICK_COLS - 3);  // one safe lane to escape through
+        for (int ci = 0; ci < BRICK_COLS; ++ci) {
+            if (std::abs(ci - gap) <= 1) continue;
+            float px = (ci + 0.5f) * (ctx_.W / float(BRICK_COLS));
+            boss_shots_.emplace_back(px, -rnd_uniform(0, 120), 0.0f,
+                                     150.0f, darker(boss_->color, 0.7f), false);
+        }
+        add_banner("AVALANCHE!!", ctx_.H / 2 - 40, RED, 2.0f);
+        if (ctx_.sfx) ctx_.sfx->boss_alarm();
+        if (ctx_.fx) ctx_.fx->shake(14);
+    }
+    // ── SURPRISE: the boss SPLITS into two weaving brick-minions and keeps fighting ──
+    if (boss_->split_pending) {
+        boss_->split_pending = false;
+        for (int i = 0; i < (boss_->tier >= 3 ? 4 : 3); ++i) {
+            float px = boss_->x + rnd_uniform(0, boss_->w);
+            boss_shots_.emplace_back(px, boss_->y + boss_->h * 0.5f,
+                                     rnd_uniform(-60, 60), 90.0f,
+                                     lerp_color(boss_->color, WHITE, 0.2f), true);
+        }
+        add_banner("IT SPLIT!!", 300, PURPLE, 1.8f);
+        if (ctx_.sfx) ctx_.sfx->boss_explosion();
+        if (ctx_.fx) ctx_.fx->shake(12);
+    }
+}
+
 void ArkanoidGame::update_ready(float dt, const Input& in) {
+    refresh_effects();
+    intro_t_ += dt;
     if (ready_t_ > 0) ready_t_ -= dt;   // "get ready" grace before the ball can launch
     paddle_->update(dt, paddle_dir(in));
-    for (auto& b : balls_) {
-        if (b.attached) {
-            b.x = paddle_->x + b.attach_offset;
-            b.y = paddle_->y - b.r - 1;
-        }
+    for (auto& b : bricks_) if (b.flash > 0) b.flash -= dt * 5.0f;
+    if (boss_ && boss_->entering) {     // the boss lumbers in while you aim
+        boss_->update(dt, ctx_.W, ctx_.H, float(paddle_->center_x()), boss_shots_, boss_bullets_);
+        update_boss_events();
     }
+    for (auto& b : balls_) b.update(dt, ctx_.W, ctx_.H, *paddle_);
     bool launch = bot_;
     for (auto k : in.pressed)
         if (k == SDLK_SPACE || k == SDLK_UP || k == SDLK_w) launch = true;
     if (launch && ready_t_ <= 0) { for (auto& b : balls_) b.release(); state_ = St::Play; }
 }
 
+// ── SMASH: HOLD the button to charge the meter; it drains when released, so you
+// time the pre-charge to peak as the ball reaches the paddle. Sitting on a full
+// charge OVERHEATS it (lockout, and you must let go before charging again) — just
+// holding the button down all level used to make every paddle hit a smash.
+void ArkanoidGame::update_smash(float dt, const Input& in) {
+    Paddle& p = *paddle_;
+    bool hold = !bot_ && (in.down(SDLK_LSHIFT) || in.down(SDLK_RSHIFT) || in.pad[PadBtnB] ||
+                          in.pad[PadThrUp] || in.pad[PadThrDown]);
+    if (!hold) smash_need_release_ = false;
+    p.armed = hold && p.smash_cd <= 0 && !smash_need_release_;
+    p.charging = p.armed;
+    if (p.armed) {
+        p.smash_charge = std::min(Paddle::SMASH_FULL, p.smash_charge + dt * Paddle::SMASH_RATE);
+        if (p.smash_charge >= Paddle::SMASH_FULL) {
+            p.full_t += dt;
+            if (ctx_.fx) ctx_.fx->rumble_charge(1.0f);
+            if (p.full_t >= Paddle::SMASH_HOLD) {   // held too long: it fizzles
+                p.smash_charge = 0; p.full_t = 0;
+                p.smash_cd = Paddle::SMASH_FIZZLE_CD;
+                smash_need_release_ = true;
+                p.armed = p.charging = false;
+                add_flash("OVERHEAT!", p.center_x(), p.y - 26, Color(255, 110, 60), 0.9f);
+                particles_.paddle_hit(p.center_x(), int(p.y), 14);
+                if (ctx_.sfx) ctx_.sfx->armor_tink();
+            }
+        }
+    } else {
+        p.full_t = 0;
+        p.smash_charge = std::max(0.0f, p.smash_charge - dt * Paddle::SMASH_DRAIN);
+    }
+}
+
+void ArkanoidGame::pop_projectiles() {
+    for (auto& bs : boss_shots_)
+        if (bs.alive) particles_.explode_brick(int(bs.x + BossShot::W / 2), int(bs.y), bs.color, 8);
+    for (auto& bb : boss_bullets_)
+        if (bb.alive) particles_.explode_brick(int(bb.x), int(bb.y), bb.color, 6);
+    boss_shots_.clear();
+    boss_bullets_.clear();
+}
+
+void ArkanoidGame::cameo_down() {
+    if (!cameo_) return;
+    float cx = cameo_->x + cameo_->w / 2, cy = cameo_->y + cameo_->h / 2;
+    add_score(800 + level_num() * 40);
+    add_banner("INVADER DOWN!", ctx_.H / 2 - 36, YELLOW, 1.6f);
+    if (ctx_.sfx) ctx_.sfx->big_explosion();
+    if (ctx_.fx) {
+        ctx_.fx->shake(14); ctx_.fx->hitstop(0.05f);
+        ctx_.fx->rumble_explosion();
+        ctx_.fx->shockwave(cx / float(ctx_.W), cy / float(ctx_.H));
+    }
+    const char* rain[3] = {"expand", "multi", "life"};
+    for (int i = 0; i < 3; ++i)
+        powerups_.emplace_back(cx + (i - 1) * 56.0f, cameo_->y + 30.0f, std::string(rain[i]));
+    // its shots die with it
+    boss_bullets_.clear();
+}
+
+// A destructible brick just broke (by ball, laser or fire).
+void ArkanoidGame::break_brick(Brick& brick, Color bc, bool by_ball) {
+    Rect br = brick.rect();
+    int cx = br.x + br.w / 2, cy = br.y + br.h / 2;
+    particles_.explode_brick(cx, cy, bc);   // shards in the brick's own colour
+    lvl_bricks_++;
+    stall_t_ = 0;
+    int pts = brick.max_hp * 10 * ev_score_mult_;
+    if (by_ball) pts *= (ctx_.combo ? ctx_.combo->hit() : 1) * juggle_mult();
+    add_score(pts);
+    add_flash("+" + std::to_string(pts), cx, cy - 8, YELLOW);
+    if (ctx_.sfx) { ctx_.sfx->pan_next(cx / float(ctx_.W)); ctx_.sfx->brick_break(); }
+    if (ctx_.fx) ctx_.fx->rumble_tap();
+    float puc = event_ == Ev::GoldRush ? 0.36f : POWERUP_CHANCE;  // GOLD RUSH showers power-ups
+    if (by_ball && powerups_.size() < 12 && rnd01() < puc)
+        powerups_.emplace_back(float(cx), float(cy), weighted_powerup());
+}
+
+// Everything one ball can hit after it has moved one (sub)step.
+void ArkanoidGame::collide_ball(Ball& ball) {
+    // paddle collision
+    if (ball.vy > 0 && overlap(ball.rect(), paddle_->rect())) {
+        if (paddle_->catch_on) {
+            ball.attached = true;
+            ball.attach_offset = ball.x - paddle_->x;
+            return;
+        }
+        ball.bounce_paddle(*paddle_);   // sets the outgoing angle from hit position
+        // a pre-charged paddle hit becomes a smash (strength = how charged)
+        if (paddle_->smash_cd <= 0 && paddle_->smash_charge >= Paddle::SMASH_MIN) {
+            smash_ball(ball, paddle_->charge_ratio());
+            paddle_->smash_charge = 0;
+            paddle_->full_t = 0;
+            paddle_->smash_cd = Paddle::SMASH_CD;
+        } else {
+            particles_.paddle_hit(int(ball.x), int(paddle_->y));
+            if (ctx_.sfx) { ctx_.sfx->pan_next(ball.x / float(ctx_.W)); ctx_.sfx->ball_paddle(); }
+        }
+    }
+
+    // brick collision (one brick per step per ball, unless on fire)
+    for (auto& brick : bricks_) {
+        if (!brick.alive) continue;
+        Rect br = brick.rect();
+        if (!overlap(ball.rect(), br)) continue;
+
+        Color bc = brick.shade();
+        bool silver = brick.indestructible();
+        // a fire/mega ball smashes destructible bricks outright and keeps going
+        bool destroyed;
+        if (ball.fire && !silver) {
+            brick.hp = 0; brick.alive = false; destroyed = true;
+        } else {
+            destroyed = brick.hit();
+        }
+        // silver doesn't speed the ball up: pinging around a fortress used to
+        // ramp it to top speed with nothing broken
+        if (!silver) ball.on_brick_hit();
+
+        if (destroyed) {
+            break_brick(brick, bc, true);
+        } else {
+            // a chip / deflect still gets a spark and its own sound
+            particles_.explode_brick(int(ball.x), int(ball.y), bc, 5);
+            if (ctx_.sfx) { if (silver) ctx_.sfx->armor_tink(); else ctx_.sfx->brick_hit(); }
+        }
+
+        // fire balls plow through destructible bricks (no bounce, keep scanning);
+        // indestructibles still stop them.
+        if (ball.fire && destroyed) continue;
+        reflect_ball(ball, br);
+        break;
+    }
+
+    // ── ball vs cameo invader: bounces off whichever side it struck ──
+    if (cameo_ && !cameo_->dying && overlap(ball.rect(), cameo_->rect())) {
+        bool killed = cameo_->take_hit(ball.fire ? 3 : 1);
+        reflect_ball(ball, cameo_->rect());
+        particles_.explode_brick(int(ball.x), int(ball.y), cameo_->col, 6);
+        if (ctx_.sfx) ctx_.sfx->brick_hit();
+        if (ctx_.fx) ctx_.fx->shake(3);
+        if (killed) cameo_down();
+    }
+
+    // ── ball vs boss ──
+    if (boss_ && !boss_->dying && overlap(ball.rect(), boss_->rect())) {
+        if (!boss_->damageable()) {
+            // stomping in / spawn shield / sulking: solid, but takes no damage
+            if (!ball.in_boss && ctx_.sfx) ctx_.sfx->armor_tink();
+            ball.in_boss = false;
+            reflect_ball(ball, boss_->rect());
+        } else {
+            // A piercing (fire/smash) ball flies THROUGH the body. It used to deal
+            // its damage on every frame of the pass — enough to delete a boss in one
+            // go, and more at higher refresh rates. Now: one hit per pass.
+            if (!(ball.fire && ball.in_boss)) {
+                int dmg = ball.fire ? 3 : 1;
+                // weak-point brick: a lit panel takes a big bonus when struck
+                bool weak_hit = boss_->weak_open && overlap(ball.rect(), boss_->weak_rect());
+                if (weak_hit) dmg += 4;
+                boss_->take_damage(dmg, particles_);
+                add_score((weak_hit ? 40 : 15) * dmg);
+                particles_.explode_brick(int(ball.x), int(ball.y),
+                                         weak_hit ? YELLOW : boss_->color, weak_hit ? 16 : 8);
+                if (weak_hit) {
+                    add_flash("WEAK POINT!", int(ball.x), int(ball.y) - 14, YELLOW, 1.0f);
+                    boss_->weak_open = false; boss_->weak_t = 0;
+                }
+                if (ctx_.sfx) ctx_.sfx->brick_hit();
+                if (ctx_.fx) ctx_.fx->shake(weak_hit ? 6 : 3);
+            }
+            if (ball.fire) ball.in_boss = true;
+            else reflect_ball(ball, boss_->rect());   // side-aware, like a big brick
+        }
+    } else {
+        ball.in_boss = false;
+    }
+}
+
 void ArkanoidGame::update_play(float dt, const Input& in) {
+    intro_t_ += dt;
+
+    // tick power-up timers, then derive paddle/ball state from what is left
+    for (size_t i = 0; i < pw_timers_.size();) {
+        pw_timers_[i].second -= dt;
+        if (pw_timers_[i].second <= 0) pw_timers_.erase(pw_timers_.begin() + long(i));
+        else ++i;
+    }
+    for (auto& b : balls_) if (b.smash_t > 0) b.smash_t -= dt;
+    refresh_effects();
+
     paddle_->update(dt, paddle_dir(in));
 
     // laser shoot and catch release (both keyed on SPACE / LCTRL; bot auto-fires)
@@ -1490,70 +1996,35 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
             for (auto& b : balls_) if (b.attached) b.release();
     }
 
-    // ── SMASH: HOLD the button (keyboard SHIFT or a gamepad shoulder) to charge the
-    // meter; it drains when released, so you time the pre-charge to peak as the ball
-    // reaches the paddle. The charged paddle hit fires the smash (see paddle
-    // collision). (Bot never charges.)
-    paddle_->armed = !bot_ && (in.down(SDLK_LSHIFT) || in.down(SDLK_RSHIFT) ||
-                               in.pad[PadThrUp] || in.pad[PadThrDown]);
-    if (!bot_) {
-        if (paddle_->armed)
-            paddle_->smash_charge = std::min(Paddle::SMASH_FULL,
-                                             paddle_->smash_charge + dt * Paddle::SMASH_RATE);
-        else
-            paddle_->smash_charge = std::max(0.0f,
-                                             paddle_->smash_charge - dt * Paddle::SMASH_DRAIN);
-    }
+    update_smash(dt, in);
 
-    // ── moving bricks drift + bounce ──
-    for (auto& b : bricks_) b.move(dt, ctx_.W);
+    // ── moving bricks drift + bounce (off the walls AND off their neighbours:
+    // they used to slide straight through the rest of the row) ──
+    for (auto& b : bricks_) {
+        bool blocked = false;
+        if (b.moving && b.alive) {
+            Rect nr{int(b.fx + b.mvx * dt) - BRICK_GAP, b.y, Brick::W + 2 * BRICK_GAP, Brick::H};
+            for (auto& o : bricks_)
+                if (&o != &b && o.alive && o.y == b.y && overlap(nr, o.rect())) {
+                    // turn around only if the neighbour is actually ahead of us
+                    if ((o.x > b.x) == (b.mvx > 0)) { b.mvx = -b.mvx; blocked = true; }
+                    break;
+                }
+        }
+        if (blocked) { if (b.flash > 0) b.flash -= dt * 5.0f; }
+        else b.move(dt, ctx_.W);
+    }
     // ── gravity/wind wells animate (steering applied per-ball below) ──
     for (auto& w : wells_) w.update(dt);
 
     // ── cross-game cameo invader (non-boss levels; reuses boss_bullets_) ──
     if (cameo_) {
-        float pcx = paddle_->center_x();
         size_t cbb_before = boss_bullets_.size();
-        cameo_->update(dt, ctx_.W, pcx, bricks_, boss_bullets_, particles_);
+        cameo_->update(dt, ctx_.W, float(paddle_->center_x()), bricks_, boss_bullets_, particles_);
+        if (cameo_->crushed > 0) stall_t_ = 0;
         if (boss_bullets_.size() > cbb_before && ctx_.sfx) {  // the invader fires
             ctx_.sfx->pan_next((cameo_->x + cameo_->w / 2) / float(ctx_.W));
             ctx_.sfx->enemy_shot();
-        }
-        for (auto& bb : boss_bullets_) bb.update(dt, ctx_.W, ctx_.H);
-        for (auto& bb : boss_bullets_)
-            if (bb.alive && overlap(bb.rect(), paddle_->rect())) {
-                bb.alive = false;
-                particles_.explode_brick(int(bb.x), int(bb.y), bb.color, 12);
-                lose_life();
-                return;
-            }
-        boss_bullets_.erase(std::remove_if(boss_bullets_.begin(), boss_bullets_.end(),
-                            [](const BossBullet& b) { return !b.alive; }), boss_bullets_.end());
-        for (auto& ball : balls_) {
-            if (ball.attached || cameo_->dying) continue;
-            if (overlap(ball.rect(), cameo_->rect())) {
-                bool killed = cameo_->take_hit(ball.fire ? 3 : 1);
-                ball.vy = std::fabs(ball.vy);
-                ball.y = cameo_->y + cameo_->h + ball.r + 1;
-                if (ctx_.sfx) ctx_.sfx->brick_hit();
-                if (ctx_.fx) ctx_.fx->shake(3);
-                if (killed) {
-                    score_ += 800 + level_num() * 40;
-                    high_score_ = std::max(high_score_, score_);
-                    add_flash("INVADER DOWN!", cameo_->x + cameo_->w / 2, cameo_->y, YELLOW, 1.6f);
-                    if (ctx_.sfx) ctx_.sfx->level_clear();
-                    if (ctx_.fx) {
-                        ctx_.fx->shake(14); ctx_.fx->hitstop(0.05f);
-                        ctx_.fx->rumble_explosion();
-                        ctx_.fx->shockwave((cameo_->x + cameo_->w / 2) / float(ctx_.W),
-                                           (cameo_->y + cameo_->h / 2) / float(ctx_.H));
-                    }
-                    const char* rain[3] = {"expand", "multi", "life"};
-                    for (int i = 0; i < 3; ++i)
-                        powerups_.emplace_back(cameo_->x + cameo_->w / 2 + (i - 1) * 56.0f, cameo_->y + 30.0f, std::string(rain[i]));
-                }
-                break;
-            }
         }
         if (!cameo_->alive) cameo_.reset();
     }
@@ -1562,273 +2033,160 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
     if (boss_) {
         // The boss aims at the paddle: the player can only dodge horizontally, so
         // the paddle (not the ball) is the threatened target for its attacks.
-        float paddle_cx = paddle_->center_x();
         size_t shots_before = boss_shots_.size(), bullets_before = boss_bullets_.size();
-        boss_->update(dt, ctx_.W, ctx_.H, paddle_cx, boss_shots_, boss_bullets_);
+        boss_->update(dt, ctx_.W, ctx_.H, float(paddle_->center_x()), boss_shots_, boss_bullets_);
         // give attacks a voice so the fight is never eerily silent
         if ((boss_shots_.size() > shots_before || boss_bullets_.size() > bullets_before) && ctx_.sfx) {
             ctx_.sfx->pan_next((boss_->x + boss_->w / 2) / float(ctx_.W));
             ctx_.sfx->enemy_shot();
         }
-        if (boss_->just_stomped) {
-            boss_->just_stomped = false;
-            if (!boss_revealed_) {
-                boss_revealed_ = true;
-                add_flash("!!  " + boss_->name + "  !!", ctx_.W / 2, 150, RED, 1.8f);
-                if (ctx_.sfx) ctx_.sfx->life_lost();  // ominous thud on reveal
-            }
-            for (int i = 0; i < 5; ++i)
-                particles_.bunker_hit(boss_->x + rnd_uniform(0, boss_->w), boss_->y + boss_->h);
-            if (ctx_.fx) ctx_.fx->shake(8);
-        }
-        if (boss_->fake_started) {
-            boss_->fake_started = false;
-            add_flash("...JUST KIDDING!", boss_->x + boss_->w / 2, boss_->y - 10, YELLOW, 1.6f);
-        }
-        // ── SHIELD_UP: materialise a band of real bricks in front of the boss ──
-        if (boss_->shield_req.pending) {
-            boss_->shield_req.pending = false;
-            spawn_boss_shield(boss_->shield_req.rows, boss_->shield_req.hp);
-            add_flash("SHIELDS UP!", boss_->x + boss_->w / 2, boss_->y + boss_->h + 6, CYAN, 1.2f);
-            if (ctx_.sfx) ctx_.sfx->brick_hit();
-        }
-        // ── SURPRISE: brick avalanche — a screen-wide curtain of bricks rains down ──
-        if (boss_->avalanche_pending) {
-            boss_->avalanche_pending = false;
-            int gap = rnd_int(2, BRICK_COLS - 3);  // one safe lane to escape through
-            for (int ci = 0; ci < BRICK_COLS; ++ci) {
-                if (std::abs(ci - gap) <= 1) continue;
-                float px = (ci + 0.5f) * (ctx_.W / float(BRICK_COLS));
-                boss_shots_.emplace_back(px, -rnd_uniform(0, 120), 0.0f,
-                                         150.0f, darker(boss_->color, 0.7f), false);
-            }
-            add_flash("AVALANCHE!!", ctx_.W / 2, ctx_.H / 2 - 40, RED, 2.0f);
-            if (ctx_.sfx) ctx_.sfx->life_lost();
-            if (ctx_.fx) ctx_.fx->shake(14);
-        }
-        // ── SURPRISE: the boss SPLITS into two weaving brick-minions and keeps fighting ──
-        if (boss_->split_pending) {
-            boss_->split_pending = false;
-            for (int i = 0; i < (boss_->tier >= 3 ? 4 : 3); ++i) {
-                float px = boss_->x + rnd_uniform(0, boss_->w);
-                boss_shots_.emplace_back(px, boss_->y + boss_->h * 0.5f,
-                                         rnd_uniform(-60, 60), 90.0f,
-                                         lerp_color(boss_->color, WHITE, 0.2f), true);
-            }
-            add_flash("IT SPLIT!!", boss_->x + boss_->w / 2, boss_->y - 12, PURPLE, 1.8f);
-            if (ctx_.sfx) ctx_.sfx->boss_explosion();
-            if (ctx_.fx) ctx_.fx->shake(12);
-        }
-        for (auto& bs : boss_shots_) bs.update(dt, ctx_.W, ctx_.H);
-        for (auto& bb : boss_bullets_) bb.update(dt, ctx_.W, ctx_.H);
+        update_boss_events();
+        // a beaten boss can't still cost you a life with bricks already in the air
+        if (boss_->dying && (!boss_shots_.empty() || !boss_bullets_.empty())) pop_projectiles();
     }
+    // projectiles always fly (they used to freeze and vanish when the cameo died)
+    for (auto& bs : boss_shots_) bs.update(dt, ctx_.W, ctx_.H);
+    for (auto& bb : boss_bullets_) bb.update(dt, ctx_.W, ctx_.H);
 
-    // update balls
+    // ── balls. Each ball moves in sub-steps of at most ~7px so a fast ball can't
+    // skip through a brick or the paddle on a long frame. ──
     int lost_count = 0;
     for (size_t bi = 0; bi < balls_.size(); ++bi) {
         Ball& ball = balls_[bi];
         if (!ball.alive) continue;
-        // gravity/wind wells nudge the velocity (steer), then renormalise so the
-        // well bends the path without altering the ball's tier speed.
-        if (!ball.attached && !wells_.empty()) {
-            float spd = ball.speed();
-            for (auto& w : wells_) w.steer(ball.x, ball.y, ball.vx, ball.vy, dt);
-            if (spd > 0) ball.set_speed(spd);  // direction changed, speed preserved
+        if (ball.attached) { ball.update(dt, ctx_.W, ctx_.H, *paddle_); continue; }
+        int steps = std::clamp(int(std::ceil(ball.current_target_speed() * dt / 7.0f)), 1, 8);
+        float h = dt / steps;
+        for (int st = 0; st < steps && ball.alive && !ball.attached; ++st) {
+            // gravity/wind wells nudge the velocity (steer), then renormalise so the
+            // well bends the path without altering the ball's tier speed.
+            if (!wells_.empty()) {
+                float spd = ball.speed();
+                for (auto& w : wells_) w.steer(ball.x, ball.y, ball.vx, ball.vy, h);
+                if (spd > 0) ball.set_speed(spd);  // direction changed, speed preserved
+            }
+            int result = ball.update(h, ctx_.W, ctx_.H, *paddle_);
+            if (result == 1 && ctx_.sfx) { ctx_.sfx->pan_next(ball.x / float(ctx_.W)); ctx_.sfx->ball_wall(); }
+            if (result == 2) { lost_count += 1; break; }
+            collide_ball(ball);
         }
-        int result = ball.update(dt, ctx_.W, ctx_.H, *paddle_);
-        if (result == 1 && ctx_.sfx) ctx_.sfx->ball_wall();
-        if (result == 2) { lost_count += 1; continue; }
-
-        particles_.ball_trail(int(ball.x), int(ball.y), ball.color);
-
-        // paddle collision
-        if (!ball.attached && ball.vy > 0 && overlap(ball.rect(), paddle_->rect())) {
-            if (paddle_->catch_on) {
-                ball.attached = true;
-                ball.attach_offset = ball.x - paddle_->x;
-            } else {
-                ball.bounce_paddle(*paddle_);   // sets the outgoing angle from hit position
-                // a pre-charged paddle hit becomes a smash (strength = how charged)
-                if (paddle_->smash_cd <= 0 && paddle_->smash_charge >= Paddle::SMASH_MIN) {
-                    smash_ball(ball, paddle_->charge_ratio());
-                    paddle_->smash_charge = 0;
-                    paddle_->smash_cd = Paddle::SMASH_CD;
-                } else {
-                    particles_.paddle_hit(int(ball.x), int(paddle_->y));
-                    if (ctx_.sfx) ctx_.sfx->ball_paddle();
-                }
-            }
-        }
-
-        // brick collision (one brick per frame per ball, unless on fire)
-        for (auto& brick : bricks_) {
-            if (!brick.alive) continue;
-            Rect br = brick.rect();
-            if (!overlap(ball.rect(), br)) continue;
-
-            // a fire/mega ball smashes destructible bricks outright and keeps going
-            bool destroyed;
-            if (ball.fire && !brick.indestructible()) {
-                brick.hp = 0; brick.alive = false; destroyed = true;
-            } else {
-                destroyed = brick.hit();
-            }
-            int cx = br.x + br.w / 2, cy = br.y + br.h / 2;
-            ball.on_brick_hit();
-
-            if (destroyed) {
-                particles_.explode_brick(cx, cy, brick_color(1));
-                lvl_bricks_++;
-                int jm = juggle_mult();
-                int pts = brick.max_hp * 10 * (ctx_.combo ? ctx_.combo->hit() : 1) * jm * ev_score_mult_;
-                score_ += pts;
-                high_score_ = std::max(high_score_, score_);
-                add_flash("+" + std::to_string(pts), cx, cy, YELLOW);
-                if (ctx_.sfx) ctx_.sfx->brick_break();
-                float puc = event_ == Ev::GoldRush ? 0.36f : POWERUP_CHANCE;  // GOLD RUSH showers power-ups
-                if (!brick.indestructible() && rnd01() < puc) {
-                    std::string kind = weighted_powerup();
-                    powerups_.emplace_back(float(cx), float(cy), kind);
-                }
-            } else {
-                if (ctx_.sfx) ctx_.sfx->brick_hit();
-            }
-
-            // fire balls plow through destructible bricks (no bounce, keep scanning);
-            // indestructibles still stop them.
-            if (ball.fire && destroyed) continue;
-            reflect_ball_off_brick(ball, br);
-            break;
-        }
-
-        // ── ball vs boss ──
-        if (boss_ && boss_->damageable() && overlap(ball.rect(), boss_->rect())) {
-            int dmg = ball.fire ? 3 : 1;
-            // weak-point brick: a lit panel takes a big bonus when struck
-            bool weak_hit = boss_->weak_open && overlap(ball.rect(), boss_->weak_rect());
-            if (weak_hit) dmg += 4;
-            boss_->take_damage(dmg, particles_);
-            score_ += (weak_hit ? 40 : 15) * dmg;
-            high_score_ = std::max(high_score_, score_);
-            particles_.explode_brick(int(ball.x), int(ball.y),
-                                     weak_hit ? YELLOW : boss_->color, weak_hit ? 16 : 8);
-            if (weak_hit) {
-                add_flash("WEAK POINT!", int(ball.x), int(ball.y) - 14, YELLOW, 1.0f);
-                boss_->weak_open = false; boss_->weak_t = 0;
-            }
-            if (ctx_.sfx) ctx_.sfx->brick_hit();
-            if (ctx_.fx) ctx_.fx->shake(weak_hit ? 6 : 3);
-            if (!ball.fire) {  // bounce off the boss body (treat it as a big brick)
-                // ball arrives travelling up into the boss; send it back down and
-                // park it just below the boss so it can't tunnel through.
-                ball.vy = std::abs(ball.vy);
-                ball.y = boss_->y + boss_->h + ball.r + 1;
-            }
-        }
+        if (ball.alive)
+            particles_.ball_trail(int(ball.x), int(ball.y),
+                                  ball.fire ? Color(255, 140, 50) : ball.color);
     }
 
     // remove dead balls (keep attached)
     balls_.erase(std::remove_if(balls_.begin(), balls_.end(),
                  [](const Ball& b) { return !(b.alive || b.attached); }), balls_.end());
 
-    bool any_left = false;
-    for (auto& b : balls_) if (b.alive || b.attached) { any_left = true; break; }
-    if (lost_count > 0 && !any_left) {
+    if (lost_count > 0 && balls_.empty()) {
         lose_life();
         return;
     }
 
-    // ── boss shots vs paddle / balls ──
-    if (boss_) {
-        for (auto& bs : boss_shots_) {
-            if (!bs.alive) continue;
-            // a boss brick that reaches the paddle costs a life (like dropping the ball)
-            if (overlap(bs.rect(), paddle_->rect())) {
+    // ── hurled bricks / minions vs paddle and balls ──
+    for (auto& bs : boss_shots_) {
+        if (!bs.alive) continue;
+        // a boss brick that reaches the paddle costs a life (like dropping the ball)
+        if (overlap(bs.rect(), paddle_->rect())) {
+            bs.alive = false;
+            lose_life();
+            return;
+        }
+        // balls can shatter incoming bricks (and minions) for points
+        for (auto& b : balls_) {
+            if (!b.alive || b.attached) continue;
+            if (overlap(bs.rect(), b.rect())) {
                 bs.alive = false;
-                particles_.explode_brick(int(bs.x + BossShot::W / 2), int(bs.y), bs.color, 14);
-                lose_life();
-                return;
-            }
-            // balls can shatter incoming bricks (and minions) for points
-            for (auto& b : balls_) {
-                if (!b.alive) continue;
-                if (overlap(bs.rect(), b.rect())) {
-                    bs.alive = false;
-                    particles_.explode_brick(int(bs.x + BossShot::W / 2), int(bs.y), bs.color, 8);
-                    if (bs.minion) { score_ += 25; high_score_ = std::max(high_score_, score_); }
-                    if (!b.fire) b.vy = -std::abs(b.vy);
-                    if (ctx_.sfx) ctx_.sfx->brick_hit();
-                    break;
-                }
+                particles_.explode_brick(int(bs.x + BossShot::W / 2), int(bs.y), bs.color, 8);
+                if (bs.minion) add_score(25);
+                if (!b.fire) reflect_ball(b, bs.rect());
+                if (ctx_.sfx) ctx_.sfx->brick_hit();
+                break;
             }
         }
-        boss_shots_.erase(std::remove_if(boss_shots_.begin(), boss_shots_.end(),
-                          [](const BossShot& s) { return !s.alive; }), boss_shots_.end());
+    }
+    boss_shots_.erase(std::remove_if(boss_shots_.begin(), boss_shots_.end(),
+                      [](const BossShot& s) { return !s.alive; }), boss_shots_.end());
 
-        // ── boss pellets vs paddle / balls (paddle must dodge sideways) ──
-        for (auto& bb : boss_bullets_) {
-            if (!bb.alive) continue;
-            if (overlap(bb.rect(), paddle_->rect())) {
-                bb.alive = false;
-                particles_.explode_brick(int(bb.x), int(bb.y), bb.color, 12);
-                lose_life();
-                return;
-            }
-            // lasers/balls don't shatter pellets — they're meant to be dodged
-        }
-        boss_bullets_.erase(std::remove_if(boss_bullets_.begin(), boss_bullets_.end(),
-                            [](const BossBullet& b) { return !b.alive; }), boss_bullets_.end());
-
-        // ── boss death → comedic deflate, then rain power-ups + clear ──
-        if (boss_->finished) {
-            float rx = boss_->x + boss_->w / 2, ry = boss_->y + boss_->h / 2;
-            for (int i = 0; i < 5; ++i) particles_.ufo_explode(rx + rnd_uniform(-40, 40), ry, 30);
-            int bonus = 1000 * (level_num() / 5);
-            score_ += bonus;
-            high_score_ = std::max(high_score_, score_);
-            add_flash(boss_->name + " GOES SPLAT!  +" + std::to_string(bonus),
-                      ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 2.2f);
-            // rain a generous spread of power-ups
-            const char* rain[] = {"life", "expand", "multi", "fire", "laser", "catch"};
-            for (int i = 0; i < 6; ++i)
-                powerups_.emplace_back(rx + (i - 2.5f) * 56, ry, std::string(rain[i]));
-            white_flash_ = 1.0f;
-            if (ctx_.sfx) { ctx_.sfx->big_explosion(); ctx_.sfx->level_clear(); }
-            if (ctx_.fx) {
-                ctx_.fx->shake(28); ctx_.fx->hitstop(0.10f);
-                ctx_.fx->rumble_explosion();
-                ctx_.fx->shockwave((boss_->x + boss_->w / 2) / float(ctx_.W),
-                                   (boss_->y + boss_->h / 2) / float(ctx_.H));
-            }
-            tele(J().add("ev", "boss_clear").add("level", level_num())
-                    .add("dt", (double)(game_t_ - level_t0_)).add("name", boss_->name)
-                    .add("lives", lives_));
-            boss_.reset();
-            boss_shots_.clear();
-            boss_bullets_.clear();
-            win_level();
+    // ── pellets vs paddle (the paddle must dodge sideways; nothing shatters them) ──
+    for (auto& bb : boss_bullets_) {
+        if (bb.alive && overlap(bb.rect(), paddle_->rect())) {
+            bb.alive = false;
+            lose_life();
             return;
         }
     }
+    boss_bullets_.erase(std::remove_if(boss_bullets_.begin(), boss_bullets_.end(),
+                        [](const BossBullet& b) { return !b.alive; }), boss_bullets_.end());
 
-    // update lasers
+    // ── boss death → comedic deflate, then rain power-ups + clear ──
+    if (boss_ && boss_->finished) {
+        float rx = boss_->x + boss_->w / 2, ry = boss_->y + boss_->h / 2;
+        for (int i = 0; i < 5; ++i) particles_.ufo_explode(rx + rnd_uniform(-40, 40), ry, 30);
+        int bonus = 1000 * (level_num() / 5);
+        add_score(bonus);
+        add_banner(boss_->name + " GOES SPLAT!  +" + std::to_string(bonus),
+                   ctx_.H / 2 - 96, YELLOW, 3.0f);
+        // rain a generous spread of power-ups — the paddle stays live through the
+        // victory interlude so they can actually be caught (see update_win)
+        powerups_.clear();
+        const char* rain[] = {"life", "expand", "multi", "fire", "laser", "catch"};
+        for (int i = 0; i < 6; ++i)
+            powerups_.emplace_back(rx + (i - 2.5f) * 62, ry - (i % 2) * 34.0f, std::string(rain[i]));
+        white_flash_ = 1.0f;
+        if (ctx_.sfx) { ctx_.sfx->big_explosion(); ctx_.sfx->level_clear(); }
+        if (ctx_.fx) {
+            ctx_.fx->shake(28); ctx_.fx->hitstop(0.10f);
+            ctx_.fx->rumble_explosion();
+            ctx_.fx->shockwave(rx / float(ctx_.W), ry / float(ctx_.H));
+        }
+        tele(J().add("ev", "boss_clear").add("level", level_num())
+                .add("dt", (double)(game_t_ - level_t0_)).add("name", boss_->name)
+                .add("lives", lives_));
+        boss_.reset();
+        win_level();
+        return;
+    }
+
+    // ── lasers: bricks, and now the boss / cameo too (they used to pass through) ──
     for (auto& laser : lasers_) {
         laser.update(dt);
+        if (!laser.alive) continue;
+        Rect lr = laser.rect();
+        if (boss_ && !boss_->dying && overlap(lr, boss_->rect())) {
+            laser.alive = false;
+            if (boss_->damageable()) {
+                bool weak_hit = boss_->weak_open && overlap(lr, boss_->weak_rect());
+                int dmg = weak_hit ? 3 : 1;
+                boss_->take_damage(dmg, particles_);
+                add_score(15 * dmg);
+                particles_.explode_brick(int(laser.x), int(laser.y - Laser::H),
+                                         weak_hit ? YELLOW : boss_->color, 6);
+                if (ctx_.sfx) ctx_.sfx->brick_hit();
+            } else if (ctx_.sfx) {
+                ctx_.sfx->armor_tink();
+            }
+            continue;
+        }
+        if (cameo_ && !cameo_->dying && overlap(lr, cameo_->rect())) {
+            laser.alive = false;
+            particles_.explode_brick(int(laser.x), int(laser.y - Laser::H), cameo_->col, 6);
+            if (ctx_.sfx) ctx_.sfx->brick_hit();
+            if (cameo_->take_hit(1)) cameo_down();
+            continue;
+        }
         for (auto& brick : bricks_) {
             if (!brick.alive) continue;
-            if (overlap(laser.rect(), brick.rect())) {
+            if (overlap(lr, brick.rect())) {
                 laser.alive = false;
-                bool destroyed = brick.hit();
-                for (auto& b : balls_)
-                    if (b.alive || b.attached) { b.on_brick_hit(); break; }
-                if (destroyed) {
-                    Rect r = brick.rect();
-                    particles_.explode_brick(r.x + r.w / 2, r.y + r.h / 2, brick_color(1));
-                    score_ += brick.max_hp * 10;
-                    high_score_ = std::max(high_score_, score_);
-                    if (ctx_.sfx) ctx_.sfx->brick_break();
+                Color bc = brick.shade();
+                bool silver = brick.indestructible();
+                if (brick.hit()) {
+                    break_brick(brick, bc, false);
                 } else {
-                    if (ctx_.sfx) ctx_.sfx->brick_hit();
+                    particles_.explode_brick(int(laser.x), int(laser.y - Laser::H), bc, 4);
+                    if (ctx_.sfx) { if (silver) ctx_.sfx->armor_tink(); else ctx_.sfx->brick_hit(); }
                 }
                 break;
             }
@@ -1854,6 +2212,61 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
         if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->hitstop(0.05f); }
         white_flash_ = 0.6f;
         win_level();
+        return;
+    }
+
+    // ── stall rescue: if nothing has broken for a long time while a ball is in
+    // play, the silver armour cracks. A level can never be left unfinishable. ──
+    if (!boss_level_ && active_ball_count() > 0) {
+        stall_t_ += dt;
+        if (stall_t_ >= STALL_CRACK_T) {
+            stall_t_ = 0;
+            bool any = false;
+            for (auto& b : bricks_)
+                if (b.alive && b.indestructible()) { b.crack(); any = true; }
+            if (any) {
+                add_banner("THE ARMOUR CRACKS!", ctx_.H / 2 - 36, Color(200, 210, 255), 2.0f);
+                if (ctx_.sfx) ctx_.sfx->shield_hit();
+                if (ctx_.fx) ctx_.fx->shake(8);
+            }
+        }
+    }
+}
+
+// The victory interlude. The paddle stays live so falling pills can be caught
+// (the boss's reward rain used to freeze in mid-air and get thrown away), and a
+// press skips ahead once nothing is left to catch.
+void ArkanoidGame::update_win(float dt, const Input& in) {
+    win_t_ -= dt;
+    intro_t_ += dt;
+    paddle_->update(dt, paddle_dir(in));
+    for (auto& pw : powerups_) {
+        pw.update(dt, ctx_.H, 2.4f);
+        if (pw.alive && overlap(pw.rect(), paddle_->rect())) {
+            pw.alive = false;
+            lvl_powerups_++;
+            int cx = int(pw.x + PowerUp::W / 2);
+            if (pw.kind == "life") {
+                lives_ += 1;
+                add_flash("EXTRA LIFE", cx, pw.y - 10, WHITE, 1.2f);
+                if (ctx_.sfx) ctx_.sfx->one_up();
+            } else {   // timed effects don't carry to the next level: bank them as points
+                int pts = 250 * ev_score_mult_;
+                add_score(pts);
+                add_flash("BONUS +" + std::to_string(pts), cx, pw.y - 10, pw.color, 1.0f);
+                if (ctx_.sfx) ctx_.sfx->powerup_collect();
+            }
+            if (ctx_.fx) ctx_.fx->rumble_pickup();
+        }
+    }
+    powerups_.erase(std::remove_if(powerups_.begin(), powerups_.end(),
+                    [](const PowerUp& p) { return !p.alive; }), powerups_.end());
+
+    bool skip = !bot_ && win_total_ - win_t_ > 0.8f &&
+                (in.just(SDLK_SPACE) || in.just(SDLK_RETURN));
+    if (powerups_.empty() && (win_t_ <= 0 || skip)) {
+        level_idx_ += 1;     // endless: keep going past the hand-made levels
+        load_level();
     }
 }
 
@@ -1861,11 +2274,24 @@ void ArkanoidGame::update_play(float dt, const Input& in) {
 void ArkanoidGame::lose_life() {
     lives_ -= 1;
     lvl_balls_lost_++;
-    dead_t_ = 2.0f;
+    dead_t_ = 1.5f;
     state_ = St::Dead;
-    paddle_->charging = false;
+    // Everything in flight goes with the life. A ball still in play used to hang
+    // in mid-air and come back as a free extra ball, and leftover boss bricks
+    // waited above the paddle to take the next life the moment play resumed.
+    for (auto& b : balls_)
+        if (b.alive) particles_.explode_brick(int(b.x), int(b.y), b.color, 8);
+    balls_.clear();
+    pop_projectiles();
+    particles_.explode_player(paddle_->center_x(), int(paddle_->y + paddle_->h / 2), 40);
+    paddle_->charging = paddle_->armed = false;
     paddle_->smash_charge = 0;
-    deactivate_all_powerups();
+    paddle_->full_t = 0;
+    pw_timers_.clear();
+    lasers_.clear();
+    powerups_.clear();
+    refresh_effects();
+    if (ctx_.combo) ctx_.combo->reset();
     if (ctx_.sfx) ctx_.sfx->life_lost();
     if (ctx_.fx) { ctx_.fx->shake(12); ctx_.fx->hitstop(0.06f); ctx_.fx->rumble_death(); }
     tele(J().add("ev", "life_lost").add("level", level_num()).add("t", (double)game_t_)
@@ -1875,84 +2301,105 @@ void ArkanoidGame::lose_life() {
 // Shared: a level was cleared; emit telemetry and enter the Win interlude.
 void ArkanoidGame::win_level() {
     state_ = St::Win;
-    win_t_ = boss_level_ ? 3.4f : 3.0f;
+    win_t_ = win_total_ = boss_level_ ? 3.4f : 2.4f;
+    // the balls leave with a little pop rather than hanging frozen in the air
+    for (auto& b : balls_)
+        if (b.alive) particles_.explode_brick(int(b.x), int(b.y), b.color, 10);
+    balls_.clear();
+    lasers_.clear();
+    pop_projectiles();
+    pw_timers_.clear();
+    paddle_->charging = paddle_->armed = false;
+    paddle_->smash_charge = 0;
+    refresh_effects();
     tele(J().add("ev", "level_clear").add("level", level_num())
             .add("dt", (double)(game_t_ - level_t0_)).add("boss", boss_level_ ? 1 : 0)
             .add("bricks_broken", lvl_bricks_).add("balls_lost", lvl_balls_lost_)
             .add("powerups", lvl_powerups_).add("score", score_).add("lives", lives_));
 }
 
-void ArkanoidGame::reflect_ball_off_brick(Ball& ball, Rect br) {
-    int r = ball.r;
-    int left = br.x, right = br.x + br.w, top = br.y, bottom = br.y + br.h;
-    float mx = left - r, mxx = right + r, my = top - r, myy = bottom + r;
-    float px = ball.x - ball.vx * 0.016f;
-    float py = ball.y - ball.vy * 0.016f;
-    bool was_inside_x = mx <= px && px <= mxx;
-    bool was_inside_y = my <= py && py <= myy;
-
-    if (was_inside_y && !was_inside_x) {
-        bool push_right = ball.vx < 0;
-        ball.vx = -ball.vx;
-        ball.x = push_right ? (mxx + 1) : (mx - 1);
-    } else if (was_inside_x && !was_inside_y) {
-        bool push_down = ball.vy < 0;
-        ball.vy = -ball.vy;
-        ball.y = push_down ? (myy + 1) : (my - 1);
+// Bounce a ball off an axis-aligned box (brick, boss body, cameo, hurled brick).
+// Which face was struck comes from where the ball actually WAS before this step
+// (Ball::px/py) — not from a guess that assumed a 60 fps frame.
+void ArkanoidGame::reflect_ball(Ball& ball, Rect br) {
+    float r = float(ball.r);
+    float mx = br.x - r, mxx = br.x + br.w + r, my = br.y - r, myy = br.y + br.h + r;
+    bool was_x = mx <= ball.px && ball.px <= mxx;   // was already within the box's columns
+    bool was_y = my <= ball.py && ball.py <= myy;   // ... / rows
+    auto side_x = [&]() {
+        bool left = ball.px < (mx + mxx) * 0.5f;
+        ball.vx = left ? -std::fabs(ball.vx) : std::fabs(ball.vx);
+        ball.x = left ? mx - 1 : mxx + 1;
+    };
+    auto side_y = [&]() {
+        bool top = ball.py < (my + myy) * 0.5f;
+        ball.vy = top ? -std::fabs(ball.vy) : std::fabs(ball.vy);
+        ball.y = top ? my - 1 : myy + 1;
+    };
+    if (was_y && !was_x) {
+        side_x();                       // came in through a side face
+    } else if (was_x && !was_y) {
+        side_y();                       // came in through the top / bottom
+    } else if (!was_x && !was_y) {
+        side_x(); side_y();             // a true corner hit
     } else {
-        bool push_right = ball.vx < 0;
-        bool push_down = ball.vy < 0;
-        ball.vx = -ball.vx;
-        ball.vy = -ball.vy;
-        ball.x = push_right ? (mxx + 1) : (mx - 1);
-        ball.y = push_down ? (myy + 1) : (my - 1);
+        // already inside (the box moved onto the ball): leave by the nearest face
+        float dl = ball.x - mx, dr = mxx - ball.x, dt_ = ball.y - my, db = myy - ball.y;
+        float m = std::min(std::min(dl, dr), std::min(dt_, db));
+        if (m == dl)      { ball.x = mx - 1;  ball.vx = -std::fabs(ball.vx); }
+        else if (m == dr) { ball.x = mxx + 1; ball.vx = std::fabs(ball.vx); }
+        else if (m == dt_){ ball.y = my - 1;  ball.vy = -std::fabs(ball.vy); }
+        else              { ball.y = myy + 1; ball.vy = std::fabs(ball.vy); }
     }
-    ball.x = std::max(float(ball.r), std::min(float(ctx_.W - ball.r), ball.x));
-    ball.y = std::max(float(ball.r), std::min(float(ctx_.H - ball.r), ball.y));
+    ball.x = std::max(r, std::min(float(ctx_.W) - r, ball.x));
+    ball.y = std::max(r, ball.y);
+    ball.px = ball.x; ball.py = ball.y;
 }
 
 // SMASH: turn the ball that just bounced off the paddle into a fast piercing
-// smash. It keeps the bounce ANGLE (so you aim with paddle position) but ramps the
-// speed toward MAX and gives it a brief fire/pierce to rip up through a column.
+// smash. It keeps the bounce ANGLE (so you aim with paddle position), runs hot
+// (near top speed) and pierces for a short while — both scale with the charge.
 void ArkanoidGame::smash_ball(Ball& b, float charge) {
     paddle_->smash_glow = 1.0f;
-    float spd = Ball::BASE_SPEED + (Ball::MAX_SPEED - Ball::BASE_SPEED) * (0.6f + 0.4f * charge);
-    float ang = std::atan2(b.vy, b.vx);             // keep the just-computed bounce direction
-    b.vx = std::cos(ang) * spd;
-    b.vy = std::sin(ang) * spd;
-    b.speed_mult = std::max(b.speed_mult, 1.0f);
-    b.fire = true;                                  // brief pierce
-    set_pw_timer("fire", std::max(0.6f + charge * 1.2f, pw_timer("fire") ? *pw_timer("fire") : 0.0f));
+    b.smash_k = charge;
+    b.smash_t = 0.6f + charge * 1.2f;
+    b.fire = true;
+    b.set_speed(b.current_target_speed());
 
-    particles_.paddle_hit(int(b.x), int(paddle_->y));
+    particles_.paddle_hit(int(b.x), int(paddle_->y), 18);
     add_flash("SMASH!", int(b.x), int(paddle_->y) - 18, Color(255, 150, 40), 0.8f);
     if (ctx_.sfx) { ctx_.sfx->ball_paddle(); ctx_.sfx->laser_shoot(); }
     if (ctx_.fx) { ctx_.fx->shake(7 + int(6 * charge)); ctx_.fx->hitstop(0.03f); ctx_.fx->rumble(0.5f, 0.6f, 200); }
 }
 
 void ArkanoidGame::collect_powerup(const PowerUp& pw) {
-    if (ctx_.sfx) ctx_.sfx->powerup_collect();
-    if (ctx_.fx) ctx_.fx->rumble_pickup();
     const std::string& k = pw.kind;
-    add_flash(pw.label, int(pw.x + PowerUp::W / 2), int(pw.y), pw.color, 1.2f);
+    if (ctx_.sfx) {
+        if (k == "life") ctx_.sfx->one_up();
+        else if (powerup_bad(k)) ctx_.sfx->armor_tink();
+        else ctx_.sfx->powerup_collect();
+    }
+    if (ctx_.fx) ctx_.fx->rumble_pickup();
+    add_flash(powerup_name(k), int(pw.x + PowerUp::W / 2), int(pw.y) - 12, pw.color, 1.3f);
     lvl_powerups_++;
     tele(J().add("ev", "powerup").add("level", level_num()).add("t", (double)game_t_)
             .add("kind", k));
 
+    // opposites replace each other, so two contradictory timers never run at once
     if (k == "expand") {
-        paddle_->set_width(PADDLE_W_BIG);
+        erase_pw_timer("shrink");
         set_pw_timer("expand", 12.0f);
     } else if (k == "shrink") {
-        paddle_->set_width(PADDLE_W_SMALL);
+        erase_pw_timer("expand");
         set_pw_timer("shrink", 8.0f);
     } else if (k == "laser") {
-        paddle_->laser_on = true;
         set_pw_timer("laser", 15.0f);
     } else if (k == "multi") {
         std::vector<Ball> new_balls;
         for (auto& b : balls_) {
-            if (!b.alive && !b.attached) continue;
+            if (!b.alive || b.attached) continue;
             for (float off : {-0.4f, 0.4f}) {
+                if (balls_.size() + new_balls.size() >= size_t(MAX_BALLS)) break;
                 Ball nb(b.x, b.y);
                 float speed = b.speed();
                 float angle = std::atan2(b.vy, b.vx) + off;
@@ -1967,139 +2414,147 @@ void ArkanoidGame::collect_powerup(const PowerUp& pw) {
         }
         for (auto& nb : new_balls) balls_.push_back(nb);
     } else if (k == "slow") {
-        for (auto& b : balls_) b.speed_mult = 0.6f;
+        erase_pw_timer("fast");
         set_pw_timer("slow", 10.0f);
     } else if (k == "fast") {
-        for (auto& b : balls_) b.speed_mult = 1.6f;
+        erase_pw_timer("slow");
         set_pw_timer("fast", 8.0f);
     } else if (k == "life") {
         lives_ += 1;
     } else if (k == "catch") {
-        paddle_->catch_on = true;
         set_pw_timer("catch", 12.0f);
     } else if (k == "fire") {
-        for (auto& b : balls_) b.fire = true;
         set_pw_timer("fire", 8.0f);
     }
-}
-
-void ArkanoidGame::deactivate_powerup(const std::string& k) {
-    if (k == "expand" || k == "shrink") {
-        paddle_->set_width(PADDLE_W_NORMAL);
-    } else if (k == "laser") {
-        paddle_->laser_on = false;
-        if (!paddle_->catch_on)
-            for (auto& b : balls_) if (b.attached) b.release();
-    } else if (k == "slow" || k == "fast") {
-        for (auto& b : balls_) b.speed_mult = 1.0f;
-    } else if (k == "catch") {
-        paddle_->catch_on = false;
-        for (auto& b : balls_) if (b.attached) b.release();
-    } else if (k == "fire") {
-        for (auto& b : balls_) b.fire = false;
-    }
-}
-
-void ArkanoidGame::deactivate_all_powerups() {
-    for (auto& p : pw_timers_) deactivate_powerup(p.first);
-    pw_timers_.clear();
-    paddle_->laser_on = false;
-    paddle_->catch_on = false;
-    paddle_->set_width(PADDLE_W_NORMAL);
-    lasers_.clear();
-    powerups_.clear();
+    refresh_effects();
 }
 
 // ── draw ──────────────────────────────────────────────────────────────────────
 void ArkanoidGame::draw(Surface& s) {
     s.fill(BLACK);
-    for (int x = 0; x < ctx_.W; x += 40) draw::line(s, Color(5, 10, 20), x, 0, x, ctx_.H, 1);
-    for (int y = 0; y < ctx_.H; y += 40) draw::line(s, Color(5, 10, 20), 0, y, ctx_.W, y, 1);
+    for (int x = 0; x < ctx_.W; x += 40) draw::line(s, Color(9, 16, 30), x, 0, x, ctx_.H, 1);
+    for (int y = 0; y < ctx_.H; y += 40) draw::line(s, Color(9, 16, 30), 0, y, ctx_.W, y, 1);
 
     particles_.draw(s);
 
     for (auto& w : wells_) w.draw(s);
-    for (auto& brick : bricks_) brick.draw(s);
+    // bricks drop into place row by row at the start of a level
+    for (auto& brick : bricks_) {
+        float k = std::clamp((intro_t_ - brick.row * 0.03f) / 0.22f, 0.0f, 1.0f);
+        if (k <= 0) continue;
+        brick.draw(s, -int((1 - k) * (1 - k) * 46));
+    }
     if (boss_) {
         // googly eyes track the nearest live ball (else the paddle)
         float tcx = paddle_->center_x(), tcy = paddle_->y;
         for (auto& b : balls_) if (b.alive) { tcx = b.x; tcy = b.y; break; }
         boss_->draw(s, tcx, tcy);
-        for (auto& bs : boss_shots_) bs.draw(s);
-        for (auto& bb : boss_bullets_) bb.draw(s);
     }
-    if (cameo_) {
-        cameo_->draw(s, paddle_->center_x());
-        for (auto& bb : boss_bullets_) bb.draw(s);
-    }
+    if (cameo_) cameo_->draw(s, paddle_->center_x());
+    for (auto& bs : boss_shots_) bs.draw(s);
+    for (auto& bb : boss_bullets_) bb.draw(s);
     for (auto& pw : powerups_) pw.draw(s, *ctx_.fonts.small);
     for (auto& laser : lasers_) laser.draw(s);
     for (auto& ball : balls_) ball.draw(s);
-    paddle_->draw(s);
+    if (state_ != St::Dead && state_ != St::GameOver) paddle_->draw(s);
 
     draw_hud(s);
     if (white_flash_ > 0)
         draw::rect(s, Color(255, 255, 255, int(180 * std::min(1.0f, white_flash_))),
                    {0, 0, ctx_.W, ctx_.H});
+
+    if (state_ == St::Win) {
+        float a = std::min(1.0f, (win_total_ - win_t_) * 3.0f);
+        draw::rect(s, Color(0, 0, 0, int(150 * a)), {0, ctx_.H / 2 - 56, ctx_.W, 120});
+        draw_text_centered(s, *ctx_.fonts.big, "LEVEL  CLEAR!", ctx_.W / 2, ctx_.H / 2 - 44,
+                           Color(YELLOW.r, YELLOW.g, YELLOW.b, int(255 * a)));
+        int nxt = level_num() + 1;  // endless: there is always a next level
+        Color nc = is_boss_level(nxt) ? RED : GREEN;
+        nc.a = uint8_t(255 * a);
+        std::string lbl = "LEVEL  " + std::to_string(nxt);
+        if (is_boss_level(nxt)) lbl += "   -  BOSS!";
+        draw_text_centered(s, *ctx_.fonts.med, lbl, ctx_.W / 2, ctx_.H / 2 + 18, nc);
+    }
     draw_flash(s);
     draw_powerup_timers(s);
 
     if (state_ == St::Ready) {
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS  SPACE  TO  LAUNCH",
-                           ctx_.W / 2, ctx_.H - 30, CYAN);
+        if (ready_t_ > 0) {
+            // presses are ignored during the grace beat, so don't ask for one yet
+            draw_text_centered(s, *ctx_.fonts.small, "GET  READY", ctx_.W / 2, ctx_.H - 104, ui::LABEL);
+        } else {
+            std::string p = std::string(ui::fire_key(pad_)) + "  LAUNCH        HOLD " +
+                            ui::alt_key(pad_) + "  SMASH";
+            draw_text_centered(s, *ctx_.fonts.small, p, ctx_.W / 2, ctx_.H - 104, ui::HINT);
+        }
     } else if (state_ == St::Play && paddle_->catch_on) {
         bool any_attached = false;
         for (auto& b : balls_) if (b.attached) { any_attached = true; break; }
         if (any_attached)
-            draw_text_centered(s, *ctx_.fonts.small, "SPACE  TO  RELEASE  BALL",
-                               ctx_.W / 2, ctx_.H - 30, Color(40, 255, 200));
+            draw_text_centered(s, *ctx_.fonts.small,
+                               std::string(ui::fire_key(pad_)) + "  TO  RELEASE  BALL",
+                               ctx_.W / 2, ctx_.H - 104, Color(40, 255, 200));
     } else if (state_ == St::Win) {
-        draw_text_centered(s, *ctx_.fonts.big, "LEVEL  CLEAR!", ctx_.W / 2, ctx_.H / 2 - 40, YELLOW);
-        int nxt = level_num() + 1;  // endless: there is always a next level
-        Color nc = is_boss_level(nxt) ? RED : GREEN;
-        std::string lbl = "LEVEL  " + std::to_string(nxt);
-        if (is_boss_level(nxt)) lbl += "   -  BOSS!";
-        draw_text_centered(s, *ctx_.fonts.med, lbl, ctx_.W / 2, ctx_.H / 2 + 20, nc);
+        if (powerups_.empty() && win_total_ - win_t_ > 0.8f)
+            draw_text_centered(s, *ctx_.fonts.small,
+                               std::string(ui::fire_key(pad_)) + "  CONTINUE",
+                               ctx_.W / 2, ctx_.H - 104, ui::HINT);
+        else if (!powerups_.empty())
+            draw_text_centered(s, *ctx_.fonts.small, "CATCH  THE  BONUS  PILLS",
+                               ctx_.W / 2, ctx_.H - 104, ui::HINT);
     } else if (state_ == St::GameOver) {
-        draw_text_centered(s, *ctx_.fonts.big, "GAME  OVER", ctx_.W / 2, ctx_.H / 2 - 50, RED);
-        draw_text_centered(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), ctx_.W / 2, ctx_.H / 2 + 10, WHITE);
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS SPACE TO RETRY", ctx_.W / 2, ctx_.H / 2 + 60, DIM);
-        if (initials_.active()) initials_.draw(s);
-    } else if (state_ == St::Victory) {
-        draw_text_centered(s, *ctx_.fonts.big, "ALL LEVELS CLEARED!", ctx_.W / 2, ctx_.H / 2 - 60, YELLOW);
-        draw_text_centered(s, *ctx_.fonts.med, "FINAL SCORE  " + zpad(score_, 6), ctx_.W / 2, ctx_.H / 2 + 10, WHITE);
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS SPACE TO PLAY AGAIN", ctx_.W / 2, ctx_.H / 2 + 60, DIM);
-        if (initials_.active()) initials_.draw(s);
+        ui::game_over(s, ctx_.fonts, ctx_.W, ctx_.H, go_t_, score_, new_hi_, pad_,
+                      "REACHED  LEVEL  " + std::to_string(level_num()));
     }
+    if (initials_.active()) initials_.draw(s);
 
     pause_.draw(s);
 }
 
 void ArkanoidGame::draw_hud(Surface& s) {
     draw_text(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
-    draw_text_centered(s, *ctx_.fonts.med, "HI  " + zpad(high_score_, 6), ctx_.W / 2, 8, YELLOW);
     draw_text_right(s, *ctx_.fonts.med, "LV  " + std::to_string(level_idx_ + 1), ctx_.W - 16, 8, CYAN);
+    // Top centre: the boss name + HP bar take the slot during a fight (they used
+    // to be squeezed in under the HI score, colliding with it and the combo).
+    bool boss_bar = boss_ && !boss_->dying && !boss_->entering;
+    if (boss_bar) {
+        int bw = 380, bx = ctx_.W / 2 - bw / 2, by = 26;
+        draw_text_centered(s, *ctx_.fonts.small, boss_->name, ctx_.W / 2, 5, boss_->color);
+        draw::rect(s, Color(20, 20, 30), {bx, by, bw, 12}, 0, 4);
+        int fillw = int(bw * boss_->hp_ratio());
+        Color hc = boss_->hp_ratio() > 0.5f ? GREEN : boss_->hp_ratio() > 0.25f ? YELLOW : RED;
+        draw::rect(s, hc, {bx, by, fillw, 12}, 0, 4);
+        draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
+    } else {
+        draw_text_centered(s, *ctx_.fonts.med, "HI  " + zpad(high_score_, 6), ctx_.W / 2, 8, YELLOW);
+    }
     // active stage event reminder
-    if (event_ != Ev::COUNT && state_ == St::Play) {
+    if (event_ != Ev::COUNT && (state_ == St::Play || state_ == St::Ready)) {
         const char* en = event_ == Ev::GoldRush ? "GOLD RUSH"
                        : event_ == Ev::LaserStorm ? "LASER STORM"
                        : event_ == Ev::Multiball ? "MULTIBALL"
                        : event_ == Ev::Frenzy ? "FRENZY" : "SLOW-MO";
-        draw_text_right(s, *ctx_.fonts.small, en, ctx_.W - 16, 34, Color(255, 200, 90));
+        draw_text_right(s, *ctx_.fonts.small, en, ctx_.W - 16, 36, Color(255, 200, 90));
     }
-    draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 26, Color(40, 60, 80));
-    for (int i = 0; i < lives_; ++i)
+    draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 26, ui::LABEL);
+    int shown = std::min(lives_, 8);
+    for (int i = 0; i < shown; ++i)
         draw::circle(s, CYAN, 82 + i * 18, ctx_.H - 16, 6);
-    draw_text_right(s, *ctx_.fonts.small, "P PAUSE", ctx_.W - 12, ctx_.H - 26, Color(25, 50, 70));
+    if (lives_ > shown)
+        draw_text(s, *ctx_.fonts.small, "+" + std::to_string(lives_ - shown),
+                  82 + shown * 18 - 4, ctx_.H - 26, CYAN);
+    draw_text_right(s, *ctx_.fonts.small, std::string(ui::pause_key(pad_)) + " PAUSE",
+                    ctx_.W - 12, ctx_.H - 26, ui::LABEL);
 
-    // combo / multiplier
+    // combo / multiplier (sits below the boss bar when there is one)
     if (ctx_.combo && ctx_.combo->active() && state_ == St::Play) {
         int m = ctx_.combo->mult();
         Color cc = m >= 6 ? RED : m >= 4 ? Color(255, 140, 0) : YELLOW;
-        draw_text_centered(s, *ctx_.fonts.med, "x" + std::to_string(m) + " COMBO", ctx_.W / 2, 34, cc);
+        int cy = boss_bar ? 44 : 36;
+        draw_text_centered(s, *ctx_.fonts.med, "x" + std::to_string(m) + " COMBO", ctx_.W / 2, cy, cc);
         int bw = 120, bx = ctx_.W / 2 - bw / 2;
-        draw::rect(s, Color(40, 40, 40), {bx, 58, bw, 4});
-        draw::rect(s, cc, {bx, 58, int(bw * ctx_.combo->ratio()), 4});
+        draw::rect(s, Color(40, 40, 40), {bx, cy + 26, bw, 4});
+        draw::rect(s, cc, {bx, cy + 26, int(bw * ctx_.combo->ratio()), 4});
     }
 
     // ── JUGGLE bonus indicator: shown while 2+ balls are in play ──
@@ -2111,39 +2566,33 @@ void ArkanoidGame::draw_hud(Surface& s) {
                  : jm == 3 ? Color(int(255 * p), int(140 * p), 0)
                            : Color(80, int(255 * p), 200);
         draw_text_centered(s, *ctx_.fonts.med,
-                           "JUGGLE x" + std::to_string(jm), ctx_.W / 2, ctx_.H - 56, jc);
+                           "JUGGLE x" + std::to_string(jm), ctx_.W / 2, ctx_.H - 58, jc);
     }
 
-    // ── SMASH meter: fills as the ball bounces off the paddle. Past the threshold
-    //    tick, HOLD smash (SHIFT / a shoulder) and the next paddle hit smashes. ──
+    // ── SMASH meter: HOLD the button to fill it; a paddle hit past the tick mark
+    //    smashes. The label names the key, so the mechanic explains itself. ──
     if (state_ == St::Play && !bot_) {
-        int bw = 90, bx = ctx_.W - bw - 12, by = ctx_.H - 44;
+        int bw = 110, bx = ctx_.W - bw - 12, by = ctx_.H - 42;
         float fill = paddle_->smash_charge / Paddle::SMASH_FULL;
-        bool canSmash = paddle_->smash_charge >= Paddle::SMASH_MIN && paddle_->smash_cd <= 0;
+        bool cooling = paddle_->smash_cd > 0;
+        bool canSmash = paddle_->smash_charge >= Paddle::SMASH_MIN && !cooling;
         Color fc = canSmash ? (paddle_->armed ? Color(255, 90, 40) : Color(255, 180, 60))
                             : Color(255, 220, 80);
-        draw_text_right(s, *ctx_.fonts.small, (paddle_->armed && canSmash) ? "SMASH!" : "SMASH",
-                        bx + bw, by - 14, canSmash ? Color(255, 150, 40) : Color(70, 70, 90));
+        std::string lbl = cooling ? "COOLING"
+                        : canSmash ? "SMASH!"
+                        : std::string("HOLD ") + ui::alt_key(pad_) + ": SMASH";
+        draw_text_right(s, *ctx_.fonts.small, lbl, bx + bw, by - 20,
+                        canSmash ? Color(255, 150, 40) : ui::LABEL);
         draw::rect(s, Color(30, 30, 40), {bx, by, bw, 6});
         draw::rect(s, fc, {bx, by, int(bw * std::min(1.0f, fill)), 6});
         int tx = bx + int(bw * (Paddle::SMASH_MIN / Paddle::SMASH_FULL));  // trigger threshold
         draw::line(s, Color(200, 200, 220, 160), tx, by - 2, tx, by + 8, 1);
     }
-
-    // boss HP bar
-    if (boss_ && !boss_->dying && !boss_->entering) {
-        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 40;
-        draw_text_centered(s, *ctx_.fonts.small, boss_->name, ctx_.W / 2, by - 16, boss_->color);
-        draw::rect(s, Color(20, 20, 30), {bx, by, bw, 12}, 0, 4);
-        int fillw = int(bw * boss_->hp_ratio());
-        Color hc = boss_->hp_ratio() > 0.5f ? GREEN : boss_->hp_ratio() > 0.25f ? YELLOW : RED;
-        draw::rect(s, hc, {bx, by, fillw, 12}, 0, 4);
-        draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
-    }
 }
 
 void ArkanoidGame::draw_powerup_timers(Surface& s) {
-    int y = 36;
+    // below the stage-event label when there is one (they used to share a row)
+    int y = event_ != Ev::COUNT ? 56 : 36;
     for (auto& p : pw_timers_) {
         const std::string& k = p.first;
         Color col = WHITE;
@@ -2156,8 +2605,9 @@ void ArkanoidGame::draw_powerup_timers(Surface& s) {
         else if (k == "fire") col = Color(255, 110, 30);
         std::string up = k;
         for (auto& c : up) c = char(std::toupper((unsigned char)c));
-        // f"{t:.0f}s" — round-half-to-even on .0f; use rounding to nearest.
-        int secs = int(std::floor(p.second + 0.5f));
+        int secs = int(std::ceil(p.second));
+        // blink in the last two seconds so an effect never just vanishes
+        if (p.second < 2.0f && std::fmod(p.second, 0.3f) < 0.12f) { y += 18; continue; }
         draw_text_right(s, *ctx_.fonts.small, up + "  " + std::to_string(secs) + "s",
                         ctx_.W - 12, y, col);
         y += 18;
@@ -2166,9 +2616,21 @@ void ArkanoidGame::draw_powerup_timers(Surface& s) {
 
 void ArkanoidGame::draw_flash(Surface& s) {
     for (auto& f : flash_) {
-        auto t = ctx_.fonts.small->render(f.text, f.color);
-        t->set_alpha(clampi(int(255 * f.life), 0, 255));
-        s.blit(*t, int(f.x) - t->width() / 2, int(f.y));
+        Color c = f.color;
+        if (f.banner) {
+            // fade in over 0.15s, out over the last 0.4s; dark plate behind
+            float a = std::min({1.0f, (f.max_life - f.life) / 0.15f, f.life / 0.4f});
+            a = std::max(0.0f, a);
+            Font& font = *ctx_.fonts.med;
+            int tw = font.text_width(f.text);
+            draw::rect(s, Color(0, 0, 0, int(170 * a)),
+                       {int(f.x) - tw / 2 - 18, int(f.y) - 5, tw + 36, 34}, 0, 6);
+            c.a = uint8_t(255 * a);
+            draw_text_centered(s, font, f.text, int(f.x), int(f.y), c);
+        } else {
+            c.a = uint8_t(255 * std::clamp(f.life * 2.0f, 0.0f, 1.0f));
+            draw_text_centered(s, *ctx_.fonts.small, f.text, int(f.x), int(f.y), c);
+        }
     }
 }
 

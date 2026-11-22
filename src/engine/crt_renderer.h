@@ -1,6 +1,7 @@
 // crt_renderer.h — CRT post-processing with phosphor persistence (afterglow).
 //
-// Multi-pass at game resolution (900x720), all in FBOs:
+// Multi-pass, all in FBOs sized to the on-screen viewport (so the effect is
+// rendered at display resolution, not stretched from 900x720):
 //   1. CRT shader (crt.vert/crt.frag, verbatim) : game texture -> scene FBO
 //   2. combine : accum = max(scene, prevAccum * persistence)  (motion trails)
 //   3. present : accum -> letterboxed viewport on the default framebuffer
@@ -42,11 +43,14 @@ public:
 private:
     GLuint compile(GLenum type, const std::string& src, const char* label);
     GLuint link(const std::string& vsrc, const std::string& fsrc, const char* label);
-    GLuint make_tex(bool nearest);
+    GLuint make_tex(bool nearest, int w, int h);
     GLuint make_fbo(GLuint tex);
     bool   build(const std::string& shader_dir);
+    void   build_plain();   // fallback: raw surface, no effects
+    void   make_quad();
 
-    int    w_, h_;
+    int    w_, h_;                // game surface size
+    int    out_w_ = 0, out_h_ = 0;  // size the CRT passes render at (= viewport)
     bool   enabled_ = false;
     float  time_ = 0.0f;
     float  persistence_ = 0.58f;  // phosphor afterglow — lowered to cut motion smear
@@ -68,9 +72,11 @@ private:
     int    accum_cur_ = 0;
     bool   accum_primed_ = false;
 
-    GLint u_crt_time_ = -1, u_crt_res_ = -1, u_crt_tex_ = -1;
+    GLint u_crt_time_ = -1, u_crt_res_ = -1, u_crt_out_ = -1, u_crt_tex_ = -1;
     GLint u_crt_hue_ = -1, u_crt_shock_ = -1, u_crt_shock_r_ = -1, u_crt_shock_c_ = -1;
     GLint u_crt_glow_ = -1, u_crt_scan_ = -1;
     GLint u_comb_scene_ = -1, u_comb_prev_ = -1, u_comb_persist_ = -1;
     GLint u_pres_tex_ = -1;
+    GLuint prog_plain_ = 0;
+    GLint  u_plain_tex_ = -1;
 };

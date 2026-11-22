@@ -7,6 +7,7 @@
 #include <fstream>
 
 #include "json.hpp"
+#include "paths.h"
 
 using json = nlohmann::json;
 
@@ -27,17 +28,7 @@ json default_doc() {
 #define DOC (*reinterpret_cast<json*>(doc_))
 
 ScoreManager::ScoreManager() : doc_(new json(default_doc())) {
-    const char* env = std::getenv("RETRO_ARCADE_DATA");
-    std::string dir;
-    if (env) {
-        dir = env;
-    } else {
-        char* base = SDL_GetBasePath();
-        dir = base ? base : "./";
-        if (base) SDL_free(base);
-    }
-    if (!dir.empty() && dir.back() != '/') dir += '/';
-    path_ = dir + "scores.json";
+    path_ = data_dir() + "scores.json";
     load();
 }
 
@@ -48,22 +39,29 @@ void ScoreManager::load() {
     try {
         json saved;
         f >> saved;
-        for (auto& [game, vals] : saved.items())
-            if (DOC.contains(game))
-                for (auto& [k, v] : vals.items()) DOC[game][k] = v;
+        if (!saved.is_object()) return;
+        // Merge only well-typed values: stats must be integers and the board an
+        // array, so a hand-edited or damaged file can never crash a lookup.
+        for (auto& [game, vals] : saved.items()) {
+            if (!DOC.contains(game) || !vals.is_object()) continue;
+            for (auto& [k, v] : vals.items()) {
+                if (k == "board") { if (v.is_array()) DOC[game][k] = v; }
+                else if (v.is_number_integer()) DOC[game][k] = v;
+            }
+        }
     } catch (...) {
         DOC = default_doc();
     }
 }
 
 void ScoreManager::save() {
-    std::ofstream f(path_);
-    if (f) f << DOC.dump(2);
+    write_file_atomic(path_, DOC.dump(2));
 }
 
 int ScoreManager::get(const std::string& g, const std::string& k, int def) const {
     const json& d = DOC;
-    if (d.contains(g) && d[g].contains(k)) return d[g][k].get<int>();
+    if (d.contains(g) && d[g].contains(k) && d[g][k].is_number_integer())
+        return d[g][k].get<int>();
     return def;
 }
 void ScoreManager::set(const std::string& g, const std::string& k, int v) {
@@ -122,8 +120,12 @@ std::vector<ScoreManager::Entry> ScoreManager::leaderboard(
     std::vector<Entry> out;
     const json& d = DOC;
     if (d.contains(g) && d[g].contains("board"))
-        for (const auto& e : d[g]["board"])
-            out.push_back({e.value("name", "AAA"), e.value("score", 0)});
+        for (const auto& e : d[g]["board"]) {
+            if (!e.is_object()) continue;
+            auto n = e.find("name"); auto sc = e.find("score");
+            out.push_back({n != e.end() && n->is_string() ? n->get<std::string>() : "AAA",
+                           sc != e.end() && sc->is_number_integer() ? sc->get<int>() : 0});
+        }
     return out;
 }
 

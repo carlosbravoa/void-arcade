@@ -29,13 +29,14 @@
 #include "engine/surface.h"
 #include "engine/telemetry.h"
 #include "engine/text.h"
+#include "engine/ui.h"
 
 namespace {
 
 // ── Colors ────────────────────────────────────────────────────────────────────
 const Color BLACK(0, 0, 0), WHITE(255, 255, 255), GREEN(80, 255, 80);
 const Color CYAN(80, 200, 255), YELLOW(255, 220, 40), RED(255, 60, 60);
-const Color DIM(40, 80, 40), ORANGE(255, 140, 40);
+const Color ORANGE(255, 140, 40);
 
 const Color BEE_COLOR(100, 220, 255);
 const Color BUTTERFLY_COLOR(255, 100, 200);
@@ -91,7 +92,6 @@ std::string zpad(int v, int width) {
     if ((int)s.size() < width) s = std::string(width - s.size(), '0') + s;
     return s;
 }
-Color darker(Color c, float f) { return Color(int(c.r * f), int(c.g * f), int(c.b * f)); }
 
 std::shared_ptr<Surface> make_glow(const SL& lines, Color color, int radius) {
     Surface base = make_sprite_surface(lines, color, SCALE);
@@ -110,51 +110,67 @@ std::pair<float, float> bezier(std::pair<float, float> p0, std::pair<float, floa
 }
 
 using Path = std::vector<std::pair<float, float>>;
+using Pt = std::pair<float, float>;
 
-Path make_entry_path(float slot_x, float slot_y, int screen_w, int screen_h,
-                     const std::string& side) {
-    Path pts;
-    const int steps = 80;
-    std::pair<float, float> p0, p1, p2, p3;
-    if (side == "right") {
-        p0 = {screen_w + 40.0f, -40.0f};
-        p1 = {screen_w - 60.0f, screen_h * 0.5f};
-        p2 = {screen_w * 0.3f, screen_h * 0.4f};
-        p3 = {slot_x, slot_y};
-    } else {
-        p0 = {-40.0f, -40.0f};
-        p1 = {60.0f, screen_h * 0.5f};
-        p2 = {screen_w * 0.7f, screen_h * 0.4f};
-        p3 = {slot_x, slot_y};
+// Every flight path is resampled to evenly spaced points, so an enemy advances
+// along it by DISTANCE (px/s) rather than by bezier parameter — speeds are real
+// pixel speeds, identical along the whole curve and at any frame rate.
+constexpr float PATH_STEP = 6.0f;
+
+Path resample(const Path& raw) {
+    Path out;
+    if (raw.empty()) return out;
+    out.push_back(raw[0]);
+    float next = PATH_STEP;  // distance into the current segment of the next sample
+    for (size_t i = 1; i < raw.size(); ++i) {
+        float ax = raw[i - 1].first, ay = raw[i - 1].second;
+        float bx = raw[i].first, by = raw[i].second;
+        float seg = std::hypot(bx - ax, by - ay);
+        if (seg <= 0) continue;
+        while (next <= seg) {
+            out.push_back({ax + (bx - ax) * next / seg, ay + (by - ay) * next / seg});
+            next += PATH_STEP;
+        }
+        next -= seg;
     }
-    for (int i = 0; i <= steps; ++i) pts.push_back(bezier(p0, p1, p2, p3, i / float(steps)));
-    return pts;
+    out.push_back(raw.back());
+    return out;
+}
+Path curve(Pt p0, Pt p1, Pt p2, Pt p3) {
+    Path raw;
+    const int steps = 64;
+    for (int i = 0; i <= steps; ++i) raw.push_back(bezier(p0, p1, p2, p3, i / float(steps)));
+    return resample(raw);
 }
 
-Path make_dive_path(float enemy_x, float enemy_y, int screen_w, int screen_h) {
-    Path pts;
-    const int steps = 120;
-    float tx = rnd_uniform(screen_w * 0.2f, screen_w * 0.8f);
-    float ty = screen_h - 80.0f;
+// Six entry swoops; each squad of four shares one so they arrive as a flight.
+Path make_entry_path(float sx, float sy, int W, int H, int variant) {
+    float w = float(W), h = float(H);
+    switch (variant % 6) {
+        case 0:  return curve({-40, -40}, {60, h * 0.5f}, {w * 0.7f, h * 0.4f}, {sx, sy});
+        case 1:  return curve({w + 40, -40}, {w - 60, h * 0.5f}, {w * 0.3f, h * 0.4f}, {sx, sy});
+        case 2:  return curve({-40, h * 0.58f}, {w * 0.45f, h * 0.66f}, {w * 0.58f, h * 0.12f}, {sx, sy});
+        case 3:  return curve({w + 40, h * 0.58f}, {w * 0.55f, h * 0.66f}, {w * 0.42f, h * 0.12f}, {sx, sy});
+        case 4:  return curve({w * 0.5f - 30, -40}, {w * 0.08f, h * 0.30f}, {w * 0.28f, h * 0.60f}, {sx, sy});
+        default: return curve({w * 0.5f + 30, -40}, {w * 0.92f, h * 0.30f}, {w * 0.72f, h * 0.60f}, {sx, sy});
+    }
+}
 
-    std::pair<float, float> p0 = {enemy_x, enemy_y};
-    std::pair<float, float> p1 = {enemy_x + rnd_uniform(-120, 120), screen_h * 0.5f};
-    std::pair<float, float> p2 = {tx + rnd_uniform(-80, 80), ty};
-    std::pair<float, float> p3 = {tx, ty + 40};
-    for (int i = 0; i <= steps / 2; ++i) pts.push_back(bezier(p0, p1, p2, p3, i / float(steps / 2)));
-
-    float exit_x = pts.back().first;
-    float wrap_x = screen_w - exit_x;
-    float re_x = enemy_x;
-    float re_y = enemy_y;
-
-    std::pair<float, float> p0b = {exit_x, ty + 40};
-    std::pair<float, float> p1b = {exit_x, screen_h + 60.0f};
-    std::pair<float, float> p2b = {wrap_x, -60.0f};
-    std::pair<float, float> p3b = {re_x, re_y};
-    for (int i = 1; i <= steps / 2; ++i)
-        pts.push_back(bezier(p0b, p1b, p2b, p3b, i / float(steps / 2)));
-    return pts;
+// Attack run: swoop down past the player's row and off the bottom of the screen.
+// The enemy then re-enters from the top (see make_return_path).
+Path make_dive_path(float ex, float ey, float aim_x, int W, int H) {
+    float tx = std::clamp(aim_x + rnd_uniform(-130, 130), W * 0.08f, W * 0.92f);
+    return curve({ex, ey}, {ex + rnd_uniform(-140, 140), H * 0.5f},
+                 {tx + rnd_uniform(-90, 90), H - 150.0f}, {tx, H + 70.0f});
+}
+Path make_return_path(float from_x, float from_y, float sx, float sy) {
+    if (from_y < 0)  // wrapped: drop back in from above
+        return curve({from_x, from_y}, {from_x, 30.0f}, {sx, sy - 70.0f}, {sx, sy});
+    return curve({from_x, from_y}, {from_x, from_y - 150.0f}, {sx, sy + 150.0f}, {sx, sy});
+}
+// A boss peeling off to a hover point above the player for a tractor run.
+Path make_hover_path(float ex, float ey, float hx, float hy) {
+    return curve({ex, ey}, {ex, ey + 130.0f}, {hx, hy - 150.0f}, {hx, hy});
 }
 
 // ── Bullet (supports angled travel + piercing + damage) ───────────────────────
@@ -166,6 +182,7 @@ struct Bullet {
     int w = BW, h = BH;
     int pierce = 0;   // enemies it can pass through (player bullets only)
     int damage = 1;
+    int volley = 0;   // which trigger-pull it came from (player bullets only)
 
     Rect rect() const {
         return {int(x - w / 2 - 1), int(vy < 0 ? y - h : y), w + 2, h};
@@ -231,6 +248,8 @@ struct SpriteCache {
     std::shared_ptr<Surface> armor[2];
     std::shared_ptr<Surface> boss[2];
     std::shared_ptr<Surface> boss_dmg[2];
+    // white silhouettes for a shape-correct hit flicker
+    std::shared_ptr<Surface> bee_fl[2], butterfly_fl[2], armor_fl[2], boss_fl[2];
     std::shared_ptr<Surface> player;       // single (glow radius 10)
     std::shared_ptr<Surface> dual;         // dual fighter (glow radius 10)
     std::shared_ptr<Surface> captured;     // captured ship (red, glow 6)
@@ -243,6 +262,10 @@ struct SpriteCache {
             armor[f] = make_glow(ARMOR[f], ARMOR_COLOR, 6);
             boss[f] = make_glow(BOSS[f], BOSS_COLOR, 6);
             boss_dmg[f] = make_glow(BOSS[f], BOSS_COLOR2, 6);
+            bee_fl[f] = make_glow(BEE[f], WHITE, 6);
+            butterfly_fl[f] = make_glow(BUTTERFLY[f], WHITE, 6);
+            armor_fl[f] = make_glow(ARMOR[f], WHITE, 6);
+            boss_fl[f] = make_glow(BOSS[f], WHITE, 6);
         }
         auto bs = sprite_size(BEE[0], SCALE); bee_w = bs.first; bee_h = bs.second;
         auto us = sprite_size(BUTTERFLY[0], SCALE); but_w = us.first; but_h = us.second;
@@ -272,7 +295,9 @@ SpriteCache& cache() {
 // ── Player (weapon progression layered on top) ────────────────────────────────
 struct Player {
     static constexpr float SPEED = 300, RESPAWN_INV = 2.5f;
-    static constexpr int MAX_BULLETS = 6;  // raised so spread/wing stacks fit
+    // Fire is limited by trigger-pulls in flight, not by individual bolts, so a
+    // fat spread/wing volley never chokes the gun.
+    static constexpr int MAX_VOLLEYS = 7;
     float x, y;
     bool alive = true;
     float fire_cd = 0, invincible = 0;
@@ -289,12 +314,11 @@ struct Player {
         return {int(x + cur_w() / 2.0f), int(y + h / 2.0f)};
     }
 
-    void update(float dt, const Input& in, int screen_w) {
+    void update(float dt, float move_dir, int screen_w) {
         if (!alive || captured) return;
         if (invincible > 0) invincible -= dt;
         if (fire_cd > 0) fire_cd -= dt;
-        if (in.down(SDLK_LEFT) || in.down(SDLK_a)) x -= SPEED * dt;
-        if (in.down(SDLK_RIGHT) || in.down(SDLK_d)) x += SPEED * dt;
+        x += move_dir * SPEED * dt;
         float max_x = screen_w - cur_w();
         x = std::max(0.0f, std::min(max_x, x));
     }
@@ -325,13 +349,15 @@ struct Enemy {
     bool alive = true;
     int frame = 0;
     float hit_flash = 0;
-    // state: entering, formation, diving, returning
+    // state: entering → formation ⇄ diving → returning; a boss may also go
+    // "tractor" (fly to a hover point, beam, return); "leaving" flies off-screen.
     std::string state = "entering";
-    Path enter_path;
-    float enter_t = 0;
-    Path dive_path;
-    float dive_t = 0;
-    float dive_speed = 220.0f;
+    Path path;              // the path for the current state (evenly spaced points)
+    float path_d = 0;       // px travelled along it
+    float enter_at = 0;     // formation clock time at which it is released
+    bool released = false;  // has left the wings and is actually on screen
+    float dive_speed = 400.0f;
+    int tractor_phase = 0;  // 0 flying to the hover point, 1 holding / beaming
     bool captured = false;
     int glow_off = 6, w, h;
 
@@ -367,19 +393,43 @@ struct Enemy {
     }
     void toggle_frame() { frame ^= 1; }
 
+    void set_path(Path p) { path = std::move(p); path_d = 0; }
+    float path_len() const { return path.size() < 2 ? 0.0f : (path.size() - 1) * PATH_STEP; }
+    bool path_done() const { return path_d >= path_len(); }
+    float progress() const { float l = path_len(); return l > 0 ? std::min(1.0f, path_d / l) : 1.0f; }
+    Pt path_pos() const {
+        if (path.empty()) return {x, y};
+        if (path.size() < 2) return path[0];
+        int n = (int)path.size();
+        float f = std::max(0.0f, path_d / PATH_STEP);
+        int i = std::min(int(f), n - 2);
+        float frac = std::min(1.0f, f - i);
+        return {path[i].first + (path[i + 1].first - path[i].first) * frac,
+                path[i].second + (path[i + 1].second - path[i].second) * frac};
+    }
+
     void draw(Surface& s) const {
-        if (!alive) return;
-        std::shared_ptr<Surface> surf;
-        if (kind == Kind::Boss && hp == 1) surf = cache().boss_dmg[frame];
-        else if (kind == Kind::Boss) surf = cache().boss[frame];
-        else if (kind == Kind::Armor) surf = cache().armor[frame];
-        else if (kind == Kind::Butterfly) surf = cache().butterfly[frame];
-        else surf = cache().bee[frame];
+        if (!alive || !released) return;
+        const SpriteCache& c = cache();
+        const Surface* surf;
+        Surface* fl;
+        if (kind == Kind::Boss) { surf = (hp == 1 ? c.boss_dmg[frame] : c.boss[frame]).get(); fl = c.boss_fl[frame].get(); }
+        else if (kind == Kind::Armor) { surf = c.armor[frame].get(); fl = c.armor_fl[frame].get(); }
+        else if (kind == Kind::Butterfly) { surf = c.butterfly[frame].get(); fl = c.butterfly_fl[frame].get(); }
+        else { surf = c.bee[frame].get(); fl = c.bee_fl[frame].get(); }
         s.blit(*surf, int(x) - glow_off, int(y) - glow_off);
-        if (hit_flash > 0)  // armored grunts spark white when chipped
-            draw::rect(s, Color(255, 255, 255, int(120 * hit_flash)), rect(), 2, 2);
+        if (hit_flash > 0) {  // white silhouette flicker, shaped like the sprite
+            fl->set_alpha(int(200 * std::min(1.0f, hit_flash)));
+            s.blit(*fl, int(x) - glow_off, int(y) - glow_off);
+            fl->set_alpha(-1);
+        }
+        if (kind == Kind::Armor && hp < max_hp) {  // armour left, once chipped
+            int bw = w - 4, fw = std::max(1, bw * hp / max_hp);
+            draw::rect(s, Color(30, 34, 40), {int(x) + 2, int(y) + h + 3, bw, 2});
+            draw::rect(s, hp * 2 <= max_hp ? ORANGE : WHITE, {int(x) + 2, int(y) + h + 3, fw, 2});
+        }
         if (captured) {
-            auto cap = cache().captured;
+            auto cap = c.captured;
             s.blit(*cap, int(x) + w / 2 - cap->width() / 2, int(y) + h + 4);
         }
     }
@@ -396,12 +446,13 @@ struct TractorBeam {
     std::string phase = "extend";  // extend → hold → retract
     float hold_t = 1.8f;
 
-    explicit TractorBeam(Enemy* b) : boss(b) {}
+    TractorBeam(Enemy* b, int reach) : boss(b), max_len(reach) {}
     float x() const { return boss->x + boss->w / 2; }
     float top_y() const { return boss->y + boss->h; }
 
     void update(float dt) {
         t += dt;
+        if (!boss->alive) { active = false; return; }  // no boss, no beam
         if (phase == "extend") {
             length = std::min(float(max_len), length + 350 * dt);
             if (length >= max_len) phase = "hold";
@@ -454,14 +505,18 @@ struct TractorBeam {
 // ── formation slots ───────────────────────────────────────────────────────────
 struct Slot { float x, y; Kind kind; };
 
-std::vector<Slot> build_formation_slots(int screen_w, int top_y) {
+// `guard` = the short two-row escort that flies under a mega-boss.
+std::vector<Slot> build_formation_slots(int screen_w, int top_y, bool guard) {
     std::vector<Slot> slots;
     struct Row { int count; Kind kind; };
-    Row rows[] = {
-        {4, Kind::Boss}, {6, Kind::Boss}, {8, Kind::Butterfly},
-        {10, Kind::Butterfly}, {12, Kind::Bee}, {12, Kind::Bee}};
+    static const Row FULL[] = {{4, Kind::Boss}, {6, Kind::Boss}, {8, Kind::Butterfly},
+                               {10, Kind::Butterfly}, {12, Kind::Bee}, {12, Kind::Bee}};
+    static const Row ESCORT[] = {{8, Kind::Butterfly}, {10, Kind::Bee}};
+    const Row* rows = guard ? ESCORT : FULL;
+    const int n_rows = guard ? 2 : 6;
     int y = top_y;
-    for (auto& r : rows) {
+    for (int ri = 0; ri < n_rows; ++ri) {
+        const Row& r = rows[ri];
         int total_w = r.count * 52;
         int start_x = (screen_w - total_w) / 2;
         for (int i = 0; i < r.count; ++i)
@@ -475,16 +530,21 @@ std::vector<Slot> build_formation_slots(int screen_w, int top_y) {
 struct Formation {
     static constexpr float ANIM_INTERVAL_BASE = 0.5f, ANIM_INTERVAL_MIN = 0.12f;
     static constexpr float DRIFT_SPEED = 38.0f, DRIFT_RANGE = 90.0f;
+    static constexpr int SQUAD = 4;
 
     int W, H, wave;
     bool challenge = false;   // bonus stage: enemies fly patterns but never fire
-    std::vector<Enemy> enemies;
+    bool guard = false;       // boss stage: a short escort instead of the full swarm
+    int top_y = 80;
+    float player_y = 650;     // the player's row, for tractor reach
+    std::vector<Enemy> enemies;   // never resized after build(): Enemy* stay valid
     std::vector<TractorBeam> tractor_beams;
     std::vector<Bullet> p_bullets;
     float anim_t = 0;
     bool anim_ticked = false;
     float drift_x = 0;
     int drift_dir = 1;
+    float clock = 0;          // seconds since the stage began (entry schedule)
     // ── formation morphs ──────────────────────────────────────────────────────
     // Every so often the whole formation animates into a new shape over a few
     // seconds: a breathe (scale pulse), a rotate (swirl), or a wave ripple. The
@@ -494,23 +554,21 @@ struct Formation {
     float morph_dur = 0;       // 0 = no morph running
     int   morph_kind = 0;      // 0 breathe, 1 rotate, 2 wave
     float form_cx = 0, form_cy = 0;  // formation centroid (resting slots)
-    // entry queue
-    int entry_idx = 0;
-    float entry_delay = 0;
-    std::vector<int> active_entering;  // indices into enemies
 
-    Formation(int sw, int sh, int wv, bool chal = false)
-        : W(sw), H(sh), wave(wv), challenge(chal) { build(); }
+    Formation(int sw, int sh, int wv, bool chal, bool grd, int top)
+        : W(sw), H(sh), wave(wv), challenge(chal), guard(grd), top_y(top) { build(); }
 
     void build() {
-        auto slots = build_formation_slots(W, 55);
-        const char* sides_pat[2] = {"right", "left"};
+        auto slots = build_formation_slots(W, top_y, guard);
         // Stage scaling: butterflies and bees can be promoted to armored grunts
         // that take multiple hits. Fraction & HP both rise with the stage.
         // Challenge stages never promote — they're a soft, point-rich breather.
         float armor_p = challenge ? 0.0f
                                   : std::min(0.55f, std::max(0.0f, (wave - 2) * 0.07f));
         int armor_hp = 2 + wave / 6;
+        // Entry: squads of four share a swoop and follow each other in; a new
+        // squad launches every ~half second, so stage 1 is full in about 8 s.
+        float squad_iv = std::max(0.28f, 0.50f - wave * 0.02f);
         for (int idx = 0; idx < (int)slots.size(); ++idx) {
             Kind k = slots[idx].kind;
             int hp = (k == Kind::Boss) ? 2 : 1;
@@ -520,16 +578,13 @@ struct Formation {
                 hp = armor_hp;
             }
             Enemy e(slots[idx].x, slots[idx].y, k, idx, hp);
-            std::string side = sides_pat[idx % 2];
-            e.x = (side == "left") ? -80.0f : float(W + 80);
-            e.y = -80.0f;
+            int squad = idx / SQUAD, member = idx % SQUAD;
             e.state = "entering";
-            e.enter_path = make_entry_path(slots[idx].x, slots[idx].y, W, H, side);
-            e.enter_t = 0;
+            e.enter_at = squad * squad_iv + member * 0.10f;
+            e.set_path(make_entry_path(slots[idx].x, slots[idx].y, W, H, squad + wave));
+            e.x = e.path[0].first; e.y = e.path[0].second;
             enemies.push_back(std::move(e));
         }
-        entry_idx = 0;
-        entry_delay = 0;
 
         // centroid of the resting slots — the pivot for rotate / breathe morphs.
         double sx = 0, sy = 0;
@@ -541,61 +596,43 @@ struct Formation {
     int alive_count() const {
         int n = 0; for (auto& e : enemies) if (e.alive) ++n; return n;
     }
+    // Enemies the player still has to deal with (ignores ones flying away).
+    int hostile_count() const {
+        int n = 0; for (auto& e : enemies) if (e.alive && e.state != "leaving") ++n; return n;
+    }
     bool all_in_formation() const {
         for (auto& e : enemies) if (e.alive && e.state != "formation") return false;
         return true;
     }
+    bool entry_done() const {
+        for (auto& e : enemies) if (e.alive && e.state == "entering") return false;
+        return true;
+    }
     float anim_interval() const {
-        float r = std::max(0.0f, alive_count() / float(enemies.size()));
+        float r = std::max(0.0f, alive_count() / float(std::max<size_t>(1, enemies.size())));
         return ANIM_INTERVAL_MIN + (ANIM_INTERVAL_BASE - ANIM_INTERVAL_MIN) * r;
     }
     bool in_formation(const Enemy& e) const { return e.state == "formation"; }
+    float dive_speed() const { return std::min(760.0f, 430.0f + wave * 16.0f); }
 
-    void update(float dt, int screen_h, int screen_w) {
+    // `hostile` = enemies may open fire. Movement, beams and bullets always run.
+    void update(float dt, int screen_h, int screen_w, bool hostile) {
         anim_ticked = false;
+        clock += dt;
         for (auto& e : enemies) if (e.hit_flash > 0) e.hit_flash -= dt * 5;
-
-        // entry queue release (staggered, faster at higher stages)
-        entry_delay -= dt;
-        if (entry_delay <= 0 && entry_idx < (int)enemies.size()) {
-            active_entering.push_back(entry_idx);
-            entry_idx += 1;
-            entry_delay = 0.5f - std::min(0.35f, wave * 0.04f);
-        }
-
-        // move entering enemies along path
-        float speed_scale = 1.0f + wave * 0.06f;
-        for (size_t ai = 0; ai < active_entering.size();) {
-            Enemy& e = enemies[active_entering[ai]];
-            if (!e.alive || e.state != "entering") { active_entering.erase(active_entering.begin() + ai); continue; }
-            Path& path = e.enter_path;
-            int n = (int)path.size();
-            int idx = std::min(int(e.enter_t * (n - 1)), n - 2);
-            float frac = e.enter_t * (n - 1) - idx;
-            auto [x0, y0] = path[idx];
-            auto [x1, y1] = path[idx + 1];
-            e.x = x0 + (x1 - x0) * frac;
-            e.y = y0 + (y1 - y0) * frac;
-            e.enter_t += dt * speed_scale * 0.8f;
-            if (e.enter_t >= 1.0f) {
-                e.x = e.slot_x; e.y = e.slot_y; e.state = "formation";
-                active_entering.erase(active_entering.begin() + ai);
-                continue;
-            }
-            ++ai;
-        }
 
         // formation drift + (optional) morph
         bool any_formation = false;
         for (auto& e : enemies) if (e.alive && e.state == "formation") { any_formation = true; break; }
         if (any_formation) {
+            // Clamp at the rail and turn there — never "still past the edge, flip again".
             drift_x += DRIFT_SPEED * drift_dir * dt;
-            if (std::fabs(drift_x) >= DRIFT_RANGE) drift_dir *= -1;
+            if (drift_x >= DRIFT_RANGE)       { drift_x = DRIFT_RANGE;  drift_dir = -1; }
+            else if (drift_x <= -DRIFT_RANGE) { drift_x = -DRIFT_RANGE; drift_dir = 1; }
 
             // morph scheduler: only morph when the whole swarm has settled.
-            bool settled = all_in_formation();
             if (morph_dur <= 0) {
-                if (settled) {
+                if (all_in_formation()) {
                     morph_cd -= dt;
                     if (morph_cd <= 0) {
                         morph_kind = rnd_int(0, 2);
@@ -610,31 +647,85 @@ struct Formation {
                     morph_cd = rnd_uniform(6.0f, 11.0f);
                 }
             }
+        }
+        // envelope: ease in and back out so the shape returns to rest cleanly.
+        float amp = 0;
+        if (morph_dur > 0) amp = std::sin(std::min(1.0f, morph_t / morph_dur) * PI);
 
-            // envelope: ease in and back out so the shape returns to rest cleanly.
-            float amp = 0;
-            if (morph_dur > 0) amp = std::sin(std::min(1.0f, morph_t / morph_dur) * PI);
-
-            for (auto& e : enemies) {
-                if (!(e.alive && e.state == "formation")) continue;
-                float ox = 0, oy = 0;
-                if (amp > 0.001f) {
-                    float rx = e.slot_x - form_cx, ry = e.slot_y - form_cy;
-                    if (morph_kind == 0) {            // BREATHE: scale toward/away from centre
-                        float s = amp * 0.22f * std::sin(morph_t * 3.0f);
-                        ox = rx * s; oy = ry * s;
-                    } else if (morph_kind == 1) {     // ROTATE: swirl around the centroid
-                        float a = amp * 0.5f * std::sin(morph_t * 1.6f);
-                        float ca = std::cos(a), sa = std::sin(a);
-                        ox = (rx * ca - ry * sa) - rx;
-                        oy = (rx * sa + ry * ca) - ry;
-                    } else {                          // WAVE: vertical ripple across columns
-                        oy = amp * 26.0f * std::sin(morph_t * 4.0f + rx * 0.035f);
-                        ox = amp * 14.0f * std::sin(morph_t * 3.0f + ry * 0.05f);
-                    }
+        // Where an enemy's slot currently is, relative to its resting slot.
+        auto offset = [&](const Enemy& e) -> Pt {
+            float ox = 0, oy = 0;
+            if (amp > 0.001f) {
+                float rx = e.slot_x - form_cx, ry = e.slot_y - form_cy;
+                if (morph_kind == 0) {            // BREATHE: scale toward/away from centre
+                    float sc = amp * 0.22f * std::sin(morph_t * 3.0f);
+                    ox = rx * sc; oy = ry * sc;
+                } else if (morph_kind == 1) {     // ROTATE: swirl around the centroid
+                    float a = amp * 0.5f * std::sin(morph_t * 1.6f);
+                    float ca = std::cos(a), sa = std::sin(a);
+                    ox = (rx * ca - ry * sa) - rx;
+                    oy = (rx * sa + ry * ca) - ry;
+                } else {                          // WAVE: vertical ripple across columns
+                    oy = amp * 26.0f * std::sin(morph_t * 4.0f + rx * 0.035f);
+                    ox = amp * 14.0f * std::sin(morph_t * 3.0f + ry * 0.05f);
                 }
-                e.x = e.slot_x + drift_x + ox;
-                e.y = e.slot_y + oy;
+            }
+            return {ox + drift_x, oy};
+        };
+        // Follow the path, steering onto the LIVE slot over the final stretch so
+        // the arrival is seamless however far the formation has drifted.
+        auto place_blended = [&](Enemy& e) {
+            auto [px, py] = e.path_pos();
+            auto [ox, oy] = offset(e);
+            float f = std::clamp((e.progress() - 0.55f) / 0.45f, 0.0f, 1.0f);
+            f = f * f * (3 - 2 * f);
+            e.x = px + ox * f; e.y = py + oy * f;
+        };
+        auto begin_return = [&](Enemy& e, float fx, float fy) {
+            e.state = "returning";
+            e.set_path(make_return_path(fx, fy, e.slot_x, e.slot_y));
+        };
+
+        const float entry_speed = std::min(900.0f, 650.0f + wave * 15.0f);
+        for (auto& e : enemies) {
+            if (!e.alive) continue;
+            if (e.state == "formation") {
+                auto [ox, oy] = offset(e);
+                e.x = e.slot_x + ox; e.y = e.slot_y + oy;
+            } else if (e.state == "entering") {
+                if (!e.released) {
+                    if (clock < e.enter_at) continue;
+                    e.released = true;
+                }
+                e.path_d += entry_speed * dt;
+                place_blended(e);
+                if (e.path_done()) e.state = "formation";
+            } else if (e.state == "diving") {
+                e.path_d += e.dive_speed * dt;
+                auto [px, py] = e.path_pos();
+                e.x = px; e.y = py;
+                if (e.path_done())  // off the bottom: wrap around and drop back in from the top
+                    begin_return(e, std::clamp(e.x, 40.0f, float(W - 40 - e.w)), -50.0f);
+            } else if (e.state == "returning") {
+                e.path_d += std::max(420.0f, e.dive_speed) * dt;
+                place_blended(e);
+                if (e.path_done()) e.state = "formation";
+            } else if (e.state == "tractor") {
+                if (e.tractor_phase == 0) {
+                    e.path_d += e.dive_speed * dt;
+                    auto [px, py] = e.path_pos();
+                    e.x = px; e.y = py;
+                    if (e.path_done()) {  // parked over the player's column: open the beam
+                        e.tractor_phase = 1;
+                        int reach = int(player_y + 14 - (e.y + e.h));
+                        tractor_beams.push_back(TractorBeam(&e, std::max(120, reach)));
+                    }
+                } else if (tractor_beams.empty()) {
+                    begin_return(e, e.x, e.y);
+                }
+            } else if (e.state == "leaving") {
+                e.y -= 560 * dt;
+                if (e.y < -70) e.alive = false;
             }
         }
 
@@ -645,29 +736,13 @@ struct Formation {
             for (auto& e : enemies) if (e.alive) e.toggle_frame();
         }
 
-        // diving enemies
-        for (auto& e : enemies) {
-            if (!e.alive || e.state != "diving") continue;
-            Path& path = e.dive_path;
-            int n = (int)path.size();
-            int idx = std::min(int(e.dive_t * (n - 1)), n - 2);
-            float frac = e.dive_t * (n - 1) - idx;
-            auto [x0, y0] = path[idx];
-            auto [x1, y1] = path[idx + 1];
-            e.x = x0 + (x1 - x0) * frac;
-            e.y = y0 + (y1 - y0) * frac;
-            e.dive_t += dt * (e.dive_speed / 220.0f);
-            if (e.dive_t >= 1.0f) {
-                e.x = e.slot_x; e.y = e.slot_y; e.state = "formation"; e.dive_t = 0;
-            }
-        }
-
         // enemy shooting — cap scales up with the stage so later stages bite.
         // Challenge (bonus) stages never fire back: pure pattern-flying for points.
-        const int MAX_ENEMY_BULLETS = challenge ? 0 : 3 + wave / 3;
+        const int MAX_ENEMY_BULLETS = (challenge || !hostile) ? 0 : 3 + wave / 3;
         for (auto& e : enemies) {
             if (!e.alive || (e.state != "formation" && e.state != "diving")) continue;
             if ((int)p_bullets.size() >= MAX_ENEMY_BULLETS) break;
+            if (e.y > player_y - 120) continue;   // no point-blank shots from a diver
             float prob = e.shoot_prob() * (1 + wave * 0.05f);
             if (rnd01() < prob * dt * 60) {
                 auto [cx, cy] = e.center();
@@ -688,7 +763,7 @@ struct Formation {
                             [](const TractorBeam& tb) { return !tb.active; }), tractor_beams.end());
     }
 
-    void trigger_dive(int count) {
+    void trigger_dive(int count, float aim_x) {
         std::vector<int> candidates;
         for (int i = 0; i < (int)enemies.size(); ++i) {
             Enemy& e = enemies[i];
@@ -702,22 +777,39 @@ struct Formation {
             std::swap(candidates[k], candidates[j]);
             Enemy& e = enemies[candidates[k]];
             e.state = "diving";
-            e.dive_t = 0;
-            e.dive_speed = 220 + wave * 12;
-            e.dive_path = make_dive_path(e.x, e.y, W, H);
+            e.dive_speed = dive_speed();
+            e.set_path(make_dive_path(e.x, e.y, aim_x, W, H));
         }
     }
 
-    void trigger_tractor() {
-        if (!tractor_beams.empty()) return;
+    // Classic capture run: one boss leaves the formation, flies to a hover
+    // point above the player's current column and HOLDS there while its beam
+    // extends (the telegraph), sweeps the row, and retracts. Returns false if no
+    // boss was free to do it.
+    bool trigger_tractor(float player_cx) {
+        if (!tractor_beams.empty()) return false;
         std::vector<int> bosses;
         for (int i = 0; i < (int)enemies.size(); ++i) {
             Enemy& e = enemies[i];
-            if (e.alive && e.kind == Kind::Boss && e.state == "diving") bosses.push_back(i);
+            if (e.alive && e.state == "tractor") return false;
+            if (e.alive && e.kind == Kind::Boss && e.state == "formation" && !e.captured)
+                bosses.push_back(i);
         }
-        if (bosses.empty()) return;
-        int b = bosses[rnd_int(0, (int)bosses.size() - 1)];
-        tractor_beams.push_back(TractorBeam(&enemies[b]));
+        if (bosses.empty()) return false;
+        Enemy& e = enemies[bosses[rnd_int(0, (int)bosses.size() - 1)]];
+        float hx = std::clamp(player_cx - e.w / 2.0f, 40.0f, float(W - 40 - e.w));
+        float hy = player_y - 300.0f;
+        e.state = "tractor";
+        e.tractor_phase = 0;
+        e.dive_speed = dive_speed();
+        e.set_path(make_hover_path(e.x, e.y, hx, hy));
+        return true;
+    }
+
+    // Everything still alive breaks off and climbs away (bonus stage timed out).
+    void retreat() {
+        tractor_beams.clear();
+        for (auto& e : enemies) if (e.alive) { e.state = "leaving"; e.released = true; }
     }
 
     void draw(Surface& s) const {
@@ -749,7 +841,7 @@ struct MegaBoss {
     static constexpr float DEATH_DUR = 1.5f;
     // grand entrance: it descends from above in heavy steps, scattering minions
     bool entering = false, just_stomped = false;
-    float enter_delay = 0, stomp_t = 0, battle_y = 64, invuln_ = 0;
+    float enter_delay = 0, stomp_t = 0, battle_y = 84, invuln_ = 0;
 
     // ── attack system: HP phases, telegraphed pick, one-shot + sustained patterns ──
     int tier = 1, phase = 1, cur_attack = -1, pending_attack = -1, dive_phase = 0;
@@ -777,9 +869,9 @@ struct MegaBoss {
         w = d.w + loop * 24; h = d.h + loop * 12;
         max_hp = hp = int(d.hp * (1.0f + 0.5f * (tier - 1)));
         atk_iv = std::max(0.6f, d.atk_iv - loop * 0.1f);
-        x = (screen_w - w) / 2.0f; y = -float(h);
+        x = (screen_w - w) / 2.0f; y = -float(h) - 24.0f;  // glow + bob stay off-screen too
         vx = (70 + tier * 8) * (rnd01() < 0.5f ? 1 : -1);
-        entering = true; enter_delay = 2.6f; battle_y = 64;
+        entering = true; enter_delay = 2.6f; battle_y = 84;
     }
     Rect rect() const { return {int(x), int(y), w, h}; }
     float hp_ratio() const { return std::max(0.0f, float(hp) / max_hp); }
@@ -833,14 +925,12 @@ struct MegaBoss {
         return pool[rnd_int(0, (int)pool.size() - 1)];
     }
     void begin_attack(int a) {
-        cur_attack = a; attack_t = 0; sub_t = 99; dive_phase = 0; shock_done = false;
+        cur_attack = a; attack_t = 0; sub_t = 0; dive_phase = 0; shock_done = false;
         if (a == 1 || a == 7) mouth_open = 0.7f;
         if (a == 9) { beam_active = true; beam_len = 0; }
         if (a == 10) { mouth_open = 0.5f; dive_target_x = x; }
     }
-    void run_attack(float dt, float pcx, float pcy, int screen_w,
-                    std::vector<Bullet>& out, ParticleSystem& parts) {
-        (void)parts;
+    void run_attack(float dt, float pcx, float pcy, std::vector<Bullet>& out) {
         attack_t += dt; sub_t += dt;
         float bx = x + w / 2, by = y + h - 8;
         switch (cur_attack) {
@@ -868,26 +958,46 @@ struct MegaBoss {
                 }
                 cur_attack = -1; break;
             }
+            // Sustained patterns emit on a fixed cadence (`sub_t -= interval`) so the
+            // bullet density is the same at 60, 144 or 240 Hz.
             case 5:  // SPIRAL: rotating twin spray
-                if (sub_t >= 0.07f) { sub_t = 0; spin += 0.5f;
+                while (sub_t >= 0.07f) {
+                    sub_t -= 0.07f; spin += 0.5f;
                     out.push_back(bb(bx, by, spin, 200));
-                    out.push_back(bb(bx, by, spin + PI, 200)); }
-                if (attack_t >= 1.7f) cur_attack = -1; break;
+                    out.push_back(bb(bx, by, spin + PI, 200));
+                }
+                if (attack_t >= 1.7f) cur_attack = -1;
+                break;
             case 6:  // RAIN: bullets from random points across the boss
-                if (sub_t >= 0.09f) { sub_t = 0; out.push_back(bb(rnd_uniform(x, x + w), by, 0, 235)); }
-                if (attack_t >= 1.5f) cur_attack = -1; break;
+                while (sub_t >= 0.09f) {
+                    sub_t -= 0.09f;
+                    out.push_back(bb(rnd_uniform(x, x + w), by, 0, 235));
+                }
+                if (attack_t >= 1.5f) cur_attack = -1;
+                break;
             case 7:  // LASER: a sweeping beam of fast bullets
                 laser_angle = -0.7f + (attack_t / 1.7f) * 1.4f;
-                if (sub_t >= 0.025f) { sub_t = 0; out.push_back(bb(bx, by, laser_angle, 380)); }
-                if (attack_t >= 1.7f) cur_attack = -1; break;
-            case 9:  // GIANT TRACTOR BEAM: extend, hold (capture window), retract
-                if (attack_t < 1.1f) beam_len = std::min(float(beam_max), beam_len + 400 * dt);
-                else if (attack_t < 2.9f) beam_len = beam_max;            // hold
-                else { beam_len = std::max(0.0f, beam_len - 460 * dt);
-                       if (beam_len <= 0) { beam_active = false; cur_attack = -1; } }
+                while (sub_t >= 0.025f) {
+                    sub_t -= 0.025f;
+                    out.push_back(bb(bx, by, laser_angle, 380));
+                }
+                if (attack_t >= 1.7f) cur_attack = -1;
                 break;
+            case 9: {  // GIANT TRACTOR BEAM: extend, hold (capture window), retract
+                // Reach is measured to the player's row, whatever the boss's size.
+                beam_max = std::max(120, int(pcy + 10 - (y + h)));
+                float rate = beam_max / 1.0f;
+                if (attack_t < 1.1f) beam_len = std::min(float(beam_max), beam_len + rate * dt);
+                else if (attack_t < 2.9f) beam_len = float(beam_max);     // hold
+                else {
+                    beam_len = std::max(0.0f, beam_len - rate * 1.2f * dt);
+                    if (beam_len <= 0) { beam_active = false; cur_attack = -1; }
+                }
+                break;
+            }
             case 10: {  // DIVE-BOMB: wind up, plunge at the player, shockwave, return
-                float target = battle_y + 320;
+                // Plunge depth comes from the player's row, so the body lands on it.
+                float target = std::max(battle_y + 120.0f, pcy + 6.0f - h);
                 if (dive_phase == 0) {            // telegraph wind-up: lock onto the player's column
                     dive_target_x = pcx - w / 2;
                     if (attack_t >= 0.4f) dive_phase = 1;
@@ -896,9 +1006,11 @@ struct MegaBoss {
                     x += (dive_target_x - x) * std::min(1.0f, 6 * dt);
                     if (y >= target) { y = target; dive_phase = 2; }
                 } else if (dive_phase == 2) {     // impact shockwave fan
-                    if (!shock_done) { shock_done = true;
+                    if (!shock_done) {
+                        shock_done = true;
                         for (int i = 0; i < 14; ++i)
-                            out.push_back(bb(x + w / 2, y + h - 8, -1.5f + i * (3.0f / 13), 240)); }
+                            out.push_back(bb(x + w / 2, y + h - 8, -1.5f + i * (3.0f / 13), 240));
+                    }
                     dive_phase = 3;
                 } else {                          // climb back to the battle line
                     y -= 680 * dt;
@@ -931,7 +1043,7 @@ struct MegaBoss {
         if (dying) {
             die_t += dt;
             beam_active = false;
-            if (rnd01() < 0.6f) {  // confetti / chained blasts
+            if (!finished && rnd01() < 36.0f * dt) {  // confetti / chained blasts (dt-scaled)
                 float rx = x + rnd_uniform(0, w), ry = y + rnd_uniform(0, h);
                 parts.ufo_explode(rx, ry, 10);
             }
@@ -982,7 +1094,7 @@ struct MegaBoss {
             telegraph -= dt;
             if (telegraph <= 0) begin_attack(pending_attack);
         } else if (cur_attack >= 0) {        // a sustained / staged attack is running
-            run_attack(dt, player_cx, player_cy, screen_w, out, parts);
+            run_attack(dt, player_cx, player_cy, out);
         } else {                             // idle: pick the next attack after a beat
             atk_t += dt;
             if (atk_t >= iv) {
@@ -1026,7 +1138,8 @@ struct MegaBoss {
         if (y + h < 0) return;  // still fully above the screen
         draw_beam(s);
         float sc = dying ? std::max(0.0f, 1 - die_t / DEATH_DUR)
-                         : faking ? 0.6f : 1.0f;
+                         : faking ? (1.0f - 0.4f * std::sin(PI * std::min(1.0f, fake_t / 1.1f)))
+                                  : 1.0f;
         int bw = int(w * sc), bh = int(h * sc);
         int bx = int(x + (w - bw) / 2), by = int(y + (h - bh) / 2 + std::sin(bob * 2) * 4);
         if (bw < 4 || bh < 4) return;
@@ -1102,6 +1215,9 @@ struct MegaBoss {
 struct Flash { std::string text; float x, y, life, max_life; Color color; bool big; };
 
 // ── Game ──────────────────────────────────────────────────────────────────────
+// The world keeps simulating in every state except GameOver. Entering / Dead /
+// Captured / WaveClear only gate what the player and the enemies may do, so
+// nothing freezes in mid-air and drops stay collectable between stages.
 enum class St { Entering, Play, Dead, Captured, WaveClear, GameOver };
 
 class GalagaGame : public Scene {
@@ -1126,6 +1242,10 @@ private:
     static constexpr float AMBIENT_STAR_T = 0.12f;
     static constexpr float DIVE_INTERVAL_BASE = 4.0f, DIVE_INTERVAL_MIN = 1.2f;
     static constexpr float TRACTOR_INTERVAL = 18.0f;
+    static constexpr float CHALLENGE_TIME = 20.0f;
+    static constexpr float CAPTURE_LIFT = 1.3f, CAPTURE_TOTAL = 2.3f;
+    static constexpr int FORMATION_TOP = 80;
+    static constexpr int CAP_RAPID = 3, CAP_SPREAD = 2, CAP_SIDE = 2;
 
     PauseMenu pause_;
     InitialsEntry initials_;
@@ -1134,6 +1254,7 @@ private:
     int high_score_ = 0;
     float star_t_ = 0;
     float time_acc_ = 0;  // mirrors pygame.time.get_ticks()/1000
+    bool pad_ = false;    // a gamepad is connected → pad-flavoured prompts
 
     int score_, wave_;
     std::unique_ptr<Player> player_;
@@ -1143,10 +1264,14 @@ private:
     std::vector<PowerUp> powerups_;
     St state_;
     float dead_t_ = 0, wave_t_ = 0, dive_cd_ = 0, tractor_cd_ = 0, capture_t_ = 0;
-    bool beam_pending_active_ = false;
-    float beam_pending_t_ = 0;
-    bool rescue_pending_ = false;
-    bool boss_wave_ = false, boss_revealed_ = false;
+    float stage_t_ = 0, game_over_t_ = 0;
+    bool boss_wave_ = false, boss_revealed_ = false, nuke_hint_ = false, new_hi_ = false;
+    // capture in progress: who is hauling the ship up (null = the mega-boss),
+    // where the ship started, and whether it has docked under its captor yet
+    Enemy* captor_ = nullptr;
+    float cap_x0_ = 0, cap_y0_ = 0;
+    bool cap_docked_ = false;
+    bool tractor_snd_ = false;
     // ── bonus "challenge" stage ───────────────────────────────────────────────
     bool challenge_ = false;
     float challenge_t_ = 0;            // countdown until the bonus stage ends
@@ -1157,33 +1282,37 @@ private:
     bool submitted_ = false;
 
     // weapon progression (persists across the run)
-    int w_rapid_ = 0, w_spread_ = 0, w_side_ = 0, w_pierce_ = 0, nukes_ = 0;
-    int kills_since_drop_ = 0;
+    int w_rapid_ = 0, w_spread_ = 0, w_side_ = 0, nukes_ = 0;
+    int kills_since_drop_ = 0, volley_id_ = 0;
     float shield_ = 0, nuke_flash_ = 0;
-    float pierce_t_ = 0;   // PIERCE is now a timed buff (was a permanent stacking level)
+    float pierce_t_ = 0;   // PIERCE is a timed buff
     // Rescue reward: a brief twin-shot spread so capture-then-rescue pays off.
     float twin_boost_ = 0;
+    float deflect_fx_ = 0;      // shield / spawn-guard just ate a shot
+    float tink_cd_ = 0;         // rate-limits the "deflected" sound
 
     // bot + telemetry
     bool bot_ = false;
     float game_t_ = 0, wave_t0_ = 0;
     int wave_kills_ = 0, wave_shots_ = 0, wave_pu_ = 0, wave_deaths_ = 0, wave_nukes_ = 0;
-    int wave_captures_ = 0;
+    int wave_captures_ = 0, clear_kills_ = 0, clear_acc_ = 0;
 
     std::string loadout() const {
         return "r" + std::to_string(w_rapid_) + "s" + std::to_string(w_spread_) +
-               "w" + std::to_string(w_side_) + "p" + std::to_string(w_pierce_);
+               "w" + std::to_string(w_side_) + "p" + std::to_string(pierce_t_ > 0 ? 1 : 0);
     }
     void tele(const J& j) { if (ctx_.tele) ctx_.tele->event(j); }
-    int weapon_tier() const { return w_rapid_ + w_spread_ + w_side_ + w_pierce_; }
+    int weapon_tier() const { return w_rapid_ + w_spread_ + w_side_; }
 
     void new_game() {
         score_ = 0; wave_ = 0;
-        entry_started_ = false; submitted_ = false;
-        w_rapid_ = w_spread_ = w_side_ = w_pierce_ = nukes_ = 0;
-        kills_since_drop_ = 0;
-        shield_ = nuke_flash_ = 0;
+        entry_started_ = false; submitted_ = false; new_hi_ = false;
+        w_rapid_ = w_spread_ = w_side_ = nukes_ = 0;
+        kills_since_drop_ = 0; volley_id_ = 0;
+        nuke_hint_ = false;
+        shield_ = nuke_flash_ = pierce_t_ = deflect_fx_ = tink_cd_ = 0;
         twin_boost_ = 0;
+        game_over_t_ = 0;
         player_ = std::make_unique<Player>(ctx_.W / 2 - 14, ctx_.H - 70);
         particles_.clear();
         flash_.clear();
@@ -1192,9 +1321,11 @@ private:
         if (const char* e = std::getenv("VOID_WAVE")) start = std::max(1, atoi(e));
         if (const char* e = std::getenv("VOID_WEAPON")) {
             int t = atoi(e);
-            w_rapid_ = std::min(3, t); w_spread_ = std::min(2, t);
-            w_side_ = std::min(2, t); w_pierce_ = std::min(2, t); nukes_ = t;
+            w_rapid_ = std::min(CAP_RAPID, t); w_spread_ = std::min(CAP_SPREAD, t);
+            w_side_ = std::min(CAP_SIDE, t); nukes_ = t;
         }
+        if (const char* e = std::getenv("VOID_LIVES")) player_->lives = std::max(1, atoi(e));
+        if (ctx_.sfx && !ctx_.demo) ctx_.sfx->start_music(1);
         start_wave(start);
     }
     void start_wave(int w) {
@@ -1204,15 +1335,20 @@ private:
         // no-fire-back breather flying fancy patterns purely for points.
         challenge_ = !boss_wave_ && (w % 4 == 0);
         p_bullets_.clear(); boss_bullets_.clear(); powerups_.clear();
-        formation_ = std::make_unique<Formation>(ctx_.W, ctx_.H, wave_, challenge_);
+        captor_ = nullptr; cap_docked_ = false;
         boss_revealed_ = false;
         if (boss_wave_) {
-            // a small honor-guard formation enters... then the giant stomps in
+            // the giant stomps in up top; a short two-row honor guard flies
+            // beneath it instead of the full swarm hiding behind its body
             boss_ = std::make_unique<MegaBoss>(wave_, ctx_.W);
+            int guard_top = int(boss_->battle_y) + boss_->h + 28;
+            formation_ = std::make_unique<Formation>(ctx_.W, ctx_.H, wave_, false, true, guard_top);
         } else {
             boss_.reset();
+            formation_ = std::make_unique<Formation>(ctx_.W, ctx_.H, wave_, challenge_, false, FORMATION_TOP);
         }
-        challenge_t_ = 16.0f;
+        formation_->player_y = player_->y;
+        challenge_t_ = CHALLENGE_TIME;
         challenge_total_ = challenge_ ? (int)formation_->enemies.size() : 0;
         challenge_kills_ = 0;
         challenge_done_ = false;
@@ -1223,15 +1359,12 @@ private:
                                  + (boss_wave_ ? -0.12f : 0.0f)
                                  + (challenge_ ? 0.20f : 0.0f);
         state_ = St::Entering;
-        dead_t_ = wave_t_ = 0;
+        dead_t_ = wave_t_ = stage_t_ = 0;
         dive_cd_ = std::max(DIVE_INTERVAL_MIN, DIVE_INTERVAL_BASE - wave_ * 0.15f);
-        tractor_cd_ = TRACTOR_INTERVAL;
+        tractor_cd_ = TRACTOR_INTERVAL * 0.6f;   // first capture run comes a little sooner
         capture_t_ = 0;
-        beam_pending_active_ = false;
-        rescue_pending_ = false;
         wave_t0_ = game_t_;
         wave_kills_ = wave_shots_ = wave_pu_ = wave_deaths_ = wave_nukes_ = wave_captures_ = 0;
-        if (challenge_) add_flash("CHALLENGE STAGE!", ctx_.W / 2, ctx_.H / 2 - 60, ORANGE, 2.2f, true);
         tele(J().add("ev", "stage_start").add("stage", wave_).add("boss", boss_wave_ ? 1 : 0)
                 .add("challenge", challenge_ ? 1 : 0)
                 .add("t", (double)game_t_).add("load", loadout()).add("lives", player_->lives));
@@ -1246,10 +1379,18 @@ private:
         tele(J().add("ev", "game_over").add("stage", wave_).add("score", score_)
                 .add("t", (double)game_t_).add("load", loadout()));
         if (ctx_.scores) {
-            bool hi = ctx_.scores->submit_galaga(score_, wave_);
-            if (hi) add_flash("NEW HI-SCORE!", ctx_.W / 2, ctx_.H / 2 - 40, YELLOW, 2.5f);
+            new_hi_ = ctx_.scores->submit_galaga(score_, wave_);
             high_score_ = ctx_.scores->high_score("galaga");
         }
+    }
+    void enter_game_over() {
+        state_ = St::GameOver;
+        game_over_t_ = 0;
+        submit_scores();
+        tractor_snd_ = false;
+        clear_enemy_fire();
+        formation_->retreat();   // the swarm peels away, leaving the panel a clear sky
+        if (ctx_.sfx) { ctx_.sfx->stop_tractor(); ctx_.sfx->game_over(); }
     }
 
     Color tier_color() const {
@@ -1268,7 +1409,7 @@ private:
         if (r < 26) k = PU::Rapid; else if (r < 50) k = PU::Spread; else if (r < 68) k = PU::Side;
         else if (r < 80) k = PU::Pierce; else if (r < 89) k = PU::Shield;
         else if (r < 95) k = PU::Nuke; else if (r < 98) k = PU::Life; else k = PU::Mystery;
-        powerups_.push_back({x, y, 0, k});
+        powerups_.push_back({std::clamp(x, 20.0f, ctx_.W - 20.0f), std::max(40.0f, y), 0, k});
     }
     void maybe_drop(float x, float y, float base) {
         if (rnd01() < base * drop_penalty()) spawn_powerup(x, y);
@@ -1282,15 +1423,30 @@ private:
     }
     void apply_powerup(PU k) {
         if (k == PU::Mystery) k = rnd_choice<PU>({PU::Rapid, PU::Spread, PU::Side, PU::Pierce, PU::Nuke, PU::Shield});
-        const char* msg = "";
+        std::string msg;
+        // A weapon that is already maxed pays out in points instead of nothing.
+        auto level_up = [&](int& lvl, int cap, const char* name) {
+            if (lvl >= cap) { score_ += 500; msg = std::string(name) + " MAXED  +500"; }
+            else { ++lvl; msg = std::string(name) + (lvl >= cap ? " MAX!" : "!"); }
+        };
         switch (k) {
-            case PU::Rapid:  w_rapid_ = std::min(3, w_rapid_ + 1); msg = "RAPID FIRE!"; break;
-            case PU::Spread: w_spread_ = std::min(2, w_spread_ + 1); msg = "SPREAD SHOT!"; break;
-            case PU::Side:   w_side_ = std::min(2, w_side_ + 1); msg = "WING CANNONS!"; break;
+            case PU::Rapid:  level_up(w_rapid_, CAP_RAPID, "RAPID FIRE"); break;
+            case PU::Spread: level_up(w_spread_, CAP_SPREAD, "SPREAD SHOT"); break;
+            case PU::Side:   level_up(w_side_, CAP_SIDE, "WING CANNONS"); break;
             case PU::Pierce: pierce_t_ = std::min(12.0f, pierce_t_ + 8.0f); msg = "PIERCING ROUNDS!"; break;
             case PU::Shield: shield_ = 7.0f; msg = "SHIELD UP!"; break;
-            case PU::Life:   player_->lives++; msg = "EXTRA LIFE!"; break;
-            case PU::Nuke:   nukes_++; msg = "NUKE ACQUIRED!"; break;
+            case PU::Life:
+                player_->lives++; msg = "EXTRA LIFE!";
+                if (ctx_.sfx) ctx_.sfx->one_up();
+                break;
+            case PU::Nuke:
+                nukes_++; msg = "NUKE ACQUIRED!";
+                if (!nuke_hint_) {
+                    nuke_hint_ = true;
+                    add_flash(std::string("PRESS  ") + ui::nuke_key(pad_) + "  TO NUKE!",
+                              ctx_.W / 2, ctx_.H / 2 + 50, RED, 3.0f, true);
+                }
+                break;
             default: break;
         }
         auto [pcx, pcy] = player_->center();
@@ -1301,8 +1457,18 @@ private:
         if (ctx_.sfx) ctx_.sfx->powerup_collect();
         if (ctx_.fx) ctx_.fx->rumble_pickup();
     }
+    // A boss carrying a captured fighter was destroyed: the fighter comes home.
+    void rescue_fighter() {
+        player_->dual_fighter = true;
+        player_->x = std::min(player_->x, float(ctx_.W - player_->cur_w()));
+        twin_boost_ = 8.0f;   // reward: temporary twin-shot spread
+        add_flash("FIGHTER RESCUED!", ctx_.W / 2, ctx_.H / 2 + 60, CYAN, 2.0f);
+        add_flash("TWIN SPREAD!", ctx_.W / 2, ctx_.H / 2 + 84, ORANGE, 1.6f, true);
+        if (ctx_.sfx) ctx_.sfx->rescue();
+    }
     void detonate_nuke() {
-        if (nukes_ <= 0 || state_ != St::Play) return;
+        if (nukes_ <= 0 || !player_->alive || player_->captured) return;
+        if (state_ != St::Play && state_ != St::Entering) return;
         nukes_--;
         nuke_flash_ = 1.0f;
         boss_bullets_.clear();
@@ -1312,23 +1478,32 @@ private:
         if (formation_) {
             // Vaporises weak enemies; armored grunts are heavily chipped but
             // survive — a nuke softens an armored stage, it doesn't skip it.
+            // Only what is actually on screen is caught in the blast.
             for (auto& e : formation_->enemies) {
-                if (!e.alive) continue;
+                if (!e.alive || !e.released || e.state == "leaving") continue;
                 e.hp -= 3;
                 auto [cx, cy] = e.center();
                 if (e.hp <= 0) {
                     e.alive = false; wave_kills_++; score_ += e.score_value(true);
                     particles_.explode_invader(cx, cy, e.color());
+                    if (e.captured) rescue_fighter();
                 } else {
                     e.hit_flash = 1.0f;
                     particles_.explode_invader(cx, cy, e.color(), 8);
                 }
             }
         }
-        if (boss_) {
-            int dmg = std::max(25, boss_->max_hp / 5 + 20);
-            boss_->take_damage(dmg, particles_);
-            add_flash("DIRECT HIT!", boss_->x + boss_->w / 2, boss_->y + boss_->h / 2, YELLOW, 1.2f, true);
+        if (boss_ && !boss_->dying) {
+            float fx = boss_->x + boss_->w / 2;
+            float fy = std::max(110.0f, boss_->y + boss_->h / 2);
+            if (boss_->damageable()) {
+                int dmg = std::max(25, boss_->max_hp / 5 + 20);
+                boss_->take_damage(dmg, particles_);
+                add_flash("DIRECT HIT!", fx, fy, YELLOW, 1.2f, true);
+            } else {  // entrance / spawn-shield / fake-out: say so instead of lying
+                add_flash("BOSS IMMUNE!", fx, fy, ARMOR_COLOR, 1.2f, true);
+                if (ctx_.sfx) ctx_.sfx->armor_tink();
+            }
         }
         add_flash("* NUKE *", ctx_.W / 2, ctx_.H / 2 - 30, RED, 1.4f, true);
         if (ctx_.sfx) ctx_.sfx->big_explosion();
@@ -1338,38 +1513,95 @@ private:
             ctx_.fx->shockwave(0.5f, 0.5f);
         }
     }
+    // A shot bounced off the shield / spawn-guard / an immune boss.
+    void deflect(float x, float y, bool on_player) {
+        particles_.bunker_hit(x, y, 6);
+        if (on_player) deflect_fx_ = 0.25f;
+        if (tink_cd_ <= 0 && ctx_.sfx) {
+            tink_cd_ = 0.08f;
+            ctx_.sfx->pan_next(x / float(ctx_.W));
+            if (on_player) ctx_.sfx->shield_hit(); else ctx_.sfx->armor_tink();
+        }
+    }
+    void clear_enemy_fire() {  // pop every hostile shot with a small spark
+        auto pop = [&](std::vector<Bullet>& bs) {
+            for (auto& b : bs) if (b.alive) particles_.bunker_hit(b.x, b.y, 3);
+            bs.clear();
+        };
+        if (formation_) pop(formation_->p_bullets);
+        pop(boss_bullets_);
+    }
+    bool vulnerable() const {
+        return player_->alive && !player_->captured && player_->invincible <= 0 && shield_ <= 0;
+    }
+    void begin_capture(Enemy* captor) {
+        player_->captured = true;
+        state_ = St::Captured;
+        capture_t_ = 0;
+        captor_ = captor;
+        cap_x0_ = player_->x; cap_y0_ = player_->y;
+        cap_docked_ = false;
+        wave_captures_++;
+        add_flash("FIGHTER CAPTURED!", ctx_.W / 2, ctx_.H - 130, Color(200, 120, 255), 2.2f, true);
+        if (ctx_.sfx) ctx_.sfx->capture();
+        if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->rumble(0.5f, 0.5f, 500); }
+    }
+    // Where the hauled-up ship is right now (top-left), and how far along (0..1).
+    Pt capture_pos(float& u) const {
+        u = std::clamp(capture_t_ / CAPTURE_LIFT, 0.0f, 1.0f);
+        float e = u * u * (3 - 2 * u);
+        float tx = cap_x0_, ty = cap_y0_ - 200;
+        if (captor_) {
+            tx = captor_->x + captor_->w / 2.0f - player_->w / 2.0f;
+            ty = captor_->y + captor_->h + 4;
+        } else if (boss_) {
+            tx = boss_->x + boss_->w / 2.0f - player_->w / 2.0f;
+            ty = boss_->y + boss_->h * 0.7f;
+        }
+        float wob = std::sin(capture_t_ * 22) * 5 * (1 - e);
+        return {cap_x0_ + (tx - cap_x0_) * e + wob, cap_y0_ + (ty - cap_y0_) * e};
+    }
 
-    void handle_keys(float dt, const Input& in, bool& want_nuke);
     void fire();
     void update_player_bullets(float dt);
     void check_player_bullet_hits();
-    void check_enemy_bullet_hits();
-    void check_tractor_beam();
+    bool check_enemy_bullet_hits();
+    bool check_tractor_beam();
+    bool check_collisions();
     void update_boss(float dt);
     void update_powerups(float dt);
-    void update_entering(float dt, const Input& in);
-    void update_play(float dt, const Input& in);
-    void update_captured(float dt);
+    void step_world(float dt, const Input& in);
+    void update_captured(float dt, const Input& in);
     void hit_player();
     void bot_decide(float& move_dir, bool& want_fire, bool& want_nuke);
     void draw_hud(Surface& s);
     void draw_flash(Surface& s);
+    void draw_banner(Surface& s);
 };
 
 // ── firing (weapon-stacking) ──────────────────────────────────────────────────
 void GalagaGame::fire() {
     float delay = std::max(0.10f, 0.20f * (1.0f - 0.09f * w_rapid_));
     if (player_->fire_cd > 0 || !player_->alive || player_->captured) return;
-    if ((int)p_bullets_.size() >= Player::MAX_BULLETS) return;
+    // Cap by VOLLEYS still in flight (each trigger-pull is one, however many
+    // bolts it throws), so extra barrels never slow the gun down.
+    int volleys = 0, last = -1;
+    for (auto& b : p_bullets_)
+        if (b.alive && b.volley != last) { ++volleys; last = b.volley; }
+    if (volleys >= Player::MAX_VOLLEYS) return;
     player_->fire_cd = delay;
+    ++volley_id_;
     float px = player_->x + player_->cur_w() / 2.0f, py = player_->y;
     Color col = tier_color();
     int dmg = 1 + weapon_tier() / 4;
+    int bolts = 0;
     auto add = [&](float x, float vx) {
         Bullet b; b.x = x; b.y = py; b.vx = vx; b.vy = -520;
         b.color = col; b.pierce = pierce_t_ > 0 ? 2 : 0; b.damage = dmg;
         b.w = 3 + std::min(3, weapon_tier() / 2);
+        b.volley = volley_id_;
         p_bullets_.push_back(b);
+        ++bolts;
     };
     add(px, 0);
     // dual fighter keeps its twin barrels
@@ -1379,40 +1611,17 @@ void GalagaGame::fire() {
     }
     for (int i = 1; i <= w_side_; ++i) { add(px - i * 11, 0); add(px + i * 11, 0); }
     for (int i = 1; i <= w_spread_; ++i) { add(px, -62.0f * i); add(px, 62.0f * i); }
-    // Rescue twin-spread: two extra angled bolts fanning outward (if room).
-    if (twin_boost_ > 0 && (int)p_bullets_.size() + 2 <= Player::MAX_BULLETS) {
-        add(px, -150.0f); add(px, 150.0f);
-        wave_shots_ += 2;
-    }
-    wave_shots_ += 1 + 2 * w_side_ + 2 * w_spread_;
+    // Rescue twin-spread: two extra angled bolts fanning outward.
+    if (twin_boost_ > 0) { add(px, -150.0f); add(px, 150.0f); }
+    wave_shots_ += bolts;
     if (ctx_.sfx) ctx_.sfx->shoot();
 }
 
-void GalagaGame::handle_keys(float dt, const Input& in, bool& want_nuke) {
-    float move_dir = 0; bool want_fire = false;
-    if (bot_) {
-        bot_decide(move_dir, want_fire, want_nuke);
-        // emulate held-movement for the bot
-        if (player_->alive && !player_->captured) {
-            player_->x += move_dir * Player::SPEED * dt;
-            player_->x = std::max(0.0f, std::min(float(ctx_.W - player_->cur_w()), player_->x));
-            if (player_->invincible > 0) player_->invincible -= dt;
-            if (player_->fire_cd > 0) player_->fire_cd -= dt;
-        }
-        if (want_fire) fire();
-        return;
-    }
-    player_->update(dt, in, ctx_.W);
-    for (auto k : in.pressed) {
-        if (k == SDLK_b) want_nuke = true;
-    }
-    if (in.down(SDLK_SPACE) || in.down(SDLK_UP) || in.down(SDLK_w)) fire();
-}
-
 void GalagaGame::update_player_bullets(float dt) {
+    const float trail_p = 30.0f * dt;  // ≈ every other frame at 60 Hz, at any refresh rate
     for (auto& b : p_bullets_) {
         b.update(dt, ctx_.W, ctx_.H);
-        if (rnd01() < 0.5f) { auto [tx, ty] = b.tip(); particles_.bullet_trail(tx, ty, b.color, true); }
+        if (rnd01() < trail_p) { auto [tx, ty] = b.tip(); particles_.bullet_trail(tx, ty, b.color, true); }
     }
     p_bullets_.erase(std::remove_if(p_bullets_.begin(), p_bullets_.end(),
                      [](const Bullet& b) { return !b.alive; }), p_bullets_.end());
@@ -1422,7 +1631,7 @@ void GalagaGame::check_player_bullet_hits() {
     for (auto& b : p_bullets_) {
         if (!b.alive) continue;
         for (auto& e : formation_->enemies) {
-            if (!e.alive || !overlap(b.rect(), e.rect())) continue;
+            if (!e.alive || !e.released || e.state == "leaving" || !overlap(b.rect(), e.rect())) continue;
             e.hp -= b.damage; e.hit_flash = 1.0f;
             bool destroyed = e.hp <= 0;
             auto [cx, cy] = e.center();
@@ -1430,17 +1639,20 @@ void GalagaGame::check_player_bullet_hits() {
                 e.alive = false;
                 wave_kills_++;
                 int pts = e.score_value(formation_->in_formation(e));
-                if (e.captured) { pts *= 2; rescue_pending_ = true; }
+                // A boss shot down while it still holds a fighter frees it. (If the
+                // capture is still in progress the player simply breaks free instead.)
+                bool rescue = e.captured && state_ != St::Captured;
+                if (rescue) pts *= 2;
                 // COMBO: chained skill kills multiply points (capture bonus included).
                 int mult = ctx_.combo ? ctx_.combo->hit() : 1;
                 pts *= mult;
                 score_ += pts;
-                high_score_ = std::max(high_score_, score_);
                 particles_.explode_invader(cx, cy, e.color(), 22);
                 Color fc = mult >= 4 ? ORANGE : YELLOW;
                 add_flash("+" + std::to_string(pts), cx, cy - 20, fc);
                 roll_enemy_drop(cx, cy);
                 if (ctx_.sfx) {
+                    ctx_.sfx->pan_next(cx / float(ctx_.W));
                     if (e.kind == Kind::Boss) ctx_.sfx->boss_explosion();
                     else ctx_.sfx->invader_hit();
                 }
@@ -1448,17 +1660,13 @@ void GalagaGame::check_player_bullet_hits() {
                     if (e.kind == Kind::Boss) { ctx_.fx->shake(11); ctx_.fx->hitstop(0.06f); ctx_.fx->rumble(0.6f, 0.7f, 220); }
                     else { ctx_.fx->shake(4); ctx_.fx->rumble(0.25f, 0.4f, 90); }
                 }
-                if (rescue_pending_) {
-                    player_->dual_fighter = true;
-                    rescue_pending_ = false;
-                    twin_boost_ = 8.0f;   // reward: temporary twin-shot spread
-                    add_flash("FIGHTER RESCUED!", ctx_.W / 2, ctx_.H / 2 - 30, CYAN, 2.0f);
-                    add_flash("TWIN SPREAD!", ctx_.W / 2, ctx_.H / 2, ORANGE, 1.6f, true);
-                    if (ctx_.sfx) ctx_.sfx->rescue();
-                }
+                if (rescue) rescue_fighter();
             } else {
-                particles_.explode_invader(cx, cy, e.color(), 8);
-                if (ctx_.sfx) ctx_.sfx->invader_hit();
+                particles_.bunker_hit(float(cx), float(cy), 7);
+                if (ctx_.sfx) {
+                    ctx_.sfx->pan_next(cx / float(ctx_.W));
+                    if (e.kind == Kind::Armor) ctx_.sfx->armor_tink(); else ctx_.sfx->invader_hit();
+                }
             }
             // Pierce only carries through enemies it KILLS outright — armored
             // grunts that merely get chipped stop the bolt cold.
@@ -1466,57 +1674,80 @@ void GalagaGame::check_player_bullet_hits() {
             break;
         }
         // bolts can hit the mega-boss (no pierce-through)
-        if (b.alive && boss_ && boss_->damageable() && overlap(b.rect(), boss_->rect())) {
-            boss_->take_damage(b.damage, particles_);
-            score_ += 5 * b.damage;
+        if (b.alive && boss_ && !boss_->dying && overlap(b.rect(), boss_->rect())) {
             auto [tx, ty] = b.tip();
-            particles_.explode_invader(tx, ty, boss_->color, 6);
-            if (ctx_.sfx) ctx_.sfx->invader_hit();
-            if (ctx_.fx) ctx_.fx->shake(2);
+            if (boss_->damageable()) {
+                boss_->take_damage(b.damage, particles_);
+                score_ += 5 * b.damage;
+                particles_.explode_invader(tx, ty, boss_->color, 6);
+                if (ctx_.sfx) ctx_.sfx->invader_hit();
+                if (ctx_.fx) ctx_.fx->shake(2);
+            } else {  // entrance / spawn-shield / fake-out: the bolt visibly bounces
+                deflect(float(tx), float(ty), false);
+            }
             b.alive = false;
         }
     }
 }
 
-void GalagaGame::check_enemy_bullet_hits() {
-    if (!player_->alive || player_->captured || player_->invincible > 0 || shield_ > 0) return;
+// Returns true if the player was hit (state changed).
+bool GalagaGame::check_enemy_bullet_hits() {
+    if (!player_->alive || player_->captured) return false;
+    const bool safe = player_->invincible > 0 || shield_ > 0;
     auto process = [&](std::vector<Bullet>& bs) -> bool {
         for (auto& b : bs) {
-            if (!b.alive) continue;
-            if (overlap(b.rect(), player_->rect())) {
-                b.alive = false; hit_player(); return true;
-            }
+            if (!b.alive || !overlap(b.rect(), player_->rect())) continue;
+            b.alive = false;
+            if (safe) { deflect(b.x, b.y, true); continue; }  // shield / spawn-guard eats it
+            hit_player();
+            return true;
         }
         return false;
     };
-    if (process(formation_->p_bullets)) return;
-    process(boss_bullets_);
+    return process(formation_->p_bullets) || process(boss_bullets_);
 }
 
-void GalagaGame::check_tractor_beam() {
-    if (player_->captured || !player_->alive) return;
+// Returns true if the player was captured (state changed).
+bool GalagaGame::check_tractor_beam() {
+    if (player_->captured || !player_->alive || player_->invincible > 0) return false;
     // small-boss formation tractor beams (classic capture)
     for (auto& tb : formation_->tractor_beams) {
-        if (tb.phase == "hold" && overlap(tb.capture_rect(), player_->rect())) {
-            player_->captured = true;
-            state_ = St::Captured;
-            capture_t_ = 0;
-            wave_captures_++;
-            if (tb.boss->alive) tb.boss->captured = true;
-            if (ctx_.sfx) { ctx_.sfx->stop_tractor(); ctx_.sfx->capture(); }
-            if (ctx_.fx) { ctx_.fx->shake(8); ctx_.fx->rumble(0.5f, 0.5f, 500); }
-            return;
+        if (tb.phase == "hold" && tb.boss->alive && overlap(tb.capture_rect(), player_->rect())) {
+            tb.phase = "retract";   // it has what it came for
+            begin_capture(tb.boss);
+            return true;
         }
     }
     // mega-boss giant tractor beam (galaga-flavored boss attack)
     if (boss_ && boss_->beam_holding() && overlap(boss_->beam_capture_rect(), player_->rect())) {
-        player_->captured = true;
-        state_ = St::Captured;
-        capture_t_ = 0;
-        wave_captures_++;
-        if (ctx_.sfx) { ctx_.sfx->stop_tractor(); ctx_.sfx->capture(); }
-        if (ctx_.fx) { ctx_.fx->shake(10); ctx_.fx->rumble(0.6f, 0.6f, 500); }
+        begin_capture(nullptr);
+        return true;
     }
+    return false;
+}
+
+// Body contact: the dive-bombing mega-boss and diving enemies. True if hit.
+bool GalagaGame::check_collisions() {
+    if (!vulnerable()) return false;
+    // DIVE-BOMB body contact: the plunging boss flattens an unshielded fighter.
+    if (boss_ && boss_->cur_attack == 10 && boss_->dive_phase >= 1 &&
+        overlap(player_->rect(), boss_->rect())) {
+        hit_player();
+        return true;
+    }
+    // A DIVING enemy that flies INTO you crashes your fighter. Bonus stages are
+    // exempt: there the swarm is pure target practice.
+    if (challenge_) return false;
+    for (auto& e : formation_->enemies) {
+        if (!e.alive || e.state != "diving") continue;
+        if (!overlap(player_->rect(), e.rect())) continue;
+        e.alive = false;
+        auto [cx, cy] = e.center();
+        particles_.explode_invader(cx, cy, e.color(), 18);
+        hit_player();
+        return true;
+    }
+    return false;
 }
 
 void GalagaGame::update_boss(float dt) {
@@ -1533,12 +1764,12 @@ void GalagaGame::update_boss(float dt) {
         boss_->just_stomped = false;
         if (!boss_revealed_) {  // the surprise reveal mid-stage
             boss_revealed_ = true;
-            add_flash("!! " + boss_->name + " !!", ctx_.W / 2, 132, RED, 1.8f, true);
-            if (ctx_.sfx) ctx_.sfx->player_death();
+            add_flash("!! " + boss_->name + " !!", ctx_.W / 2, ctx_.H / 2 + 60, RED, 1.8f, true);
+            if (ctx_.sfx) ctx_.sfx->boss_alarm();
         }
         if (formation_)  // crush any honor-guard unlucky enough to be underfoot
             for (auto& e : formation_->enemies)
-                if (e.alive && overlap(e.rect(), boss_->rect())) {
+                if (e.alive && e.released && overlap(e.rect(), boss_->rect())) {
                     e.alive = false;
                     auto [cx, cy] = e.center();
                     particles_.explode_invader(cx, cy, e.color(), 12);
@@ -1546,32 +1777,23 @@ void GalagaGame::update_boss(float dt) {
                 }
         for (int i = 0; i < 6; ++i)
             particles_.bunker_hit(boss_->x + rnd_uniform(0, boss_->w), boss_->y + boss_->h);
-        if (ctx_.fx) ctx_.fx->shake(15);
+        if (ctx_.fx) { ctx_.fx->shake(15); ctx_.fx->rumble_boss_step(); }
         if (ctx_.sfx) ctx_.sfx->bunker_hit();
     }
     if (boss_->fake_started) {
         boss_->fake_started = false;
-        add_flash("...JUST KIDDING!", boss_->x + boss_->w / 2, boss_->y - 10, YELLOW, 1.6f, true);
+        add_flash("...JUST KIDDING!", boss_->x + boss_->w / 2, boss_->y + boss_->h + 8, YELLOW, 1.6f, true);
     }
     if (boss_->split_started) {  // the SHED-THE-SWARM surprise barrage
         boss_->split_started = false;
-        add_flash("IT SHEDS THE SWARM!", ctx_.W / 2, ctx_.H / 2 - 30, RED, 1.8f, true);
+        add_flash("IT SHEDS THE SWARM!", ctx_.W / 2, ctx_.H / 2 + 60, RED, 1.8f, true);
         if (ctx_.sfx) { ctx_.sfx->boss_explosion(); ctx_.sfx->dive_warble(); }
         if (ctx_.fx) { ctx_.fx->shake(18); ctx_.fx->hitstop(0.05f); ctx_.fx->rumble(0.8f, 0.8f, 260); }
     }
     if (boss_->spawn_minions) {  // boss summons a wave of dive-minions
         boss_->spawn_minions = false;
-        if (formation_) formation_->trigger_dive(2 + wave_ / 5);
+        if (formation_) formation_->trigger_dive(2 + wave_ / 5, float(pcx));
         if (ctx_.sfx) ctx_.sfx->dive_warble();
-    }
-    for (auto& b : boss_bullets_) b.update(dt, ctx_.W, ctx_.H);
-    boss_bullets_.erase(std::remove_if(boss_bullets_.begin(), boss_bullets_.end(),
-                        [](const Bullet& b) { return !b.alive; }), boss_bullets_.end());
-
-    // boss tractor sfx
-    if (ctx_.sfx) {
-        if (boss_->beam_active && boss_->beam_len > 8) ctx_.sfx->start_tractor();
-        else if (formation_ && formation_->tractor_beams.empty()) ctx_.sfx->stop_tractor();
     }
 }
 
@@ -1589,10 +1811,22 @@ void GalagaGame::update_powerups(float dt) {
 
 void GalagaGame::hit_player() {
     auto [cx, cy] = player_->center();
+    // A dual fighter takes the hit on its wingman: lose the second ship, keep
+    // the life and the arsenal, and get a moment of grace.
+    if (player_->dual_fighter) {
+        particles_.explode_player(player_->x + player_->w + 8 + player_->w / 2.0f, cy, 30);
+        player_->dual_fighter = false;
+        player_->invincible = 1.5f;
+        twin_boost_ = 0;
+        add_flash("WINGMAN LOST!", cx, cy - 44, RED, 1.6f, true);
+        if (ctx_.sfx) ctx_.sfx->player_death();
+        if (ctx_.fx) { ctx_.fx->shake(12); ctx_.fx->hitstop(0.06f); ctx_.fx->rumble_hit(); }
+        return;
+    }
     particles_.explode_player(cx, cy);
     // Death costs you your arsenal — start the weapon climb over (nukes survive).
-    bool had_weapons = w_rapid_ || w_spread_ || w_side_ || w_pierce_;
-    w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0; pierce_t_ = 0;
+    bool had_weapons = w_rapid_ || w_spread_ || w_side_ || pierce_t_ > 0;
+    w_rapid_ = w_spread_ = w_side_ = 0; pierce_t_ = 0;
     shield_ = 0;
     twin_boost_ = 0;
     if (had_weapons) add_flash("WEAPONS LOST!", cx, cy - 44, RED, 1.8f, true);
@@ -1602,112 +1836,107 @@ void GalagaGame::hit_player() {
     wave_deaths_++;
     tele(J().add("ev", "death").add("stage", wave_).add("t", (double)game_t_)
             .add("load", loadout()).add("lives_left", player_->lives));
-    if (ctx_.sfx) { ctx_.sfx->stop_tractor(); ctx_.sfx->player_death(); }
+    if (ctx_.sfx) ctx_.sfx->player_death();
     if (ctx_.fx) { ctx_.fx->shake(16); ctx_.fx->hitstop(0.09f); ctx_.fx->rumble_death(); }
 }
 
-void GalagaGame::update_entering(float dt, const Input& in) {
-    bool want_nuke = false;
-    handle_keys(dt, in, want_nuke);
-    if (shield_ > 0) shield_ -= dt;
-    if (pierce_t_ > 0) pierce_t_ -= dt;
-    if (twin_boost_ > 0) twin_boost_ -= dt;
-    formation_->update(dt, ctx_.H, ctx_.W);
-    if (ctx_.sfx && formation_->anim_ticked) ctx_.sfx->march_tick();
-    if (boss_) update_boss(dt);
+// One step of the whole world, called in every state but GameOver:
+//   Entering  — squads fly in; the ship fights normally (nuke included)
+//   Play      — everything, plus dive / tractor timers and stage-clear checks
+//   Dead      — enemies keep flying but hold fire; shots and drops keep moving
+//   Captured  — same, while the ship is hauled up the beam
+//   WaveClear — no hostiles; the ship mops up falling drops
+void GalagaGame::step_world(float dt, const Input& in) {
+    const bool live = state_ == St::Entering || state_ == St::Play;
+    const bool can_act = player_->alive && !player_->captured &&
+                         (live || state_ == St::WaveClear);
+    float move_dir = 0; bool want_fire = false, want_nuke = false;
+    if (can_act) {
+        if (bot_) {
+            bot_decide(move_dir, want_fire, want_nuke);
+        } else {
+            move_dir = float(in.down(SDLK_RIGHT) || in.down(SDLK_d)) -
+                       float(in.down(SDLK_LEFT) || in.down(SDLK_a));
+            want_fire = in.down(SDLK_SPACE) || in.down(SDLK_UP) || in.down(SDLK_w);
+            want_nuke = in.just(SDLK_b);
+        }
+    }
+    if (want_nuke) detonate_nuke();
+    if (live) {  // timed buffs only burn while the fight is actually on
+        if (shield_ > 0) shield_ -= dt;
+        if (pierce_t_ > 0) pierce_t_ -= dt;
+        if (twin_boost_ > 0) twin_boost_ -= dt;
+    }
+    if (deflect_fx_ > 0) deflect_fx_ -= dt;
+    if (tink_cd_ > 0) tink_cd_ -= dt;
+    player_->update(dt, move_dir, ctx_.W);
+    if (want_fire) fire();
+
+    formation_->player_y = player_->y;
+    formation_->update(dt, ctx_.H, ctx_.W, live);
+    if (ctx_.sfx && live && formation_->anim_ticked) ctx_.sfx->march_tick();
+    update_boss(dt);
+    for (auto& b : boss_bullets_) b.update(dt, ctx_.W, ctx_.H);
     update_player_bullets(dt);
     check_player_bullet_hits();
-    check_enemy_bullet_hits();
-    update_powerups(dt);
-    // a boss stage stays in "entering" until the honor guard is in; the boss
-    // reveals itself once the formation settles.
-    if (formation_->all_in_formation()) state_ = St::Play;
-}
 
-void GalagaGame::update_play(float dt, const Input& in) {
-    bool want_nuke = false;
-    handle_keys(dt, in, want_nuke);
-    if (want_nuke) detonate_nuke();
-    if (shield_ > 0) shield_ -= dt;
-    if (pierce_t_ > 0) pierce_t_ -= dt;
-    if (twin_boost_ > 0) twin_boost_ -= dt;
-
-    if (!player_->alive) { return; }
-
-    formation_->update(dt, ctx_.H, ctx_.W);
-    if (ctx_.sfx && formation_->anim_ticked) ctx_.sfx->march_tick();
-    if (boss_) update_boss(dt);
-    update_player_bullets(dt);
-
-    // dive timer — more divers, more often, each stage. On a challenge stage the
-    // whole swarm peels off in rapid fancy dives, since it's all about the show.
-    dive_cd_ -= dt;
-    if (dive_cd_ <= 0) {
-        int count = challenge_ ? 4 + (wave_ / 4) : 1 + (wave_ / 3);
-        formation_->trigger_dive(count);
-        dive_cd_ = challenge_ ? 0.8f
-                              : std::max(DIVE_INTERVAL_MIN, DIVE_INTERVAL_BASE - wave_ * 0.12f);
-        if (ctx_.sfx) ctx_.sfx->dive_warble();
-    }
-
-    // tractor beam timer (non-boss, non-challenge stages — classic capture intact)
-    if (!boss_ && !challenge_) {
-        tractor_cd_ -= dt;
-        if (tractor_cd_ <= 0 && !player_->captured && !player_->dual_fighter) {
-            formation_->trigger_dive(1);
-            tractor_cd_ = TRACTOR_INTERVAL + rnd_uniform(-3, 3);
-            beam_pending_active_ = true;
-            beam_pending_t_ = 1.8f;
+    if (state_ == St::Play) {
+        float pcx = player_->x + player_->cur_w() / 2.0f;
+        // dive timer — more divers, more often, each stage. On a challenge stage the
+        // whole swarm peels off in rapid fancy dives, since it's all about the show.
+        dive_cd_ -= dt;
+        if (dive_cd_ <= 0) {
+            int count = challenge_ ? 4 + (wave_ / 4) : 1 + (wave_ / 3);
+            formation_->trigger_dive(count, pcx);
+            dive_cd_ = challenge_ ? 0.8f
+                                  : std::max(DIVE_INTERVAL_MIN, DIVE_INTERVAL_BASE - wave_ * 0.12f);
+            if (ctx_.sfx) ctx_.sfx->dive_warble();
         }
-        if (beam_pending_active_) {
-            beam_pending_t_ -= dt;
-            if (beam_pending_t_ <= 0) {
-                formation_->trigger_tractor();
-                beam_pending_active_ = false;
+        // tractor run (non-boss, non-challenge stages): a boss flies down to hover
+        // over the player's column and opens its beam.
+        if (!boss_ && !challenge_ && !player_->dual_fighter) {
+            tractor_cd_ -= dt;
+            if (tractor_cd_ <= 0) {
+                bool carrying = false;  // one captured fighter at a time
+                for (auto& e : formation_->enemies) if (e.alive && e.captured) carrying = true;
+                if (!carrying && formation_->trigger_tractor(pcx)) {
+                    tractor_cd_ = TRACTOR_INTERVAL + rnd_uniform(-3, 3);
+                    if (ctx_.sfx) ctx_.sfx->dive_warble();
+                } else {
+                    tractor_cd_ = 3.0f;  // nobody free right now: try again shortly
+                }
             }
         }
     }
+    if (state_ == St::Entering && formation_->entry_done()) state_ = St::Play;
 
-    check_player_bullet_hits();
-    check_enemy_bullet_hits();
-    check_tractor_beam();
-    // DIVE-BOMB body contact: the plunging boss flattens an unshielded fighter.
-    if (boss_ && boss_->cur_attack == 10 && boss_->dive_phase >= 1 &&
-        player_->alive && !player_->captured && player_->invincible <= 0 && shield_ <= 0 &&
-        overlap(player_->rect(), boss_->rect())) {
-        hit_player();
-        return;
+    if (live) {
+        // each of these may end the player's turn (Dead / Captured)
+        if (!check_enemy_bullet_hits() && !check_tractor_beam()) check_collisions();
     }
-    // A DIVING enemy that flies INTO you crashes your fighter (it used to pass
-    // through harmlessly). Only enemies out of formation, and never through the
-    // spawn-shield / power shield.
-    if (formation_ && player_->alive && !player_->captured &&
-        player_->invincible <= 0 && shield_ <= 0) {
-        for (auto& e : formation_->enemies) {
-            if (!e.alive || e.state == "formation" || e.state == "entering") continue;
-            if (!overlap(player_->rect(), e.rect())) continue;
-            e.alive = false;
-            auto [cx, cy] = e.center();
-            particles_.explode_invader(cx, cy, e.color(), 18);
-            hit_player();
-            return;
-        }
-    }
+    boss_bullets_.erase(std::remove_if(boss_bullets_.begin(), boss_bullets_.end(),
+                        [](const Bullet& b) { return !b.alive; }), boss_bullets_.end());
     update_powerups(dt);
 
-    if (ctx_.sfx && !boss_) {
-        if (!formation_->tractor_beams.empty()) ctx_.sfx->start_tractor();
-        else ctx_.sfx->stop_tractor();
+    // tractor loop follows whatever beam is out. start_tractor() is a no-op
+    // while it is already playing, so this also restores it after a pause.
+    if (ctx_.sfx) {
+        bool beam = !formation_->tractor_beams.empty() ||
+                    (boss_ && boss_->beam_active && boss_->beam_len > 8);
+        if (beam) ctx_.sfx->start_tractor();
+        else if (tractor_snd_) ctx_.sfx->stop_tractor();
+        tractor_snd_ = beam;
     }
 
-    // ── boss finished its death throes → win (rains power-ups) ──
+    // ── boss finished its death throes (rains power-ups, the guard goes with it) ──
     if (boss_ && boss_->finished) {
         score_ += 500 * (wave_ / 5);
-        auto rainx = boss_->x + boss_->w / 2;
-        powerups_.push_back({rainx, boss_->y + 40, 0, PU::Nuke});
-        powerups_.push_back({rainx - 50, boss_->y + 40, 0, PU::Side});
-        powerups_.push_back({rainx + 50, boss_->y + 40, 0, PU::Spread});
-        add_flash(boss_->name + " GOES SPLAT!", ctx_.W / 2, ctx_.H / 2 - 20, YELLOW, 2.2f, true);
+        float rainx = std::clamp(boss_->x + boss_->w / 2, 80.0f, ctx_.W - 80.0f);
+        float rainy = std::max(60.0f, boss_->y + 40);
+        powerups_.push_back({rainx, rainy, 0, PU::Nuke});
+        powerups_.push_back({rainx - 50, rainy, 0, PU::Side});
+        powerups_.push_back({rainx + 50, rainy, 0, PU::Spread});
+        add_flash(boss_->name + " GOES SPLAT!", ctx_.W / 2, ctx_.H / 2 + 60, YELLOW, 2.2f, true);
         if (ctx_.sfx) ctx_.sfx->big_explosion();
         if (ctx_.fx) {
             ctx_.fx->shake(30); ctx_.fx->hitstop(0.10f);
@@ -1718,8 +1947,29 @@ void GalagaGame::update_play(float dt, const Input& in) {
         tele(J().add("ev", "boss_clear").add("stage", wave_).add("dt", (double)(game_t_ - wave_t0_))
                 .add("name", boss_->name).add("load", loadout()).add("lives", player_->lives));
         boss_.reset();
-        if (ctx_.sfx) ctx_.sfx->stop_tractor();
+        // The honor guard doesn't outlive its boss: every straggler pops with it.
+        for (auto& e : formation_->enemies)
+            if (e.alive) {
+                e.alive = false;
+                if (!e.released) continue;
+                auto [cx, cy] = e.center();
+                particles_.explode_invader(cx, cy, e.color(), 14);
+                score_ += e.score_value(true);
+            }
+        formation_->tractor_beams.clear();
+        clear_enemy_fire();
     }
+
+    if (state_ != St::Play) return;
+
+    auto finish_stage = [&]() {
+        clear_kills_ = wave_kills_;
+        clear_acc_ = wave_shots_ > 0 ? std::min(100, wave_kills_ * 100 / wave_shots_) : 0;
+        clear_enemy_fire();
+        state_ = St::WaveClear;
+        wave_t_ = 2.4f;
+        if (ctx_.sfx) ctx_.sfx->level_clear();
+    };
 
     // ── challenge (bonus) stage: ends on a timer or when the swarm is cleared ──
     if (challenge_ && !challenge_done_) {
@@ -1732,117 +1982,155 @@ void GalagaGame::update_play(float dt, const Input& in) {
             score_ += hit_bonus;
             bool perfect = challenge_total_ > 0 && challenge_kills_ >= challenge_total_;
             add_flash(std::to_string(challenge_kills_) + " HIT  +" + std::to_string(hit_bonus),
-                      ctx_.W / 2, ctx_.H / 2 + 10, YELLOW, 2.2f, true);
+                      ctx_.W / 2, ctx_.H / 2 + 110, YELLOW, 2.2f, true);
             if (perfect) {
                 int perfect_bonus = 5000;
                 score_ += perfect_bonus;
                 add_flash("PERFECT!  +" + std::to_string(perfect_bonus),
-                          ctx_.W / 2, ctx_.H / 2 - 40, ORANGE, 2.6f, true);
+                          ctx_.W / 2, ctx_.H / 2 + 138, ORANGE, 2.4f, true);
                 if (ctx_.fx) { ctx_.fx->shake(14); ctx_.fx->rumble(0.7f, 0.7f, 300); }
             }
             tele(J().add("ev", "challenge_clear").add("stage", wave_)
                     .add("hits", challenge_kills_).add("total", challenge_total_)
                     .add("perfect", perfect ? 1 : 0).add("load", loadout()));
-            state_ = St::WaveClear;
-            wave_t_ = 3.0f;
-            if (ctx_.sfx) { ctx_.sfx->stop_tractor(); ctx_.sfx->level_clear(); }
+            formation_->retreat();   // survivors peel away instead of freezing
+            finish_stage();
         }
         return;   // challenge stages resolve here, never via the normal clear path
     }
 
     // ── stage clear: all formation enemies gone AND boss (if any) gone ──
-    bool formation_clear = formation_->alive_count() == 0;
-    if (formation_clear && !boss_) {
+    if (formation_->alive_count() == 0 && !boss_) {
         tele(J().add("ev", "stage_clear").add("stage", wave_).add("dt", (double)(game_t_ - wave_t0_))
                 .add("kills", wave_kills_).add("shots", wave_shots_).add("pu", wave_pu_)
                 .add("deaths", wave_deaths_).add("nukes_used", wave_nukes_)
                 .add("captures", wave_captures_).add("load", loadout()).add("lives", player_->lives));
-        state_ = St::WaveClear;
-        wave_t_ = 3.0f;
-        if (ctx_.sfx) { ctx_.sfx->stop_tractor(); ctx_.sfx->level_clear(); }
+        finish_stage();
     }
 }
 
-void GalagaGame::update_captured(float dt) {
+void GalagaGame::update_captured(float dt, const Input& in) {
     capture_t_ += dt;
-    formation_->update(dt, ctx_.H, ctx_.W);
-    if (boss_) update_boss(dt);
-    if (capture_t_ > 2.5f) {
+    step_world(dt, in);
+    if (state_ != St::Captured) return;
+    // Shoot the captor down mid-haul (shots already in flight count) and the
+    // fighter drops free.
+    bool captor_gone = captor_ ? !captor_->alive : (!boss_ || boss_->dying);
+    if (captor_gone) {
+        player_->captured = false;
+        player_->invincible = 1.5f;
+        captor_ = nullptr;
+        state_ = formation_->entry_done() ? St::Play : St::Entering;
+        add_flash("BROKE FREE!", ctx_.W / 2, ctx_.H - 130, CYAN, 1.6f, true);
+        if (ctx_.sfx) ctx_.sfx->rescue();
+        return;
+    }
+    if (!cap_docked_ && capture_t_ >= CAPTURE_LIFT) {
+        cap_docked_ = true;
+        if (captor_) captor_->captured = true;   // now it carries the fighter home
+        if (ctx_.fx) ctx_.fx->shake(5);
+    }
+    if (capture_t_ >= CAPTURE_TOTAL) {
+        // capture costs a life and the arsenal (mirror the death reset) — and says so
+        bool had_weapons = w_rapid_ || w_spread_ || w_side_ || pierce_t_ > 0;
+        w_rapid_ = w_spread_ = w_side_ = 0; pierce_t_ = 0;
+        shield_ = 0; twin_boost_ = 0;
         player_->captured = false;
         player_->kill();
-        // capture costs the arsenal too (mirror death reset)
-        w_rapid_ = w_spread_ = w_side_ = w_pierce_ = 0; pierce_t_ = 0;
-        shield_ = 0;
+        wave_deaths_++;
+        captor_ = nullptr;
+        add_flash(had_weapons ? "FIGHTER LOST  -  WEAPONS LOST!" : "FIGHTER LOST!",
+                  ctx_.W / 2, ctx_.H - 130, RED, 1.8f, true);
+        tele(J().add("ev", "death").add("stage", wave_).add("t", (double)game_t_)
+                .add("load", loadout()).add("lives_left", player_->lives));
+        if (ctx_.fx) ctx_.fx->rumble_hit();
         if (player_->lives > 0) {
+            clear_enemy_fire();
             player_->respawn(ctx_.W / 2 - 14);
-            state_ = St::Play;
+            state_ = formation_->entry_done() ? St::Play : St::Entering;
             if (ctx_.sfx) ctx_.sfx->spawn_chime();
         } else {
-            state_ = St::GameOver;
-            submit_scores();
+            enter_game_over();
         }
     }
 }
 
 void GalagaGame::update(float dt, const Input& in) {
+    pad_ = in.pad_connected;
     time_acc_ += dt;
-    game_t_ += dt;
 
-    for (auto k : in.pressed)
-        if (k == SDLK_p && (state_ == St::Play || state_ == St::Entering)) {
-            pause_.toggle();
-            if (ctx_.sfx && pause_.active()) ctx_.sfx->stop_tractor();
-        }
+    // Pause works everywhere except the game-over screen (where P / START = menu).
+    // ESC opens the pause menu too (quit lives there) instead of dropping the run.
+    if ((in.just(SDLK_p) || (in.just(SDLK_ESCAPE) && !pause_.active())) && state_ != St::GameOver) {
+        pause_.toggle();
+        if (ctx_.sfx && pause_.active()) ctx_.sfx->stop_tractor();
+    }
     if (pause_.active()) {
         if (pause_.update(in) == PauseResult::QuitToMenu) { submit_scores(); quit_to_menu = true; }
         return;
     }
-    for (auto k : in.pressed)
-        if (k == SDLK_ESCAPE) { quit_to_menu = true; return; }
+    if (in.just(SDLK_ESCAPE) && initials_.active()) {
+        quit_to_menu = true;
+        return;
+    }
 
+    game_t_ += dt;
+    stage_t_ += dt;
     star_t_ += dt;
-    if (star_t_ >= AMBIENT_STAR_T) { star_t_ = 0; particles_.ambient_star(ctx_.W, ctx_.H); }
+    if (star_t_ >= AMBIENT_STAR_T) { star_t_ -= AMBIENT_STAR_T; particles_.ambient_star(ctx_.W, ctx_.H); }
     particles_.update(dt);
     if (nuke_flash_ > 0) nuke_flash_ -= dt * 1.6f;
     for (auto& f : flash_) f.life -= dt;
     flash_.erase(std::remove_if(flash_.begin(), flash_.end(),
                  [](const Flash& f) { return f.life <= 0; }), flash_.end());
 
-    if (state_ == St::Entering) {
-        update_entering(dt, in);
-    } else if (state_ == St::Play) {
-        update_play(dt, in);
+    if (state_ == St::Entering || state_ == St::Play) {
+        step_world(dt, in);
     } else if (state_ == St::Dead) {
         dead_t_ -= dt;
-        if (dead_t_ <= 0) {
+        step_world(dt, in);
+        if (state_ == St::Dead && dead_t_ <= 0) {
             if (player_->lives > 0) {
+                clear_enemy_fire();  // respawn into a clean sky
                 player_->respawn(ctx_.W / 2 - 14);
-                state_ = St::Play;
+                state_ = formation_->entry_done() ? St::Play : St::Entering;
                 if (ctx_.sfx) ctx_.sfx->spawn_chime();
-            } else { state_ = St::GameOver; submit_scores(); }
+            } else {
+                enter_game_over();
+            }
         }
     } else if (state_ == St::Captured) {
-        update_captured(dt);
+        update_captured(dt, in);
     } else if (state_ == St::WaveClear) {
         wave_t_ -= dt;
-        if (wave_t_ <= 0) start_wave(wave_ + 1);
+        step_world(dt, in);
+        // Hold the next stage until any drops still falling are grabbed or gone.
+        if (state_ == St::WaveClear && wave_t_ <= 0 && (powerups_.empty() || wave_t_ < -6.0f))
+            start_wave(wave_ + 1);
     } else if (state_ == St::GameOver) {
-        if (bot_) { new_game(); return; }  // self-play loops for more data
+        game_over_t_ += dt;
+        formation_->update(dt, ctx_.H, ctx_.W, false);   // survivors fly off behind the panel
+        if (bot_) {  // self-play loops for more data (after a beat on the panel)
+            if (game_over_t_ >= 2.5f) new_game();
+            return;
+        }
         if (ctx_.scores) {
             const std::string gid = "galaga";
-            if (!entry_started_ && ctx_.scores->qualifies(gid, score_)) {
+            if (!entry_started_ && game_over_t_ >= ui::GAME_OVER_LOCK &&
+                ctx_.scores->qualifies(gid, score_)) {
                 entry_started_ = true;
                 int rank = 1;
                 for (auto& e : ctx_.scores->leaderboard(gid)) if (e.score > score_) rank++;
                 initials_.begin("VOID SQUADRONS", score_, rank);
+                return;  // don't feed the opening frame's key press to the entry
             }
             if (initials_.active()) {
                 if (initials_.update(in)) ctx_.scores->add_score(gid, initials_.name(), score_);
                 return;   // block retry while entering initials
             }
         }
-        for (auto k : in.pressed)
-            if (k == SDLK_RETURN || k == SDLK_SPACE) new_game();
+        if (ui::game_over_retry(in, game_over_t_)) new_game();
+        else if (ui::game_over_menu(in, game_over_t_)) quit_to_menu = true;
     }
 }
 
@@ -1866,6 +2154,19 @@ void GalagaGame::bot_decide(float& move_dir, bool& want_fire, bool& want_nuke) {
     };
     if (formation_) scan(formation_->p_bullets);
     scan(boss_bullets_);
+    // divers and tractor beams are threats too: sidestep anything coming down the lane
+    if (formation_ && !challenge_) {
+        for (auto& e : formation_->enemies) {
+            if (!e.alive || e.state != "diving") continue;
+            float dy = py - e.y, dx = e.x + e.w / 2.0f - pcx;
+            if (dy < -10 || dy > 260) continue;
+            if (std::fabs(dx) < 60 && dy < closest) { closest = dy; threat_dir = dx > 0 ? -1.0f : 1.0f; }
+        }
+        for (auto& tb : formation_->tractor_beams) {
+            float dx = tb.x() - pcx;
+            if (std::fabs(dx) < 120) { closest = 0; threat_dir = dx > 0 ? -1.0f : 1.0f; }
+        }
+    }
 
     if (threat_dir != 0) {
         move_dir = threat_dir;
@@ -1880,12 +2181,12 @@ void GalagaGame::bot_decide(float& move_dir, bool& want_fire, bool& want_nuke) {
         if (best > 1e8f && formation_) {
             float eb = 1e9f;
             for (auto& e : formation_->enemies) {
-                if (!e.alive) continue;
+                if (!e.alive || !e.released) continue;
                 float ex = e.x + e.w / 2.0f, d = std::fabs(ex - pcx);
                 if (d < eb) { eb = d; target = ex; }
             }
+            if (boss_ && boss_->damageable() && eb > 1e8f) target = boss_->x + boss_->w / 2.0f;
         }
-        if (boss_ && boss_->damageable()) target = boss_->x + boss_->w / 2.0f;
         move_dir = target > pcx + 6 ? 1.0f : target < pcx - 6 ? -1.0f : 0.0f;
     }
     want_nuke = nukes_ > 0 && near >= 7;
@@ -1903,115 +2204,160 @@ void GalagaGame::draw(Surface& s) {
     if (boss_) {
         auto [pcx, pcy] = player_->center();
         boss_->draw(s, pcx, pcy);
-        for (auto& b : boss_bullets_) b.draw(s);
     }
+    for (auto& b : boss_bullets_) b.draw(s);   // always: they can outlive the boss
     for (auto& p : powerups_) p.draw(s, *ctx_.fonts.small);
     player_->draw(s);
     for (auto& b : p_bullets_) b.draw(s);
 
-    // shield bubble
-    if (shield_ > 0 && player_->alive && !player_->captured) {
+    // captured fighter being hauled up the beam (until it docks under its captor)
+    if (state_ == St::Captured && !cap_docked_) {
+        float u = 0;
+        auto [hx, hy] = capture_pos(u);
+        auto cap = cache().captured;
+        bool tumble = int(capture_t_ * 14) % 2 == 0;   // flicker blue/red as it is taken
+        if (tumble && u < 0.8f) s.blit(*cache().player, int(hx) - 10, int(hy) - 10);
+        else s.blit(*cap, int(hx) - 6, int(hy) - 6);
+    }
+
+    // shield bubble: pulses, flares when it eats a shot, blinks before it drops
+    if (player_->alive && !player_->captured) {
         auto [cx, cy] = player_->center();
-        float pulse = 0.6f + 0.4f * std::sin(star_t_ * 20 + shield_ * 4);
         int rr = player_->cur_w();
-        draw::circle(s, Color(80, 220, 255, int(90 * pulse)), cx, cy, rr, 2);
-        draw::circle(s, Color(80, 220, 255, int(30 * pulse)), cx, cy, rr - 2, 1);
+        float hit = std::max(0.0f, deflect_fx_ / 0.25f);
+        if (shield_ > 0) {
+            bool blink_off = shield_ < 1.5f && std::fmod(shield_, 0.25f) < 0.1f;
+            if (!blink_off) {
+                float pulse = 0.6f + 0.4f * std::sin(time_acc_ * 9 + shield_ * 4);
+                draw::circle(s, Color(80, 220, 255, int(90 * pulse + 150 * hit)), cx, cy, rr, 2);
+                draw::circle(s, Color(80, 220, 255, int(30 * pulse + 60 * hit)), cx, cy, rr - 2, 1);
+            }
+        } else if (hit > 0) {  // spawn-guard has no bubble of its own: flash one on impact
+            draw::circle(s, Color(255, 255, 255, int(170 * hit)), cx, cy, rr, 2);
+        }
     }
 
     draw_hud(s);
     if (nuke_flash_ > 0)
         draw::rect(s, Color(255, 255, 255, int(200 * std::min(1.0f, nuke_flash_))), {0, 0, ctx_.W, ctx_.H});
     draw_flash(s);
+    draw_banner(s);
 
-    if (state_ == St::Entering) {
-        draw_text_centered(s, *ctx_.fonts.small, "STAGE  " + zpad(wave_, 2),
-                           ctx_.W / 2, ctx_.H / 2, CYAN);
-    } else if (state_ == St::Captured) {
-        int g = int(180 + 75 * std::sin(time_acc_ * 6));
-        Color col(g, 80, 255);
-        draw_text_centered(s, *ctx_.fonts.small, "FIGHTER CAPTURED!", ctx_.W / 2, ctx_.H - 50, col);
-    } else if (state_ == St::WaveClear) {
-        draw_text_centered(s, *ctx_.fonts.big, "STAGE  CLEAR", ctx_.W / 2, ctx_.H / 2 - 30, YELLOW);
-    } else if (state_ == St::GameOver) {
-        draw_text_centered(s, *ctx_.fonts.big, "GAME  OVER", ctx_.W / 2, ctx_.H / 2 - 50, RED);
-        draw_text_centered(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), ctx_.W / 2, ctx_.H / 2 + 10, WHITE);
-        draw_text_centered(s, *ctx_.fonts.small, "PRESS SPACE TO RETRY", ctx_.W / 2, ctx_.H / 2 + 60, DIM);
+    if (state_ == St::GameOver) {
+        ui::game_over(s, ctx_.fonts, ctx_.W, ctx_.H, game_over_t_, score_, new_hi_, pad_,
+                      "REACHED STAGE " + std::to_string(wave_));
         if (initials_.active()) initials_.draw(s);
     }
 
     pause_.draw(s);
 }
 
-void GalagaGame::draw_hud(Surface& s) {
-    draw_text(s, *ctx_.fonts.med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
-    draw_text_centered(s, *ctx_.fonts.med, "HI  " + zpad(high_score_, 6), ctx_.W / 2, 8, YELLOW);
-    draw_text_right(s, *ctx_.fonts.med, "STAGE  " + zpad(wave_, 2), ctx_.W - 16, 8, CYAN);
+// Stage intro and stage-clear banners: both fade in and out, in the clear band
+// between the formation and the player's row.
+void GalagaGame::draw_banner(Surface& s) {
+    const int cx = ctx_.W / 2, cy = ctx_.H / 2 + 60;
+    auto faded = [](Color c, float a) { return Color(c.r, c.g, c.b, int(255 * std::clamp(a, 0.0f, 1.0f))); };
+    if ((state_ == St::Entering || state_ == St::Play) && stage_t_ < 2.2f) {
+        float a = std::min(stage_t_ / 0.25f, (2.2f - stage_t_) / 0.5f);
+        draw_text_centered(s, *ctx_.fonts.big, "STAGE " + std::to_string(wave_), cx, cy, faded(CYAN, a));
+        if (challenge_)
+            draw_text_centered(s, *ctx_.fonts.med, "CHALLENGE STAGE  -  NO ENEMY FIRE", cx, cy + 52, faded(ORANGE, a));
+        else
+            draw_text_centered(s, *ctx_.fonts.small, "GET READY", cx, cy + 54, faded(ui::HINT, a));
+        if (wave_ == 1 && !bot_) {  // the only controls the game needs, shown once
+            std::string hint = pad_ ? std::string("STICK  MOVE      ") + ui::fire_key(pad_) + "  FIRE"
+                                    : std::string("← →  MOVE      ") + ui::fire_key(pad_) + "  FIRE";
+            draw_text_centered(s, *ctx_.fonts.small, hint, cx, cy + 82, faded(ui::HINT, a));
+        }
+    } else if (state_ == St::WaveClear) {
+        float t = 2.4f - wave_t_;   // seconds since the clear
+        float a = std::min(t / 0.25f, std::max(0.0f, wave_t_ + 0.6f) / 0.6f);
+        draw_text_centered(s, *ctx_.fonts.big, challenge_ ? "BONUS  OVER" : "STAGE  CLEAR", cx, cy, faded(YELLOW, a));
+        if (!challenge_)
+            draw_text_centered(s, *ctx_.fonts.small,
+                               "KILLS " + std::to_string(clear_kills_) + "      ACCURACY " +
+                                   std::to_string(clear_acc_) + "%",
+                               cx, cy + 54, faded(ui::HINT, a));
+    }
+}
 
-    // COMBO indicator (rising multiplier for chained skill kills). When a boss
-    // HP bar is on screen the combo readout shifts left so the two don't collide.
-    if (ctx_.combo && ctx_.combo->active() &&
-        (state_ == St::Play || state_ == St::Entering)) {
+void GalagaGame::draw_hud(Surface& s) {
+    Font& med = *ctx_.fonts.med;
+    Font& small = *ctx_.fonts.small;
+    // ── top row: score / hi / stage ──
+    draw_text(s, med, "SCORE  " + zpad(score_, 6), 16, 8, GREEN);
+    draw_text_centered(s, med, "HI  " + zpad(std::max(high_score_, score_), 6), ctx_.W / 2, 8, YELLOW);
+    draw_text_right(s, med, "STAGE  " + zpad(wave_, 2), ctx_.W - 16, 8, CYAN);
+
+    // ── second row, left: combo (kept out of the centre, which banners own) ──
+    if (ctx_.combo && ctx_.combo->active() && state_ != St::GameOver) {
         int m = ctx_.combo->mult();
         Color cc = m >= 6 ? RED : m >= 4 ? ORANGE : YELLOW;
-        bool boss_bar = boss_ && !boss_->dying && !boss_->entering;
-        bool busy_centre = boss_bar || (challenge_ && !challenge_done_);
-        int tx = busy_centre ? 150 : ctx_.W / 2;
-        int ty = busy_centre ? 60 : 34;          // tuck under any centred banner
-        draw_text_centered(s, *ctx_.fonts.med, "x" + std::to_string(m) + " COMBO", tx, ty, cc);
-        int bw = 120, bx = tx - bw / 2;
-        draw::rect(s, Color(40, 40, 40), {bx, ty + 24, bw, 4});
-        draw::rect(s, cc, {bx, ty + 24, int(bw * ctx_.combo->ratio()), 4});
+        draw_text(s, small, "x" + std::to_string(m) + " COMBO", 16, 38, cc);
+        draw::rect(s, Color(40, 40, 40), {16, 58, 100, 3});
+        draw::rect(s, cc, {16, 58, int(100 * ctx_.combo->ratio()), 3});
     }
 
-    // challenge (bonus) stage banner + countdown
-    if (challenge_ && !challenge_done_ &&
-        (state_ == St::Play || state_ == St::Entering)) {
+    // ── second row, centre: bonus-stage status WITH its countdown ──
+    if (challenge_ && !challenge_done_ && (state_ == St::Play || state_ == St::Entering)) {
         float p = 0.6f + 0.4f * std::sin(time_acc_ * 6);
-        Color bc(255, int(150 * p), 40);
-        draw_text_centered(s, *ctx_.fonts.small, "* BONUS STAGE *  NO ENEMY FIRE", ctx_.W / 2, 40, bc);
-        draw_text_centered(s, *ctx_.fonts.small,
-                           "HITS " + std::to_string(wave_kills_) + " / " + std::to_string(challenge_total_),
-                           ctx_.W / 2, 58, YELLOW);
+        int secs = std::max(0, int(std::ceil(challenge_t_)));
+        Color tc = secs <= 5 ? Color(255, int(90 + 120 * p), 60) : Color(255, int(170 + 60 * p), 60);
+        draw_text_centered(s, small,
+                           "BONUS STAGE    HITS " + std::to_string(wave_kills_) + " / " +
+                               std::to_string(challenge_total_) + "    TIME " + std::to_string(secs),
+                           ctx_.W / 2, 38, tc);
+        int bw = 300, bx = ctx_.W / 2 - bw / 2;
+        draw::rect(s, Color(40, 40, 40), {bx, 60, bw, 4});
+        draw::rect(s, tc, {bx, 60, int(bw * std::clamp(challenge_t_ / CHALLENGE_TIME, 0.0f, 1.0f)), 4});
     }
 
-    // boss HP bar
+    // ── second row, centre: boss name, then its HP bar on a row of its own ──
     if (boss_ && !boss_->dying && !boss_->entering) {
-        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 40;
-        draw_text_centered(s, *ctx_.fonts.small, boss_->name, ctx_.W / 2, by - 16, boss_->color);
-        draw::rect(s, Color(20, 20, 30), {bx, by, bw, 12}, 0, 4);
+        int bw = 420, bx = ctx_.W / 2 - bw / 2, by = 58;
+        draw_text_centered(s, small, boss_->name, ctx_.W / 2, 38, boss_->color);
+        draw::rect(s, Color(20, 20, 30), {bx, by, bw, 10}, 0, 4);
         int fillw = int(bw * boss_->hp_ratio());
         Color hc = boss_->hp_ratio() > 0.5f ? GREEN : boss_->hp_ratio() > 0.25f ? YELLOW : RED;
-        draw::rect(s, hc, {bx, by, fillw, 12}, 0, 4);
-        draw::rect(s, boss_->color, {bx, by, bw, 12}, 1, 4);
+        draw::rect(s, hc, {bx, by, fillw, 10}, 0, 4);
+        draw::rect(s, boss_->color, {bx, by, bw, 10}, 1, 4);
     }
 
-    // weapon loadout (bottom-left)
-    int hx = 16, hy = ctx_.H - 46;
-    draw_text(s, *ctx_.fonts.small, "PWR", hx, hy, DIM);
-    auto pip = [&](int n, Color c, int slot) {
-        for (int i = 0; i < 5; ++i)
-            draw::rect(s, i < n ? c : Color(30, 40, 30), {hx + 44 + slot * 16, hy + 11 - i * 3, 12, 2});
+    // ── bottom-left: weapon levels (one pip per real level) and lives ──
+    const int row_a = ctx_.H - 39, row_b = ctx_.H - 21;
+    draw_text(s, small, "PWR", 16, row_a, ui::LABEL);
+    auto pips = [&](int n, int cap, Color c, int slot) {
+        for (int i = 0; i < cap; ++i)
+            draw::rect(s, i < n ? c : Color(50, 62, 56), {60 + slot * 18, row_a + 12 - i * 4, 13, 3});
     };
-    pip(w_rapid_, YELLOW, 0); pip(w_spread_, ORANGE, 1); pip(w_side_, CYAN, 2); pip(w_pierce_, Color(200, 100, 255), 3);
+    pips(w_rapid_, CAP_RAPID, YELLOW, 0);
+    pips(w_spread_, CAP_SPREAD, ORANGE, 1);
+    pips(w_side_, CAP_SIDE, CYAN, 2);
 
-    // lives
-    draw_text(s, *ctx_.fonts.small, "LIVES", 16, ctx_.H - 26, DIM);
-    for (int i = 0; i < player_->lives; ++i)
-        draw::polygon(s, CYAN, {{80 + i * 22, ctx_.H - 16},
-                                {80 + i * 22 + 7, ctx_.H - 26},
-                                {80 + i * 22 + 14, ctx_.H - 16}});
+    draw_text(s, small, "LIVES", 16, row_b, ui::LABEL);
+    int shown = std::min(player_->lives, 6);
+    for (int i = 0; i < shown; ++i)
+        draw::polygon(s, CYAN, {{80 + i * 22, row_b + 14},
+                                {80 + i * 22 + 7, row_b + 4},
+                                {80 + i * 22 + 14, row_b + 14}});
+    if (player_->lives > shown)
+        draw_text(s, small, "+" + std::to_string(player_->lives - shown), 80 + shown * 22, row_b, CYAN);
 
-    // nukes + shield (bottom-right)
+    // ── bottom-right: timed buffs on one row, nuke + pause hint on the other ──
+    auto seg = [&](int& x, int y, const std::string& t, Color c) {
+        draw_text_right(s, small, t, x, y, c);
+        x -= small.text_width(t) + 18;
+    };
+    int xa = ctx_.W - 12, xb = ctx_.W - 12;
+    seg(xb, row_b, std::string(ui::pause_key(pad_)) + " PAUSE", ui::LABEL);
     if (nukes_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "NUKE x" + std::to_string(nukes_) + "  [B]", ctx_.W - 12, ctx_.H - 44, RED);
-    if (twin_boost_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "TWIN " + std::to_string(int(twin_boost_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 62, ORANGE);
+        seg(xb, row_b, "NUKE x" + std::to_string(nukes_) + "  [" + ui::nuke_key(pad_) + "]", RED);
     if (shield_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 26, Color(80, 220, 255));
+        seg(xa, row_a, "SHIELD " + std::to_string(int(shield_ + 0.99f)) + "s", Color(80, 220, 255));
     if (pierce_t_ > 0)
-        draw_text_right(s, *ctx_.fonts.small, "PIERCE " + std::to_string(int(pierce_t_ + 0.99f)) + "s", ctx_.W - 12, ctx_.H - 10, Color(200, 100, 255));
-    else
-        draw_text_right(s, *ctx_.fonts.small, "P PAUSE", ctx_.W - 12, ctx_.H - 26, Color(25, 50, 70));
+        seg(xa, row_a, "PIERCE " + std::to_string(int(pierce_t_ + 0.99f)) + "s", Color(200, 100, 255));
+    if (twin_boost_ > 0)
+        seg(xa, row_a, "TWIN " + std::to_string(int(twin_boost_ + 0.99f)) + "s", ORANGE);
 }
 
 void GalagaGame::draw_flash(Surface& s) {
@@ -2020,7 +2366,10 @@ void GalagaGame::draw_flash(Surface& s) {
         float a = std::max(0.0f, std::min(1.0f, f.life / std::max(0.1f, f.max_life)));
         c.a = uint8_t(255 * a);
         Font& font = f.big ? *ctx_.fonts.med : *ctx_.fonts.small;
-        draw_text_centered(s, font, f.text, int(f.x), int(f.y), c);
+        // keep the whole string on screen even when its anchor hugs a wall
+        int half = font.text_width(f.text) / 2 + 6;
+        int x = half * 2 >= ctx_.W ? ctx_.W / 2 : std::clamp(int(f.x), half, ctx_.W - half);
+        draw_text_centered(s, font, f.text, x, int(f.y), c);
     }
 }
 

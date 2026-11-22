@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <random>
 #include <string>
 
 #include <cerrno>   // errno — distinguish "blocked" from "absent" joystick nodes
@@ -107,9 +108,15 @@ int main(int, char**) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
 
+    int win_w = kW, win_h = kH;
+    if (const char* ws = std::getenv("VOID_WIN")) {  // dev: "1920x1080"
+        int a = 0, b = 0;
+        if (std::sscanf(ws, "%dx%d", &a, &b) == 2 && a >= 320 && b >= 240) { win_w = a; win_h = b; }
+    }
     SDL_Window* win = SDL_CreateWindow(kTitle, SDL_WINDOWPOS_CENTERED,
-                                       SDL_WINDOWPOS_CENTERED, kW, kH,
-                                       SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+                                       SDL_WINDOWPOS_CENTERED, win_w, win_h,
+                                       SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                           SDL_WINDOW_ALLOW_HIGHDPI);
     if (!win) { std::fprintf(stderr, "CreateWindow: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx || !gl::load()) { std::fprintf(stderr, "GL init failed\n"); return 1; }
@@ -120,6 +127,11 @@ int main(int, char**) {
     Font fbig(base + "assets/fonts/DejaVuSansMono.ttf", 40);
     Font fmed(base + "assets/fonts/DejaVuSansMono.ttf", 22);
     Font fsmall(base + "assets/fonts/DejaVuSansMono.ttf", 15);
+
+    // A fresh seed per launch so no two sessions play out identically.
+    // VOID_SEED pins it for reproducible balance runs.
+    if (const char* sd = std::getenv("VOID_SEED")) rng().seed(unsigned(std::atol(sd)));
+    else rng().seed(unsigned(SDL_GetPerformanceCounter() ^ (Uint64(std::random_device{}()) << 1)));
 
     SoundManager sfx;
     sfx.init();
@@ -151,8 +163,11 @@ int main(int, char**) {
 
     // Open the first available game controller (hot-plug handled in the loop).
     SDL_GameController* pad = nullptr;
-    for (int i = 0; i < SDL_NumJoysticks(); ++i)
-        if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); break; }
+    auto open_first_pad = [&] {
+        for (int i = 0; i < SDL_NumJoysticks() && !pad; ++i)
+            if (SDL_IsGameController(i)) pad = SDL_GameControllerOpen(i);
+    };
+    open_first_pad();
     if (pad) std::printf("[pad] %s connected\n", SDL_GameControllerName(pad));
     gctx.pad_blocked = !pad && snap_pad_blocked();
     if (gctx.pad_blocked)
@@ -231,8 +246,24 @@ int main(int, char**) {
                                Color(255, 220, 40));
     };
 
+    // Key presses that arrive while the sim is frozen (hit-stop) are held here
+    // and delivered on the next simulated frame instead of being lost.
+    std::vector<SDL_Keycode> carried;
+    int stick_x = 0, stick_y = 0;  // last digital stick direction, for edge events
+    bool trigger_held = false;
+
     while (running) {
         Uint64 now = SDL_GetPerformanceCounter();
+        // Frame limiter: vsync normally paces us, but when it is off or ignored
+        // (some drivers, minimised windows) don't spin a core at 1000s of fps.
+        if (!accel) {
+            const double min_frame = 1.0 / 250.0;
+            double el = double(now - prev) / freq;
+            if (el < min_frame) {
+                SDL_Delay(Uint32((min_frame - el) * 1000.0));
+                now = SDL_GetPerformanceCounter();
+            }
+        }
         float dt = accel ? (1.0f / 120.0f) : float((now - prev) / freq);
         if (dt > 0.05f) dt = 0.05f;
         prev = now;
@@ -242,6 +273,7 @@ int main(int, char**) {
         crt.set_scanline(settings.scanline);
         crt.set_persistence(settings.persistence);
         sfx.set_master_volume(settings.volume);
+        sfx.set_music_volume(settings.music);
         if (settings.fullscreen != fullscreen) {
             fullscreen = settings.fullscreen;
             SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -257,6 +289,7 @@ int main(int, char**) {
         }
 
         Input input;
+        input.pressed.swap(carried);
         SDL_Event e;
         auto handle_key = [&](SDL_Keycode k) {
             if (k == SDLK_F11) {
@@ -274,13 +307,26 @@ int main(int, char**) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.repeat == 0) handle_key(e.key.keysym.sym);
-            else if (e.type == SDL_CONTROLLERBUTTONDOWN) handle_key(map_pad_button(e.cbutton.button));
-            else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad) {
+            else if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+                // B is "back" inside the Options screen only. In games it stays a
+                // held button (it sits next to fire, so it must never quit).
+                if (e.cbutton.button == SDL_CONTROLLER_BUTTON_B && options)
+                    handle_key(SDLK_ESCAPE);
+                else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+                    if (!game && !options) handle_key(SDLK_o);  // Options, menu only
+                } else
+                    handle_key(map_pad_button(e.cbutton.button));
+            } else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad) {
                 pad = SDL_GameControllerOpen(e.cdevice.which);
+                if (pad) gctx.pad_blocked = false;
             } else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
-                if (pad) { SDL_GameControllerClose(pad); pad = nullptr; }
-                for (int i = 0; i < SDL_NumJoysticks(); ++i)
-                    if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); break; }
+                // Only react when it is *our* pad that went away.
+                if (pad && e.cdevice.which == SDL_JoystickInstanceID(
+                               SDL_GameControllerGetJoystick(pad))) {
+                    SDL_GameControllerClose(pad);
+                    pad = nullptr;
+                    open_first_pad();
+                }
             }
         }
         input.state = SDL_GetKeyboardState(nullptr);
@@ -302,6 +348,29 @@ int main(int, char**) {
             input.pad[PadThrUp]   = h(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
             input.pad[PadThrDown] = h(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
             input.pad[PadBtnB]    = h(SDL_CONTROLLER_BUTTON_B);  // held B (e.g. Void Drift thrust)
+            input.pad_connected = true;
+
+            // A stick flick counts as a press, like the d-pad, so menus and
+            // edge-triggered actions work from the analog stick too. Wider
+            // threshold + hysteresis than the held deadzone to avoid chatter.
+            const int ON = 16000, OFF = 9000;
+            auto dir = [&](int v, int prev_dir) {
+                if (v > ON) return 1;
+                if (v < -ON) return -1;
+                if (std::abs(v) < OFF) return 0;
+                return prev_dir;
+            };
+            int nx = dir(lx, stick_x), ny = dir(ly, stick_y);
+            if (nx != stick_x && nx != 0) input.pressed.push_back(nx < 0 ? SDLK_LEFT : SDLK_RIGHT);
+            if (ny != stick_y && ny != 0) input.pressed.push_back(ny < 0 ? SDLK_UP : SDLK_DOWN);
+            stick_x = nx; stick_y = ny;
+            // Same for the right trigger: pulling it is a fire *press*.
+            bool trig = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > DZ;
+            if (trig && !trigger_held) input.pressed.push_back(SDLK_SPACE);
+            trigger_held = trig;
+        } else {
+            stick_x = stick_y = 0;
+            trigger_held = false;
         }
 
         // Advance any active characterful rumble pattern, then consume. The
@@ -331,6 +400,7 @@ int main(int, char**) {
             if (woke || capped) {
                 sfx.stop_all();
                 game.reset();
+                juice = Juice{};   // no leftover hue drift / shake / rumble in the menu
                 demo_mode = false;
                 menu_idle = 0.0f;
                 // On a natural time-out, cycle to the next game so a long idle
@@ -350,6 +420,7 @@ int main(int, char**) {
         }
 
         if (!game) {
+            sfx.start_music(7);  // calm menu loop (no-op while already playing)
             launcher->update(dt, input);
             if (launcher->options_requested) {
                 launcher->options_requested = false;
@@ -393,6 +464,7 @@ int main(int, char**) {
             bool frozen = juice.hitstop_t > 0.0f;
             if (frozen) {
                 juice.hitstop_t -= dt;
+                carried = input.pressed;  // deliver these once the sim resumes
                 if (!accel) present(game_surf, dt);
                 continue;
             }
@@ -402,6 +474,7 @@ int main(int, char**) {
                 sfx.stop_all();
                 scores.load();
                 game.reset();
+                juice = Juice{};   // no leftover hue drift / shake / rumble in the menu
                 menu_idle = 0.0f;
                 launcher = std::make_unique<Launcher>(gctx);
                 launcher->draw(game_surf);
